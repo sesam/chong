@@ -1,0 +1,23 @@
+{
+  "name": "chong",
+  "version": "0.1.0",
+  "description": "ship change-lists to the company-wide Harness git backend",
+  "type": "module",
+  "bin": {
+    "chong": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun src/index.ts",
+    "build": "bun build --compile --target=bun ./src/index.ts --outfile chong",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write ."
+  },
+  "dependencies": {
+    "prettier": "^3.4.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/bun": "latest",
+    "typescript": "^5.4.0"
+  }
+}

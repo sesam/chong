@@ -1,0 +1,21 @@
+name = "chong-server"
+main = "src/index.ts"
+compatibility_date = "2026-05-08"
+compatibility_flags = ["nodejs_compat"]
+
+# Set with: wrangler d1 create chong, then paste database_id here.
+[[d1_databases]]
+binding = "DB"
+database_name = "chong"
+database_id = ""
+
+[vars]
+# Public, non-secret config — override in production via dashboard or via this file.
+HARNESS_URL = "https://git.example.com"
+WORKER_DOMAIN = "yourcompany.workers.dev"
+
+# Secrets — set with `wrangler secret put <NAME>`:
+#   HARNESS_BOT_PAT   service-account PAT used to bypass approval rule on squash-merge
+#   CF_ACCOUNT_ID     account that hosts deployed user workers
+#   CF_API_TOKEN      token with Workers Scripts:Edit on that account
+#   ANTHROPIC_API_KEY for commit coaching

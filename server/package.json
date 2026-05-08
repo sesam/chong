@@ -1,0 +1,27 @@
+{
+  "name": "chong-server",
+  "version": "0.1.0",
+  "description": "thin chong backend on Cloudflare Workers — deploy + Harness merge + history + AI coaching",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "db:create": "wrangler d1 create chong",
+    "db:migrate": "wrangler d1 execute chong --file schema.sql",
+    "db:migrate:remote": "wrangler d1 execute chong --remote --file schema.sql",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check ."
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0",
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@cloudflare/workers-types": "^4.20240924.0",
+    "typescript": "^5.4.0",
+    "wrangler": "^3.78.0"
+  }
+}
