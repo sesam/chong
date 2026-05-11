@@ -1,0 +1,22 @@
+{
+  "name": "chong-pi",
+  "version": "0.1.0",
+  "description": "chong server-process — runs on a small always-on box and owns git repos + CL state",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "init": "bun src/init.ts",
+    "user-add": "bun src/user-add.ts",
+    "lint": "biome check ."
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/bun": "latest",
+    "typescript": "^5.4.0"
+  }
+}

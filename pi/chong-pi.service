@@ -1,0 +1,27 @@
+[Unit]
+Description=chong-pi server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/chong/pi
+Environment=PORT=8787
+Environment=BIND=127.0.0.1
+# Optional — enable AI commit coaching:
+# Environment=ANTHROPIC_API_KEY=sk-ant-…
+ExecStart=/home/pi/.bun/bin/bun src/index.ts
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/pi/.chong-pi
+
+[Install]
+WantedBy=multi-user.target

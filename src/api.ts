@@ -74,22 +74,24 @@ export const api = {
   history: (q: { repo?: string; author?: string } = {}) =>
     req<Commit[]>(`/api/history${qs(q)}`),
 
-  commit: (sha: string) =>
-    req<CommitDetail>(`/api/commit/${encodeURIComponent(sha)}`),
+  commit: (sha: string, repo: string) =>
+    req<CommitDetail>(`/api/commit/${encodeURIComponent(sha)}${qs({ repo })}`),
 };
 
 export type SSEvent = { event: string; data: string };
 
-export async function* uploadStream(id: string): AsyncGenerator<SSEvent> {
+export async function* uploadStream(id: string, sha: string): AsyncGenerator<SSEvent> {
   const auth = await readAuth();
   const r = await fetch(
     `${auth.server.replace(/\/+$/, "")}/api/cls/${encodeURIComponent(id)}/upload`,
     {
       method: "POST",
       headers: {
+        "content-type": "application/json",
         authorization: `Bearer ${auth.token}`,
         accept: "text/event-stream",
       },
+      body: JSON.stringify({ sha }),
     },
   );
   if (!r.ok || !r.body) {

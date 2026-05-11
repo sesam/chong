@@ -23,6 +23,9 @@ export const git = {
   currentBranch: (cwd?: string) =>
     run(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd }),
 
+  headSha: (cwd?: string) =>
+    run(["git", "rev-parse", "HEAD"], { cwd }),
+
   topLevel: (cwd?: string) =>
     run(["git", "rev-parse", "--show-toplevel"], { cwd }),
 

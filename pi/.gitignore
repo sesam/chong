@@ -1,0 +1,9 @@
+node_modules
+.chong-pi-data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.log
+.env
+.env.local

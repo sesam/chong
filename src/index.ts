@@ -11,13 +11,13 @@ import { c } from "./util";
 const HELP = `chong — ship change-lists to the company git backend
 
   chong new "<title>" [--repo <name>]   create a CL + worktree off latest main
-  chong upload                          push, lint, build, deploy, squash-merge
+  chong upload                          format, push, squash-merge to main
   chong status                          your open chongs (local + remote)
   chong abandon [<id>]                  drop a chong (worktree + branch + server)
   chong history [--repo <name>] [--author <u>]
                                         recent commits on main
-  chong show <sha>                      commit + diff + AI coaching
-  chong show --latest                   most recent commit on main
+  chong show <sha> [--repo <name>]      commit + diff + AI coaching
+  chong show --latest [--repo <name>]   most recent commit on main
   chong auth login                      save server URL + PAT to ~/.chong/auth.json
 `;
 

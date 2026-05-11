@@ -1,7 +1,9 @@
 node_modules/
 bun.lockb
-chong
-chong-*
+/chong
+/chong-*
 dist/
 .DS_Store
 .chong/
+.claude/
+server/.dry/

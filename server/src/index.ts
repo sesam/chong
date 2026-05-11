@@ -13,12 +13,7 @@ app.get("/api/health", async (c) => {
   const harnessOk = await fetch(`${c.env.HARNESS_URL.replace(/\/+$/, "")}/api/v1/system/health`)
     .then((r) => r.ok)
     .catch(() => false);
-  const cfOk = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
-    headers: { authorization: `Bearer ${c.env.CF_API_TOKEN}` },
-  })
-    .then((r) => r.ok)
-    .catch(() => false);
-  return c.json({ ok: harnessOk && cfOk, harness: harnessOk, cloudflare: cfOk });
+  return c.json({ ok: harnessOk, harness: harnessOk });
 });
 
 // Authed routes

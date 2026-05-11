@@ -38,9 +38,10 @@ export async function cmdUpload(_argv: string[]): Promise<void> {
   // Push the branch first so chong-server can act on it.
   console.log(c.dim(`  pushing ${entry.branch}…`));
   await git.push("origin", entry.branch, wtAbs);
+  const sha = await git.headSha(wtAbs);
 
   // Stream server-side pipeline output.
-  for await (const ev of uploadStream(id)) {
+  for await (const ev of uploadStream(id, sha)) {
     if (ev.event === "step") {
       process.stdout.write(c.cyan(`  ${ev.data}\n`));
     } else if (ev.event === "log") {
@@ -77,6 +78,5 @@ export async function cmdUpload(_argv: string[]): Promise<void> {
   await writeState(state);
 
   console.log(c.green(`✓ ${id} live`));
-  if (final.worker_url) console.log(`  ${final.worker_url}`);
   if (final.sha) console.log(c.dim(`  ${final.sha.slice(0, 7)}`));
 }

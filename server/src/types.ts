@@ -1,10 +1,7 @@
 export type Env = {
   DB: D1Database;
   HARNESS_URL: string;
-  WORKER_DOMAIN: string;
   HARNESS_BOT_PAT: string;
-  CF_ACCOUNT_ID: string;
-  CF_API_TOKEN: string;
   ANTHROPIC_API_KEY: string;
 };
 
