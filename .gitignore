@@ -2,6 +2,8 @@ node_modules/
 bun.lockb
 /chong
 /chong-*
+*.bun-build
+.*.bun-build
 dist/
 .DS_Store
 .chong/

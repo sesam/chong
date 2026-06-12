@@ -1,11 +1,12 @@
 #!/usr/bin/env bun
-import { authLogin } from "./commands/auth";
 import { cmdAbandon } from "./commands/abandon";
+import { authLogin } from "./commands/auth";
 import { cmdHistory } from "./commands/history";
 import { cmdNew } from "./commands/new";
 import { cmdShow } from "./commands/show";
 import { cmdStatus } from "./commands/status";
 import { cmdUpload } from "./commands/upload";
+import { cmdWatch } from "./commands/watch";
 import { c } from "./util";
 
 const HELP = `chong — ship change-lists to the company git backend
@@ -18,6 +19,9 @@ const HELP = `chong — ship change-lists to the company git backend
                                         recent commits on main
   chong show <sha> [--repo <name>]      commit + diff + AI coaching
   chong show --latest [--repo <name>]   most recent commit on main
+  chong watch [<path>] [--branches main,stage,prod] [--interval <s>] [--remote <r>]
+                                        live TUI of commits queueing through the
+                                        promotion pipeline; promote between branches
   chong auth login                      save server URL + PAT to ~/.chong/auth.json
 `;
 
@@ -48,6 +52,8 @@ async function main(): Promise<void> {
       return await cmdHistory(rest);
     case "show":
       return await cmdShow(rest);
+    case "watch":
+      return await cmdWatch(rest);
     default:
       console.error(c.red(`unknown command: ${cmd}`));
       process.stdout.write(HELP);

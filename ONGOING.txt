@@ -1,0 +1,118 @@
+chong — ONGOING (continue-here notes)
+=====================================
+Last updated: 2026-06-11
+Repo: /Users/simonbohlin/42b/chong   Branch: main   HEAD: dc015d8
+
+WHAT chong IS
+-------------
+A developer CLI ("chong" / 冲) that ships change-lists to a company git backend.
+Flow: `chong new "title"` makes a CL + a git worktree off latest origin/main →
+you edit in the worktree → `chong upload` formats (bundled Prettier), pushes the
+branch, the server squash-merges to main, and the local worktree+branch are
+cleaned up. No code-review step, no stacked CLs (both explicitly out of scope).
+
+There are THREE code areas in the repo:
+  src/      → the CLI (chong)                — BUILT, full v1 surface
+  pi/       → chong-pi self-hosted server     — BUILT, the real/current backend (v0.2)
+  server/   → Cloudflare Worker + Harness API — v0.1 scaffold, NOW SUPERSEDED by pi/
+
+The big v0.2 architectural move: the original design (Cloudflare Worker calling a
+hosted Harness git backend) was replaced by chong-pi — a Bun server running on a
+small Linux box / Raspberry Pi that holds bare git repos directly, fronted by a
+Cloudflare Tunnel (no inbound ports). server/ is left in the tree but is no longer
+the intended path.
+
+
+=====================================================================
+BUILT (implemented and present in code)
+=====================================================================
+
+CLI (src/) — every command in the v1 plan exists:
+  - index.ts        dispatcher + help text for all commands
+  - auth login      saves server URL + bearer token to ~/.chong/auth.json
+  - new             POST /api/cls, git fetch, git worktree add off origin/main,
+                    records id→{branch,worktree} in <repo>/.chong/state.json
+  - upload          Prettier auto-format of changed files (commits "style:… [chong]"),
+                    push branch, stream SSE pipeline, on LIVE remove worktree+branch
+  - status / abandon / history / show(--latest)   all wired to the API
+  - watch            full-screen TUI of the promotion pipeline for ANY git repo
+                     (default branches main→stage→prod). Polls `git fetch`, shows
+                     incoming commits, what's queued between each branch (ahead/
+                     behind + drift), and CI per tip via `gh`. Promote in-place:
+                     fast-forward push when linear, GitHub merge API when diverged.
+                     Does NOT touch the working tree. Code in src/watch/*.
+                     NOTE: independent of chong-pi — points at GitHub (gh CLI),
+                     e.g. `chong watch ~/lc/FRONTEND` (LynxCraft-Git/Builder-fe).
+  - format.ts (bundled Prettier), git.ts (worktree ops), state.ts, config.ts, repo.ts
+  - api.ts          typed client incl. SSE upload stream
+  - build script:   `bun build --compile` → single `chong` binary (defined in package.json)
+
+chong-pi (pi/) — the current backend, fully functional for its scope:
+  - index.ts        Bun.serve router: /api/health, git smart-HTTP, authed /api/*
+  - routes/cls.ts   create / list / get / delete / upload(SSE squash-merge)
+  - routes/git-http.ts   git http-backend (clone / fetch / push)
+  - routes/history.ts    git log + commit show, with AI coaching (cached in db)
+  - git.ts          ensureRepo (bare repo + work clone, seeded main), squashMerge,
+                    log, show. Merge = squash into work clone, push back to bare,
+                    delete branch.
+  - db.ts (SQLite via bun:sqlite), auth.ts (bearer token → user), coaching.ts
+                    (optional Anthropic), init.ts, user-add.ts
+  - chong-pi.service (systemd), schema.sql, README.md (full cloudflared deploy guide)
+
+server/ (Cloudflare Worker) — v0.1, kept but superseded:
+  - Hono-style handler, Harness API client (createPR/mergePR with bypass_rules),
+    D1 schema, SSE, coaching. This is the "hosted Harness backend" design that pi
+    replaced.
+
+
+=====================================================================
+NOT DONE / PLANNED / OPEN DECISIONS  (the actual next-steps list)
+=====================================================================
+
+1. [GAP] `chong new` does NOT set the git `origin` remote to the Pi.
+   README (pi/README.md) says set it manually for now:
+     git remote set-url origin https://git.<domain>/repos/<repo>.git
+   Next step: have `chong new` (or auth login) configure origin automatically.
+   Note `new` already does `git worktree add ... origin/main`, so origin must
+   exist or `new` fails — this is the most important gap to close first.
+
+2. [DECISION] Two backends coexist: pi/ vs server/. Pick the canonical one.
+   pi/ is the intended path; either delete/retire server/ or document it as
+   the alternative "hosted Harness" deployment. The CLI points at a single
+   server URL (auth.json), so this is just an ops/url decision, not code churn.
+
+3. [SCOPE] No lint / typecheck / build / deploy pipeline server-side.
+   Original PLAN.md pipeline was lint → typecheck → push → build → deploy →
+   squash-merge. pi `upload` currently does ONLY the squash-merge. The CLI does
+   formatting locally. Decide whether the rest of the pipeline is still wanted
+   and where it runs (client-side in upload, or on the Pi).
+
+4. [LEFTOVER] CLI types still carry v0.1/Worker concepts (CLStatus has
+   LINT_ERROR, CL has worker_url). Harmless but should be reconciled with pi's
+   actual statuses (DRAFT/BUILDING/BUILD_ERROR/LIVE/ABANDONED).
+
+5. [SECURITY] pi git-http (/repos/*) has NO per-user auth — the Cloudflare
+   Tunnel/Access is the only gate. Planned: add HTTP basic in
+   pi/src/routes/git-http.ts before exposing on any non-tunnel hostname.
+
+6. [INFRA / TBD] Physical Pi + Cloudflare Tunnel not yet stood up. README has
+   the full recipe (init.ts, user-add.ts, cloudflared tunnel + DNS, systemd,
+   nightly rclone backup). "Harness host still TBD" per project memory.
+
+7. [DEFERRED, documented] `chong new --inplace` (Option A: auto-rotate branches
+   in one working dir instead of worktree-per-chong). PLAN.md keeps it as a
+   later option.
+
+8. [OUT OF SCOPE, locked 2026-05-08] Stacked CLs; code review / PR approvals.
+
+SUGGESTED ORDER TO RESUME
+  a) Stand up one Pi + tunnel, run init.ts + user-add.ts, smoke-test end to end.
+  b) Make `chong new`/auth configure the `origin` remote automatically (#1).
+  c) Decide server/ fate (#2) and reconcile CLI status types (#4).
+  d) Decide on the build/deploy pipeline scope (#3).
+
+KEY FILES TO REREAD
+  PLAN.md ............ design rationale + locked decisions
+  pi/README.md ....... deploy + API surface + "decisions that bit us"
+  pi/src/routes/cls.ts, pi/src/git.ts ...... the real upload/merge path
+  src/commands/new.ts, src/commands/upload.ts ...... CLI flow
