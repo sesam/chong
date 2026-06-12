@@ -19,6 +19,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   let localBaseline: Set<string> | null = null; // local branch shas at the moment watch started
   let refreshing = false;
   const checkedShas = new Set<string>(); // shas that have been through post-commit checks
+  let checkQueue = Promise.resolve(); // serializes shadow work — prevents index.lock races
 
   const ui: UIState = {
     selectedGap: 0,
@@ -130,7 +131,8 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
             ui.newShas.add(cm.sha);
             if (!checkedShas.has(cm.sha)) {
               checkedShas.add(cm.sha);
-              void runCommitChecks(cm.sha, "remote");
+              const sha = cm.sha;
+              checkQueue = checkQueue.then(() => runCommitChecks(sha, "remote"));
             }
           }
         }
@@ -139,7 +141,8 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
             ui.newLocalShas.add(cm.sha);
             if (!checkedShas.has(cm.sha)) {
               checkedShas.add(cm.sha);
-              void runCommitChecks(cm.sha, "local");
+              const sha = cm.sha;
+              checkQueue = checkQueue.then(() => runCommitChecks(sha, "local"));
             }
           }
         }

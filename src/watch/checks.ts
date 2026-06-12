@@ -73,6 +73,13 @@ export async function ensureShadow(repoPath: string, ref: string): Promise<Shado
     const addR = await git(["worktree", "add", "--detach", shadowPath, ref], repoPath);
     if (!addR.ok) return { shadowPath, error: `worktree add: ${addR.err}` };
   } else {
+    // Remove stale index.lock before touching the worktree
+    const gitDirR = await git(["rev-parse", "--git-dir"], shadowPath);
+    if (gitDirR.ok) {
+      const lock = path.join(gitDirR.out, "index.lock");
+      try { unlinkSync(lock); } catch { /* doesn't exist, fine */ }
+    }
+
     await git(["clean", "-fd"], shadowPath);
     const resetR = await git(["reset", "--hard", ref], shadowPath);
     if (!resetR.ok) return { shadowPath, error: `reset to ${ref}: ${resetR.err}` };
