@@ -2,71 +2,53 @@
 
 > 冲 (chōng) — to push through, to rush forward, to clear the way.
 
-A CLI for shipping change-lists through a git promotion pipeline (main → stage → prod), built on top of Harness and standard git.
+A CLI for watching and managing a git promotion pipeline (main → stage → prod). Works standalone with just git, with optional deeper integration via a Harness account.
 
 ## Requirements
 
 - [Bun](https://bun.sh) (runtime + build)
 - Git
-- `gh` CLI (optional — used for CI status and merge operations in `chong watch`)
-- `pnpm` in the watched repo (for `shadow-work` auto-fix features)
+- `gh` CLI (optional — used for CI status badges and merge operations in `chong watch`)
+- `pnpm` in the watched repo (optional — for i18n/format auto-fix in `chong watch`)
 
 ## Install
 
 ```sh
 git clone https://github.com/sesam/chong.git
 cd chong
-bun run build          # compiles to ./chong binary
+bun run build
 ln -sf $PWD/chong ~/bin/chong   # or wherever your $PATH includes
 ```
 
-## Commands
+---
 
-### `chong auth login`
-Save your Harness server URL and personal access token to `~/.chong/auth.json`.
-Requires a PAT with repo + pull-request scope.
-
-### `chong new "<title>" [--repo <name>]`
-Create a new change-list: makes a branch + worktree off the latest main, and registers it with the Harness backend.
-
-### `chong upload`
-Format, push, and squash-merge the current change-list to main.
-
-### `chong status`
-List your open change-lists (local worktrees + remote).
-
-### `chong abandon [<id>]`
-Drop a change-list — removes the worktree, branch, and server record.
-
-### `chong history [--repo <name>] [--author <user>]`
-Recent commits on main.
-
-### `chong show <sha|--latest> [--repo <name>]`
-Show a commit with its diff and AI coaching notes.
+## Part 1 — works without any account
 
 ### `chong watch [<path>] [options]`
-Live TUI for the promotion pipeline. Shows commits queuing through main → stage → prod, lets you promote between branches, and runs automated post-commit checks.
+
+Live TUI for your promotion pipeline. Point it at any git repo and it shows commits queuing through your branches, lets you promote between them, and runs automated post-commit checks.
 
 ```
 Options:
-  --branches main,stage,prod   pipeline branch names (default: main,stage,prod)
+  --branches main,stage,prod   branch names for the pipeline (default: main,stage,prod)
   --interval <seconds>         poll interval (default: 15)
   --remote <name>              git remote (default: origin)
-  --format-cmd <cmd>           formatter to run in shadow checks (default: pnpm format)
+  --format-cmd <cmd>           formatter for shadow auto-fix (default: pnpm format)
 ```
 
-**TUI keys:** `[s]` promote → stage · `[p]` promote → prod · `[↑/↓]` select gap · `[space]` toggle queued commits · `[f]` fetch · `[r]` refresh CI · `[q]` quit
+**TUI keys:** `[s]` promote → stage · `[p]` promote → prod · `[↑/↓]` select · `[space]` queued commits · `[f]` fetch · `[r]` CI · `[q]` quit
 
-**INCOMING section** shows local branch commits and remote origin/main commits merged by time. Commits that arrived after `chong watch` started are highlighted with a green background.
+**INCOMING** shows your local branch and remote origin/main commits merged by time. Commits that arrived after `chong watch` started are highlighted green.
 
-**Post-commit checks** (runs automatically on each new remote commit):
-- Flags i18n mismatches: `t()`/`useT`/`i18n` code added without `.po`/`.pot` changes, or vice versa
-- Sets up a `main-shadow` git worktree (sibling of the watched repo), runs `pnpm i18n`, commits `.po`/`.pot` changes as `FIX: pnpm i18n` and pushes
-- Runs the format command, commits formatting fixes for the changed files, pushes
-- Shows a modal if leftover files remain after the i18n fix
+**Post-commit checks** run automatically on each new remote commit:
+- Flags i18n mismatches: `t()`/`useT`/`i18n` code without `.po`/`.pot` changes, or vice versa
+- Resets a `main-shadow` worktree to origin/main, runs `pnpm i18n`, commits `.po`/`.pot` changes as `FIX: pnpm i18n` and pushes
+- Runs the format command on the changed files, commits as `FIX: code formatting` and pushes
+- Shows a modal in the TUI if leftover files remain after the i18n fix
 
 ### `chong shadow-work [<path>] [options]`
-Manually trigger the same i18n + format checks that `chong watch` runs automatically, against the latest `origin/main` commit. Useful for debugging or re-running after a failure.
+
+Manually trigger the same i18n + format checks against the latest origin/main commit — useful for debugging or re-running after a failure.
 
 ```
 Options:
@@ -74,7 +56,7 @@ Options:
   --format-cmd <cmd>    formatter command (default: pnpm format)
 ```
 
-## How `main-shadow` works
+### How `main-shadow` works
 
 For each new remote commit, chong creates (or resets) a git worktree called `main-shadow` as a sibling of the watched repo:
 
@@ -84,7 +66,37 @@ For each new remote commit, chong creates (or resets) a git worktree called `mai
   main-shadow/     ← chong's worktree, always at origin/main
 ```
 
-The worktree's `node_modules` is symlinked from the source repo (same lockfile, no reinstall needed). Auto-fix commits are tagged `FIX:` and skipped on subsequent checks to avoid loops.
+`node_modules` is symlinked from the source repo (same lockfile, no reinstall). Auto-fix commits are tagged `FIX:` and skipped on re-check to avoid loops.
+
+---
+
+## Part 2 — additional features with a Harness account
+
+[Harness](https://harness.io) has a free tier. These commands integrate with its git backend for change-list tracking, squash-merge workflows, and AI commit coaching.
+
+### `chong auth login`
+Save your Harness server URL and personal access token to `~/.chong/auth.json`.
+Requires a PAT with repo + pull-request scope.
+
+### `chong new "<title>" [--repo <name>]`
+Create a change-list: makes a branch + worktree off the latest main and registers it with Harness.
+
+### `chong upload`
+Format, push, and squash-merge the current change-list to main via Harness.
+
+### `chong status`
+List your open change-lists (local worktrees + Harness remote).
+
+### `chong abandon [<id>]`
+Drop a change-list — removes the worktree, branch, and Harness record.
+
+### `chong history [--repo <name>] [--author <user>]`
+Recent commits on main, fetched from Harness.
+
+### `chong show <sha|--latest> [--repo <name>]`
+Show a commit with its diff and AI coaching notes from Harness.
+
+---
 
 ## Development
 
