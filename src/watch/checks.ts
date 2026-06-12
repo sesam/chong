@@ -1,3 +1,4 @@
+import { existsSync, lstatSync, symlinkSync, unlinkSync, rmSync } from "fs";
 import path from "path";
 
 type Run = { ok: boolean; out: string; err: string };
@@ -77,9 +78,16 @@ export async function ensureShadow(repoPath: string, ref: string): Promise<Shado
     if (!resetR.ok) return { shadowPath, error: `reset to ${ref}: ${resetR.err}` };
   }
 
-  // Ensure deps are installed — required before any pnpm scripts run in the worktree
-  const installR = await sh(["pnpm", "install", "--frozen-lockfile"], shadowPath);
-  if (!installR.ok) return { shadowPath, error: `pnpm install: ${installR.err || installR.out}` };
+  // Symlink node_modules from the source repo — same lockfile, avoids pnpm hoisting
+  // differences and is much faster than a fresh install.
+  const nmSource = path.join(repoPath, "node_modules");
+  const nmLink = path.join(shadowPath, "node_modules");
+  if (existsSync(nmLink)) {
+    const stat = lstatSync(nmLink);
+    if (!stat.isSymbolicLink()) rmSync(nmLink, { recursive: true, force: true });
+    else unlinkSync(nmLink);
+  }
+  symlinkSync(nmSource, nmLink);
 
   return { shadowPath, error: null };
 }
