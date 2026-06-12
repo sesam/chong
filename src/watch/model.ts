@@ -31,6 +31,7 @@ export type WatchConfig = {
   repoPath: string;
   remote: string;
   branches: string[]; // ordered upstream → downstream
+  formatCmd: string; // command to run for code formatting (default: "pnpm format")
 };
 
 /** Fetch refs and assemble the full pipeline state (without CI — see enrichCI). */

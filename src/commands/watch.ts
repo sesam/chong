@@ -30,7 +30,9 @@ export async function cmdWatch(argv: string[]): Promise<void> {
     throw new Error("need at least 2 branches to form a pipeline (e.g. --branches main,prod)");
   }
 
-  const cfg: WatchConfig = { repoPath, remote, branches };
+  const formatCmd = typeof flags["format-cmd"] === "string" ? flags["format-cmd"] : "pnpm format";
+
+  const cfg: WatchConfig = { repoPath, remote, branches, formatCmd };
   try {
     await runWatch(cfg, intervalMs);
   } finally {

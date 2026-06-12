@@ -13,6 +13,8 @@ export type UIState = {
   busy: boolean; // a promote/fetch is in flight
   newShas: Set<string>; // remote head-lane commits first seen since watch started
   newLocalShas: Set<string>; // local branch commits first seen since watch started
+  notices: string[]; // recent check results, newest first (max 5 shown)
+  modal: { title: string; body: string[] } | null; // leftover-files alert
 };
 
 const cols = () => process.stdout.columns || 100;
@@ -86,6 +88,22 @@ function gapRows(gap: Gap, key: string, selected: boolean, confirming: boolean):
   ];
 }
 
+function renderModal(title: string, body: string[], W: number): string {
+  const inner = Math.min(W - 4, 72);
+  const hbar = "─".repeat(inner - 2);
+  const pad = (s: string) => `  │  ${s.slice(0, inner - 6).padEnd(inner - 6)}  │`;
+  const lines = [
+    `  ┌─ ${title} ${"─".repeat(Math.max(0, inner - 4 - title.length))}┐`,
+    pad(""),
+    ...body.map(pad),
+    pad(""),
+    pad(c.dim("press any key to dismiss")),
+    `  └${hbar}┘`,
+    "",
+  ];
+  return lines.join("\n");
+}
+
 export function render(p: Pipeline, ui: UIState): string {
   const W = cols();
   const out: string[] = [];
@@ -125,6 +143,13 @@ export function render(p: Pipeline, ui: UIState): string {
   }
   out.push("");
 
+  // ── check notices
+  if (ui.notices.length > 0) {
+    out.push(rule("CHECKS"));
+    for (const n of ui.notices.slice(0, 5)) out.push(`  ${n}`);
+    out.push("");
+  }
+
   // ── pipeline
   out.push(rule("PIPELINE  main → stage → prod"));
   out.push("");
@@ -163,5 +188,7 @@ export function render(p: Pipeline, ui: UIState): string {
   const promoteKeys = p.gaps.map((g, i) => `[${keys[i]}] →${g.to}`).join("  ");
   out.push(c.dim(`  ${promoteKeys}   [↑/↓] select  [space] details  [f] fetch  [r] CI  [q] quit`));
 
-  return out.join("\n");
+  const frame = out.join("\n");
+  if (ui.modal) return renderModal(ui.modal.title, ui.modal.body, W) + frame;
+  return frame;
 }

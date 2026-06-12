@@ -1,4 +1,11 @@
 import { c } from "../util";
+import {
+  checkI18n,
+  ensureShadow,
+  isAutoFix,
+  runFormatFix,
+  runI18nFix,
+} from "./checks";
 import { type WatchConfig, computePipeline, enrichCI, gapHotkeys, promote } from "./model";
 import { type UIState, render } from "./render";
 import type { Pipeline } from "./types";
@@ -11,6 +18,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   let baseline: Set<string> | null = null; // remote incoming shas at the moment watch started
   let localBaseline: Set<string> | null = null; // local branch shas at the moment watch started
   let refreshing = false;
+  const checkedShas = new Set<string>(); // shas that have been through post-commit checks
 
   const ui: UIState = {
     selectedGap: 0,
@@ -20,6 +28,8 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     busy: false,
     newShas: new Set(),
     newLocalShas: new Set(),
+    notices: [],
+    modal: null,
   };
 
   const write = (s: string) => process.stdout.write(s);
@@ -36,6 +46,74 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     write(`\x1b[H${body}\r\n\x1b[0J`);
   }
 
+  function addNotice(msg: string): void {
+    ui.notices = [msg, ...ui.notices].slice(0, 5);
+  }
+
+  async function runCommitChecks(sha: string, src: "local" | "remote"): Promise<void> {
+    if (!pipeline) return;
+    if (await isAutoFix(pipeline.repoPath, sha)) return;
+
+    const { repoPath, remote, lanes } = pipeline;
+    const headBranch = lanes[0].name;
+
+    // i18n mismatch flag
+    const i18n = await checkI18n(repoPath, sha);
+    if (i18n.mismatch) {
+      addNotice(
+        i18n.hasI18nCode
+          ? c.yellow(`⚠ ${sha.slice(0, 7)}: i18n code change without .po/.pot update`)
+          : c.yellow(`⚠ ${sha.slice(0, 7)}: .po/.pot changed without i18n code changes`),
+      );
+      paint();
+    }
+
+    if (src !== "remote") return;
+
+    const shadow = await ensureShadow(repoPath, `${remote}/${headBranch}`);
+    if (shadow.error) {
+      addNotice(c.red(`✗ shadow: ${shadow.error}`));
+      paint();
+      return;
+    }
+
+    // i18n auto-fix
+    const i18nFix = await runI18nFix(repoPath, shadow.shadowPath, remote, headBranch);
+    if (i18nFix.error) {
+      addNotice(c.red(`✗ ${sha.slice(0, 7)} i18n: ${i18nFix.error}`));
+    } else if (i18nFix.committed) {
+      addNotice(c.green(`✓ ${sha.slice(0, 7)}: pnpm i18n applied → pushed to ${headBranch}`));
+    }
+    if (i18nFix.leftovers.length > 0 && !ui.modal) {
+      ui.modal = {
+        title: "Leftover changes after pnpm i18n",
+        body: [
+          `Commit: ${sha.slice(0, 7)}`,
+          "",
+          "These files changed but were not committed:",
+          ...i18nFix.leftovers.map((f) => `  ${f}`),
+        ],
+      };
+    }
+    paint();
+
+    // Format fix
+    const formatFix = await runFormatFix(
+      repoPath,
+      shadow.shadowPath,
+      sha,
+      cfg.formatCmd,
+      remote,
+      headBranch,
+    );
+    if (formatFix.error) {
+      addNotice(c.red(`✗ ${sha.slice(0, 7)} format: ${formatFix.error}`));
+    } else if (formatFix.committed) {
+      addNotice(c.green(`✓ ${sha.slice(0, 7)}: formatting applied → pushed to ${headBranch}`));
+    }
+    paint();
+  }
+
   async function refresh(): Promise<void> {
     if (refreshing) return;
     refreshing = true;
@@ -47,8 +125,24 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
         baseline = new Set(p.incoming.map((cm) => cm.sha));
         localBaseline = new Set(p.localCommits.map((cm) => cm.sha));
       } else {
-        for (const cm of p.incoming) if (!baseline.has(cm.sha)) ui.newShas.add(cm.sha);
-        for (const cm of p.localCommits) if (!localBaseline!.has(cm.sha)) ui.newLocalShas.add(cm.sha);
+        for (const cm of p.incoming) {
+          if (!baseline.has(cm.sha)) {
+            ui.newShas.add(cm.sha);
+            if (!checkedShas.has(cm.sha)) {
+              checkedShas.add(cm.sha);
+              void runCommitChecks(cm.sha, "remote");
+            }
+          }
+        }
+        for (const cm of p.localCommits) {
+          if (!localBaseline!.has(cm.sha)) {
+            ui.newLocalShas.add(cm.sha);
+            if (!checkedShas.has(cm.sha)) {
+              checkedShas.add(cm.sha);
+              void runCommitChecks(cm.sha, "local");
+            }
+          }
+        }
       }
       pipeline = p;
       if (ui.selectedGap > p.gaps.length - 1) ui.selectedGap = Math.max(0, p.gaps.length - 1);
@@ -101,6 +195,11 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   }
 
   function onKey(s: string): void {
+    if (ui.modal) {
+      ui.modal = null;
+      paint();
+      return;
+    }
     if (!pipeline) {
       if (s === "q" || s === "\x03") quit();
       return;
