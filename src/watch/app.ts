@@ -65,12 +65,16 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   async function doPromote(idx: number): Promise<void> {
     if (!pipeline) return;
     const gap = pipeline.gaps[idx];
+    // The confirm step for a diverged gap is itself the explicit merge consent,
+    // so only then do we allow a (non-ff) merge commit.
+    const allowMerge = !gap.ff;
+    const how = gap.ff ? "fast-forward" : "merge";
     ui.confirm = null;
     ui.busy = true;
-    ui.status = c.yellow(`promoting ${gap.from} → ${gap.to}…`);
+    ui.status = c.yellow(`promoting ${gap.from} → ${gap.to} (${how})…`);
     paint();
-    const err = await promote(pipeline, idx);
-    ui.status = err ? c.red(`✗ ${err}`) : c.green(`✓ promoted ${gap.from} → ${gap.to}`);
+    const err = await promote(pipeline, idx, allowMerge);
+    ui.status = err ? c.red(`✗ ${err}`) : c.green(`✓ promoted ${gap.from} → ${gap.to} (${how})`);
     ui.busy = false;
     await refresh();
   }

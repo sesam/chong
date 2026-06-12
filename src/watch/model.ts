@@ -76,16 +76,27 @@ export async function enrichCI(pipeline: Pipeline): Promise<void> {
 }
 
 /**
- * Promote the upstream branch of `gapIndex` onto its downstream branch. Fast-forwards
- * by direct push when linear, otherwise merges via GitHub. Returns null on success.
+ * Promote the upstream branch of `gapIndex` onto its downstream branch.
+ *
+ * Fast-forward by default (direct push, linear history). When the branches have
+ * diverged a fast-forward is impossible; we only create a merge commit if the
+ * caller has explicitly opted in via `allowMerge` (the UI requires a separate,
+ * clearly-worded confirmation for that). Returns null on success, else a message.
  */
-export async function promote(pipeline: Pipeline, gapIndex: number): Promise<string | null> {
+export async function promote(
+  pipeline: Pipeline,
+  gapIndex: number,
+  allowMerge = false,
+): Promise<string | null> {
   const gap = pipeline.gaps[gapIndex];
   if (!gap) return "no such promotion";
   if (gap.ahead === 0) return `${gap.from} → ${gap.to}: nothing to promote`;
 
   if (gap.ff) {
     return repo.pushFastForward(pipeline.repoPath, pipeline.remote, gap.from, gap.to);
+  }
+  if (!allowMerge) {
+    return `${gap.from} → ${gap.to} is not a fast-forward (${gap.to} has ${gap.behind} commit(s) ${gap.from} lacks) — reconcile first, or confirm a merge`;
   }
   if (!pipeline.ghRepo) {
     return `${gap.from} and ${gap.to} have diverged (${gap.behind} behind) — can't fast-forward, and no GitHub remote to merge through`;

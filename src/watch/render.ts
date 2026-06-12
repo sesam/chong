@@ -57,11 +57,17 @@ function gapRows(gap: Gap, selected: boolean, confirming: boolean): string[] {
 
   let body: string;
   if (confirming) {
-    body = c.bold(
-      c.yellow(
-        `▸ promote ${gap.ahead} commit(s)  ${gap.from} → ${gap.to}  (${how})?  [y] yes  [n] no`,
-      ),
-    );
+    body = gap.ff
+      ? c.bold(
+          c.yellow(
+            `▸ fast-forward ${gap.ahead} commit(s)  ${gap.from} → ${gap.to}?  [y] yes  [n] no`,
+          ),
+        )
+      : c.bold(
+          c.red(
+            `⚠ NOT a fast-forward — ${gap.to} has ${gap.behind} commit(s) ${gap.from} lacks.  Create a MERGE commit?  [y] merge  [n] cancel`,
+          ),
+        );
   } else if (gap.ahead === 0) {
     body = c.dim(`✓ ${gap.to} is up to date with ${gap.from}`) + drift;
   } else {
