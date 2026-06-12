@@ -72,6 +72,8 @@ export async function computePipeline(
   }
 
   const incoming = await repo.recentLog(repoPath, remote, present[0], INCOMING_LIMIT);
+  const localBranch = await repo.currentBranch(repoPath);
+  const localCommits = await repo.localRecentLog(repoPath, localBranch, INCOMING_LIMIT);
 
   return {
     pipeline: {
@@ -81,6 +83,8 @@ export async function computePipeline(
       lanes,
       gaps,
       incoming,
+      localBranch,
+      localCommits,
       fetchedAt: Date.now(),
     },
     error: fetchErr, // surfaced as a non-fatal warning

@@ -8,7 +8,8 @@ const ALT_OFF = "\x1b[?25h\x1b[?1049l"; // show cursor + leave alt screen
 
 export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<void> {
   let pipeline: Pipeline | null = null;
-  let baseline: Set<string> | null = null; // incoming shas at the moment watch started
+  let baseline: Set<string> | null = null; // remote incoming shas at the moment watch started
+  let localBaseline: Set<string> | null = null; // local branch shas at the moment watch started
   let refreshing = false;
 
   const ui: UIState = {
@@ -18,6 +19,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     confirm: null,
     busy: false,
     newShas: new Set(),
+    newLocalShas: new Set(),
   };
 
   const write = (s: string) => process.stdout.write(s);
@@ -42,9 +44,11 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     const { pipeline: p, error } = await computePipeline(cfg);
     if (p) {
       if (baseline === null) {
-        baseline = new Set(p.incoming.map((cm) => cm.sha)); // first load = nothing "new"
+        baseline = new Set(p.incoming.map((cm) => cm.sha));
+        localBaseline = new Set(p.localCommits.map((cm) => cm.sha));
       } else {
         for (const cm of p.incoming) if (!baseline.has(cm.sha)) ui.newShas.add(cm.sha);
+        for (const cm of p.localCommits) if (!localBaseline!.has(cm.sha)) ui.newLocalShas.add(cm.sha);
       }
       pipeline = p;
       if (ui.selectedGap > p.gaps.length - 1) ui.selectedGap = Math.max(0, p.gaps.length - 1);

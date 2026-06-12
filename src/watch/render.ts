@@ -11,7 +11,8 @@ export type UIState = {
   status: string; // transient status / result line
   confirm: number | null; // gap index awaiting y/n confirmation
   busy: boolean; // a promote/fetch is in flight
-  newShas: Set<string>; // commits on the head lane first seen since watch started
+  newShas: Set<string>; // remote head-lane commits first seen since watch started
+  newLocalShas: Set<string>; // local branch commits first seen since watch started
 };
 
 const cols = () => process.stdout.columns || 100;
@@ -100,17 +101,26 @@ export function render(p: Pipeline, ui: UIState): string {
   out.push(`${c.bold(mag("chong watch"))} ${c.dim("·")} ${c.bold(title)}   ${status}`);
   out.push("");
 
-  // ── incoming
-  out.push(rule(`INCOMING · ${p.remote}/${p.lanes[0].name}`));
-  if (p.incoming.length === 0) {
+  // ── incoming (local branch + remote head lane, merged by time)
+  const headLane = p.lanes[0].name;
+  out.push(rule(`INCOMING · ${p.localBranch} · ${p.remote}/${headLane}`));
+  type Tagged = { cm: typeof p.incoming[0]; src: "local" | "remote" };
+  const localSet = new Set(p.localCommits.map((c) => c.sha));
+  const tagged: Tagged[] = [
+    ...p.localCommits.map((cm): Tagged => ({ cm, src: "local" })),
+    ...p.incoming.filter((cm) => !localSet.has(cm.sha)).map((cm): Tagged => ({ cm, src: "remote" })),
+  ];
+  tagged.sort((a, b) => (a.cm.iso < b.cm.iso ? 1 : a.cm.iso > b.cm.iso ? -1 : 0));
+  if (tagged.length === 0) {
     out.push(c.dim("  (no commits)"));
   } else {
-    for (const cm of p.incoming.slice(0, 6)) {
-      const isNew = ui.newShas.has(cm.sha);
+    for (const { cm, src } of tagged.slice(0, 8)) {
+      const isNew = src === "local" ? ui.newLocalShas.has(cm.sha) : ui.newShas.has(cm.sha);
+      const srcTag = src === "local" ? c.cyan("local ") : c.dim("remote");
       const meta = c.dim(`${cm.rel} ${cm.author}`);
-      const subj = trunc(cm.subject, W - 24 - cm.author.length);
-      const row = `  ${c.yellow(cm.short)}  ${subj}  ${meta}`;
-      out.push(isNew ? c.bgNew(row) : `   ${row}`);
+      const subj = trunc(cm.subject, W - 30 - cm.author.length);
+      const row = `  ${srcTag}  ${c.yellow(cm.short)}  ${subj}  ${meta}`;
+      out.push(isNew ? c.bgNew(row) : row);
     }
   }
   out.push("");

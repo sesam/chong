@@ -34,6 +34,8 @@ export type Pipeline = {
   ghRepo: string | null; // "OWNER/REPO" when origin is GitHub, else null
   lanes: Lane[]; // ordered upstream → downstream
   gaps: Gap[]; // between consecutive lanes; gaps[i] sits between lanes[i] and lanes[i+1]
-  incoming: Commit[]; // recent commits on the head (most-upstream) lane
+  incoming: Commit[]; // recent commits on the head (most-upstream) remote lane
+  localBranch: string; // current branch name in the watched repo
+  localCommits: Commit[]; // recent commits on the local branch
   fetchedAt: number; // epoch ms of last successful fetch
 };

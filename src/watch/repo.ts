@@ -106,6 +106,21 @@ export const repo = {
       .filter((x): x is Commit => x !== null);
   },
 
+  async currentBranch(cwd: string): Promise<string> {
+    const r = await git(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
+    return r.ok && r.out ? r.out : "HEAD";
+  },
+
+  /** Recent commits on a local branch (no remote prefix), newest first. */
+  async localRecentLog(cwd: string, branch: string, limit: number): Promise<Commit[]> {
+    const r = await git(["log", `--format=${FORMAT}`, `-n${limit}`, branch], cwd);
+    if (!r.ok || !r.out) return [];
+    return r.out
+      .split("\n")
+      .map(parseCommit)
+      .filter((x): x is Commit => x !== null);
+  },
+
   /** { ahead: commits on `from` not `to`, behind: commits on `to` not `from` }. */
   async aheadBehind(
     cwd: string,
