@@ -1,4 +1,5 @@
 import { c } from "../util";
+import { gapHotkeys } from "./model";
 import type { CIState, Gap, Lane, Pipeline } from "./types";
 
 const mag = (s: string) => `\x1b[35m${s}\x1b[0m`;
@@ -51,7 +52,7 @@ function laneRow(lane: Lane): string {
   return `${left}${trunc(subj, Math.max(10, budget))}  ${c.dim(meta)}`;
 }
 
-function gapRows(gap: Gap, selected: boolean, confirming: boolean): string[] {
+function gapRows(gap: Gap, key: string, selected: boolean, confirming: boolean): string[] {
   const how = gap.ff ? "fast-forward" : "merge";
   const drift = gap.behind > 0 ? c.red(`  ⚠ ${gap.behind} behind (drift)`) : "";
 
@@ -71,7 +72,7 @@ function gapRows(gap: Gap, selected: boolean, confirming: boolean): string[] {
   } else if (gap.ahead === 0) {
     body = c.dim(`✓ ${gap.to} is up to date with ${gap.from}`) + drift;
   } else {
-    const action = selected ? c.cyan("[p] promote") : c.dim("[p] promote");
+    const action = c.cyan(`[${key}] promote`);
     body = `${c.bold(`${gap.ahead}`)} queued for ${gap.to}   ${action} → ${gap.to} ${c.dim(`(${how})`)}${drift}`;
   }
 
@@ -116,12 +117,13 @@ export function render(p: Pipeline, ui: UIState): string {
   // ── pipeline
   out.push(rule("PIPELINE  main → stage → prod"));
   out.push("");
+  const keys = gapHotkeys(p.gaps);
   for (let i = 0; i < p.lanes.length; i++) {
     out.push(laneRow(p.lanes[i]));
     if (i < p.gaps.length) {
       const selected = ui.selectedGap === i;
       const confirming = ui.confirm === i;
-      out.push(...gapRows(p.gaps[i], selected, confirming));
+      out.push(...gapRows(p.gaps[i], keys[i], selected, confirming));
     }
   }
   out.push("");
@@ -145,9 +147,8 @@ export function render(p: Pipeline, ui: UIState): string {
   // ── status line + footer
   if (ui.status) out.push(`  ${ui.status}`);
   out.push(rule());
-  out.push(
-    c.dim("  [↑/↓] select  [space] details  [p] promote  [f] fetch  [r] refresh CI  [q] quit"),
-  );
+  const promoteKeys = p.gaps.map((g, i) => `[${keys[i]}] →${g.to}`).join("  ");
+  out.push(c.dim(`  ${promoteKeys}   [↑/↓] select  [space] details  [f] fetch  [r] CI  [q] quit`));
 
   return out.join("\n");
 }

@@ -1,9 +1,31 @@
 import { checkState, mergeBranches, parseGitHubSlug } from "./gh";
 import { repo } from "./repo";
-import type { Lane, Pipeline } from "./types";
+import type { Gap, Lane, Pipeline } from "./types";
 
 const QUEUE_LIMIT = 50; // max commits to list per gap
 const INCOMING_LIMIT = 15; // recent commits shown for the head lane
+
+// keys the TUI binds to other actions — gap hotkeys must avoid these
+const RESERVED_KEYS = new Set(["q", "f", "r", "j", "k", "y", "n", " "]);
+
+/**
+ * One promote hotkey per gap, indexed alongside `gaps`. Prefers the first letter of
+ * the target branch (stage→"s", prod→"p"); falls back to the 1-based gap number on
+ * collision or when the letter is reserved/non-alphabetic.
+ */
+export function gapHotkeys(gaps: Gap[]): string[] {
+  const used = new Set<string>();
+  return gaps.map((g, i) => {
+    const letter = g.to[0]?.toLowerCase() ?? "";
+    if (/^[a-z]$/.test(letter) && !RESERVED_KEYS.has(letter) && !used.has(letter)) {
+      used.add(letter);
+      return letter;
+    }
+    const digit = String(i + 1);
+    used.add(digit);
+    return digit;
+  });
+}
 
 export type WatchConfig = {
   repoPath: string;

@@ -1,5 +1,5 @@
 import { c } from "../util";
-import { type WatchConfig, computePipeline, enrichCI, promote } from "./model";
+import { type WatchConfig, computePipeline, enrichCI, gapHotkeys, promote } from "./model";
 import { type UIState, render } from "./render";
 import type { Pipeline } from "./types";
 
@@ -102,6 +102,21 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       return;
     }
     const maxGap = pipeline.gaps.length - 1;
+
+    // dedicated promote hotkey per gap (e.g. "s" → main→stage, "p" → stage→prod)
+    const gi = gapHotkeys(pipeline.gaps).indexOf(s);
+    if (gi >= 0) {
+      const gap = pipeline.gaps[gi];
+      ui.selectedGap = gi;
+      if (gap.ahead > 0) ui.confirm = gi;
+      else {
+        ui.confirm = null;
+        ui.status = c.dim(`${gap.from} → ${gap.to}: nothing to promote`);
+      }
+      paint();
+      return;
+    }
+
     switch (s) {
       case "q":
       case "\x03": // ctrl-c
@@ -120,12 +135,6 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       case " ":
         ui.expanded = !ui.expanded;
         break;
-      case "p": {
-        const gap = pipeline.gaps[ui.selectedGap];
-        if (gap && gap.ahead > 0) ui.confirm = ui.selectedGap;
-        else ui.status = c.dim("nothing to promote");
-        break;
-      }
       case "y":
         if (ui.confirm !== null) {
           void doPromote(ui.confirm);
