@@ -36,6 +36,8 @@ Options:
   --format-cmd <cmd>           formatter for shadow auto-fix (default: pnpm format)
 ```
 
+![chong watch TUI](chong-watch-tui-example.webp)
+
 **TUI keys:** `[s]` promote → stage · `[p]` promote → prod · `[↑/↓]` select · `[space]` queued commits · `[f]` fetch · `[r]` CI · `[q]` quit
 
 **INCOMING** shows your local branch and remote origin/main commits merged by time. Commits that arrived after `chong watch` started are highlighted green.

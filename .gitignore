@@ -1,7 +1,7 @@
 node_modules/
 bun.lockb
 /chong
-/chong-*
+/chong-*.bun-build
 *.bun-build
 .*.bun-build
 dist/
