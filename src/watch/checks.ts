@@ -77,6 +77,10 @@ export async function ensureShadow(repoPath: string, ref: string): Promise<Shado
     if (!resetR.ok) return { shadowPath, error: `reset to ${ref}: ${resetR.err}` };
   }
 
+  // Ensure deps are installed — required before any pnpm scripts run in the worktree
+  const installR = await sh(["pnpm", "install", "--frozen-lockfile"], shadowPath);
+  if (!installR.ok) return { shadowPath, error: `pnpm install: ${installR.err || installR.out}` };
+
   return { shadowPath, error: null };
 }
 

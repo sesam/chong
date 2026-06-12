@@ -6,6 +6,7 @@ import { cmdNew } from "./commands/new";
 import { cmdShow } from "./commands/show";
 import { cmdStatus } from "./commands/status";
 import { cmdUpload } from "./commands/upload";
+import { cmdShadowWork } from "./commands/shadow-work";
 import { cmdWatch } from "./commands/watch";
 import { c } from "./util";
 
@@ -20,8 +21,11 @@ const HELP = `chong — ship change-lists to the company git backend
   chong show <sha> [--repo <name>]      commit + diff + AI coaching
   chong show --latest [--repo <name>]   most recent commit on main
   chong watch [<path>] [--branches main,stage,prod] [--interval <s>] [--remote <r>]
-                                        live TUI of commits queueing through the
+              [--format-cmd <cmd>]      live TUI of commits queueing through the
                                         promotion pipeline; promote between branches
+  chong shadow-work [<path>] [--remote <r>] [--format-cmd <cmd>]
+                                        manually run i18n + format checks on the
+                                        latest origin/main commit via main-shadow
   chong auth login                      save server URL + PAT to ~/.chong/auth.json
 `;
 
@@ -54,6 +58,8 @@ async function main(): Promise<void> {
       return await cmdShow(rest);
     case "watch":
       return await cmdWatch(rest);
+    case "shadow-work":
+      return await cmdShadowWork(rest);
     default:
       console.error(c.red(`unknown command: ${cmd}`));
       process.stdout.write(HELP);
