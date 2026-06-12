@@ -7,6 +7,12 @@ export const c = {
   red: (s: string) => (TTY ? `\x1b[31m${s}\x1b[0m` : s),
   yellow: (s: string) => (TTY ? `\x1b[33m${s}\x1b[0m` : s),
   cyan: (s: string) => (TTY ? `\x1b[36m${s}\x1b[0m` : s),
+  // Dark green bg — re-applies after every reset so nested color codes don't clear it.
+  bgNew: (s: string) => {
+    if (!TTY) return s;
+    const BG = "\x1b[48;5;22m";
+    return BG + s.replace(/\x1b\[0m/g, `\x1b[0m${BG}`) + "\x1b[0m";
+  },
 };
 
 export function slugify(s: string): string {

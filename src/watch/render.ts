@@ -106,10 +106,11 @@ export function render(p: Pipeline, ui: UIState): string {
     out.push(c.dim("  (no commits)"));
   } else {
     for (const cm of p.incoming.slice(0, 6)) {
-      const fresh = ui.newShas.has(cm.sha) ? c.green("●") : " ";
+      const isNew = ui.newShas.has(cm.sha);
       const meta = c.dim(`${cm.rel} ${cm.author}`);
       const subj = trunc(cm.subject, W - 24 - cm.author.length);
-      out.push(`  ${fresh} ${c.yellow(cm.short)}  ${subj}  ${meta}`);
+      const row = `  ${c.yellow(cm.short)}  ${subj}  ${meta}`;
+      out.push(isNew ? c.bgNew(row) : `   ${row}`);
     }
   }
   out.push("");
@@ -136,8 +137,10 @@ export function render(p: Pipeline, ui: UIState): string {
       out.push(c.dim("  (nothing queued)"));
     } else {
       for (const cm of gap.queued.slice(0, 12)) {
+        const isNew = ui.newShas.has(cm.sha);
         const subj = trunc(cm.subject, W - 24 - cm.author.length);
-        out.push(`  ${c.yellow(cm.short)}  ${subj}  ${c.dim(`${cm.rel} ${cm.author}`)}`);
+        const row = `  ${c.yellow(cm.short)}  ${subj}  ${c.dim(`${cm.rel} ${cm.author}`)}`;
+        out.push(isNew ? c.bgNew(row) : row);
       }
       if (gap.queued.length > 12) out.push(c.dim(`  … and ${gap.queued.length - 12} more`));
     }
