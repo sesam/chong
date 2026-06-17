@@ -1,0 +1,28 @@
+#!/bin/sh
+# Recompile the chong binary after every commit so a built ./chong — and any
+# symlink pointing at it (e.g. ~/bin/chong) — stays in sync with the source.
+#
+# Enable in your clone with:
+#   git config core.hooksPath .githooks
+
+# Find bun: PATH first, then the usual install locations (no hard-coded user path).
+BUN="$(command -v bun 2>/dev/null || true)"
+for candidate in "$HOME/.bun/bin/bun" /opt/homebrew/bin/bun /usr/local/bin/bun; do
+  [ -n "$BUN" ] && break
+  [ -x "$candidate" ] && BUN="$candidate"
+done
+[ -n "$BUN" ] && [ -x "$BUN" ] || {
+  echo "post-commit: bun not found, skipping chong rebuild" >&2
+  exit 0
+}
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT" || exit 0
+
+echo "post-commit: rebuilding chong…"
+if "$BUN" build --compile --target=bun ./src/index.ts --outfile chong >/dev/null 2>&1; then
+  echo "post-commit: chong rebuilt → ./chong"
+else
+  echo "post-commit: chong rebuild FAILED (run 'bun run build' to see why)" >&2
+fi
+exit 0

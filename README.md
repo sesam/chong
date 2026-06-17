@@ -117,3 +117,13 @@ bun run build      # compile binary
 bun run lint       # biome check
 bun run lint:fix   # biome check --write
 ```
+
+### Auto-rebuild on commit (optional)
+
+A tracked `post-commit` hook in `.githooks/` recompiles `./chong` after every commit, so a binary you've symlinked onto your `$PATH` stays in sync with the source. Enable it once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The hook finds `bun` via `$PATH` (falling back to `~/.bun/bin`, Homebrew, or `/usr/local/bin`) — no machine-specific paths. To opt out, run `git config --unset core.hooksPath`.
