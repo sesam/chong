@@ -31,8 +31,10 @@ export async function cmdWatch(argv: string[]): Promise<void> {
   }
 
   const formatCmd = typeof flags["format-cmd"] === "string" ? flags["format-cmd"] : "pnpm format";
+  const testCmd = typeof flags["test-cmd"] === "string" ? flags["test-cmd"] : "pnpm test";
+  const i18nCmd = typeof flags["i18n-cmd"] === "string" ? flags["i18n-cmd"] : "pnpm i18n";
 
-  const cfg: WatchConfig = { repoPath, remote, branches, formatCmd };
+  const cfg: WatchConfig = { repoPath, remote, branches, formatCmd, testCmd, i18nCmd };
   try {
     await runWatch(cfg, intervalMs);
   } finally {

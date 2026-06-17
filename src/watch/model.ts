@@ -6,7 +6,7 @@ const QUEUE_LIMIT = 50; // max commits to list per gap
 const INCOMING_LIMIT = 15; // recent commits shown for the head lane
 
 // keys the TUI binds to other actions — gap hotkeys must avoid these
-const RESERVED_KEYS = new Set(["q", "f", "r", "j", "k", "y", "n", " "]);
+const RESERVED_KEYS = new Set(["q", "f", "r", "m", "j", "k", "y", "n", " "]);
 
 /**
  * One promote hotkey per gap, indexed alongside `gaps`. Prefers the first letter of
@@ -32,6 +32,8 @@ export type WatchConfig = {
   remote: string;
   branches: string[]; // ordered upstream → downstream
   formatCmd: string; // command to run for code formatting (default: "pnpm format")
+  testCmd: string; // command to run the unit tests (default: "pnpm test")
+  i18nCmd: string; // command to run i18n extraction (default: "pnpm i18n")
 };
 
 /** Fetch refs and assemble the full pipeline state (without CI — see enrichCI). */

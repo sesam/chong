@@ -34,11 +34,13 @@ Options:
   --interval <seconds>         poll interval (default: 15)
   --remote <name>              git remote (default: origin)
   --format-cmd <cmd>           formatter for shadow auto-fix (default: pnpm format)
+  --test-cmd <cmd>             unit-test command for maintenance (default: pnpm test)
+  --i18n-cmd <cmd>             i18n command for maintenance (default: pnpm i18n)
 ```
 
 ![chong watch TUI](chong-watch-tui-example.webp)
 
-**TUI keys:** `[s]` promote → stage · `[p]` promote → prod · `[↑/↓]` select · `[space]` queued commits · `[f]` fetch · `[r]` CI · `[q]` quit
+**TUI keys:** `[s]` promote → stage · `[p]` promote → prod · `[↑/↓]` select · `[space]` queued commits · `[m]` maintenance · `[f]` fetch · `[r]` CI · `[q]` quit
 
 **INCOMING** shows your local branch and remote origin/main commits merged by time. Commits that arrived after `chong watch` started are highlighted green.
 
@@ -47,6 +49,14 @@ Options:
 - Resets a `main-shadow` worktree to origin/main, runs `pnpm i18n`, commits `.po`/`.pot` changes as `FIX: pnpm i18n` and pushes
 - Runs the format command on the changed files, commits as `FIX: code formatting` and pushes
 - Shows a modal in the TUI if leftover files remain after the i18n fix
+
+**Maintenance** (`[m]`) runs a manual pass in the `main-shadow` worktree:
+1. Applies minor (same-major) `pnpm outdated` updates and commits `CLEAN: bump minor deps`
+2. Runs the formatter and commits `CLEAN: code style`
+3. Runs `pnpm test` — if any unit tests break, shows a short, copy-friendly LLM prompt scoped to just the broken test file(s) (so the LLM can fix and re-run only those, not the whole suite)
+4. Runs `pnpm i18n` — if it errors or leaves the tree dirty, shows a copy-friendly LLM prompt to finish the translations
+
+Steps 1–2 commit with a `CLEAN:` prefix and push; those commits are skipped by the post-commit checks. The prompts are printed flush-left and color-free so they paste cleanly. Press `[esc]` to return to the pipeline, `[m]` to re-run.
 
 ### `chong shadow-work [<path>] [options]`
 

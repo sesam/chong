@@ -5,6 +5,7 @@ import {
   isAutoFix,
   runFormatFix,
   runI18nFix,
+  runMaintenance,
 } from "./checks";
 import { type WatchConfig, computePipeline, enrichCI, gapHotkeys, promote } from "./model";
 import { type UIState, render } from "./render";
@@ -31,6 +32,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     newLocalShas: new Set(),
     notices: [],
     modal: null,
+    maintenance: null,
   };
 
   const write = (s: string) => process.stdout.write(s);
@@ -180,6 +182,58 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     await refresh();
   }
 
+  let maintaining = false;
+  async function doMaintenance(): Promise<void> {
+    if (!pipeline || maintaining) return;
+    maintaining = true;
+    ui.busy = true;
+    ui.maintenance = { running: true, steps: [], prompts: [] };
+    paint();
+
+    // Serialize with the shadow-worktree checks so maintenance and an incoming
+    // commit's auto-fix never touch main-shadow at the same time.
+    const run = async (): Promise<void> => {
+      if (!pipeline) return;
+      const { repoPath, remote, lanes } = pipeline;
+      const headBranch = lanes[0].name;
+      try {
+        const shadow = await ensureShadow(repoPath, `${remote}/${headBranch}`);
+        if (shadow.error) {
+          ui.maintenance = { running: false, steps: [`✗ shadow: ${shadow.error}`], prompts: [] };
+          return;
+        }
+        const res = await runMaintenance(
+          repoPath,
+          shadow.shadowPath,
+          { format: cfg.formatCmd, test: cfg.testCmd, i18n: cfg.i18nCmd },
+          remote,
+          headBranch,
+          (msg) => {
+            ui.maintenance = {
+              running: true,
+              steps: [...(ui.maintenance?.steps ?? []), msg],
+              prompts: ui.maintenance?.prompts ?? [],
+            };
+            paint();
+          },
+        );
+        ui.maintenance = { running: false, steps: res.steps, prompts: res.prompts };
+      } catch (e) {
+        ui.maintenance = {
+          running: false,
+          steps: [`✗ maintenance crashed: ${e instanceof Error ? e.message : String(e)}`],
+          prompts: [],
+        };
+      }
+    };
+    checkQueue = checkQueue.then(run, run);
+    await checkQueue;
+
+    ui.busy = false;
+    maintaining = false;
+    paint();
+  }
+
   // ── teardown plumbing
   let resolve!: () => void;
   const done = new Promise<void>((r) => {
@@ -201,6 +255,22 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     if (ui.modal) {
       ui.modal = null;
       paint();
+      return;
+    }
+    if (ui.maintenance) {
+      if (s === "q" || s === "\x03") {
+        quit();
+        return;
+      }
+      if (ui.maintenance.running) return; // ignore input mid-run (except quit)
+      if (s === "m") {
+        void doMaintenance();
+        return;
+      }
+      if (s === "\x1b" || s === "n") {
+        ui.maintenance = null;
+        paint();
+      }
       return;
     }
     if (!pipeline) {
@@ -251,6 +321,9 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       case "\x1b": // esc
         ui.confirm = null;
         break;
+      case "m":
+        void doMaintenance();
+        return;
       case "f":
         void refresh();
         return;

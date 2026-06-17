@@ -15,6 +15,12 @@ export type UIState = {
   newLocalShas: Set<string>; // local branch commits first seen since watch started
   notices: string[]; // recent check results, newest first (max 5 shown)
   modal: { title: string; body: string[] } | null; // leftover-files alert
+  // manual maintenance pass ([m]); when set, takes over the whole screen
+  maintenance: {
+    running: boolean;
+    steps: string[];
+    prompts: { title: string; text: string }[];
+  } | null;
 };
 
 const cols = () => process.stdout.columns || 100;
@@ -104,8 +110,39 @@ function renderModal(title: string, body: string[], W: number): string {
   return lines.join("\n");
 }
 
+function renderMaintenance(m: NonNullable<UIState["maintenance"]>, W: number): string {
+  const out: string[] = [];
+  const rule = (label = "") =>
+    label
+      ? c.dim(`── ${label} ${"─".repeat(Math.max(0, W - label.length - 5))}`)
+      : c.dim("─".repeat(W));
+
+  out.push(`${c.bold(mag("chong watch"))} ${c.dim("·")} ${c.bold("MAINTENANCE")}   (main-shadow)`);
+  out.push("");
+  out.push(rule("STEPS"));
+  for (const s of m.steps) {
+    const col = s.startsWith("✓") ? c.green : s.startsWith("⚠") ? c.yellow : c.red;
+    out.push(`  ${col(s)}`);
+  }
+  if (m.running) out.push(`  ${c.yellow("… running")}`);
+  out.push("");
+
+  // Prompts are printed flush-left and color-free so they select & paste cleanly.
+  for (const p of m.prompts) {
+    out.push(rule(`COPY PROMPT — ${p.title}`));
+    out.push("");
+    for (const line of p.text.split("\n")) out.push(line);
+    out.push("");
+  }
+
+  out.push(rule());
+  out.push(c.dim(m.running ? "  running…  [q] quit" : "  [m] re-run   [esc] back   [q] quit"));
+  return out.join("\n");
+}
+
 export function render(p: Pipeline, ui: UIState): string {
   const W = cols();
+  if (ui.maintenance) return renderMaintenance(ui.maintenance, W);
   const out: string[] = [];
   const rule = (label = "") =>
     label
@@ -122,11 +159,13 @@ export function render(p: Pipeline, ui: UIState): string {
   // ── incoming (local branch + remote head lane, merged by time)
   const headLane = p.lanes[0].name;
   out.push(rule(`INCOMING · ${p.localBranch} · ${p.remote}/${headLane}`));
-  type Tagged = { cm: typeof p.incoming[0]; src: "local" | "remote" };
+  type Tagged = { cm: (typeof p.incoming)[0]; src: "local" | "remote" };
   const localSet = new Set(p.localCommits.map((c) => c.sha));
   const tagged: Tagged[] = [
     ...p.localCommits.map((cm): Tagged => ({ cm, src: "local" })),
-    ...p.incoming.filter((cm) => !localSet.has(cm.sha)).map((cm): Tagged => ({ cm, src: "remote" })),
+    ...p.incoming
+      .filter((cm) => !localSet.has(cm.sha))
+      .map((cm): Tagged => ({ cm, src: "remote" })),
   ];
   tagged.sort((a, b) => (a.cm.iso < b.cm.iso ? 1 : a.cm.iso > b.cm.iso ? -1 : 0));
   if (tagged.length === 0) {
@@ -186,7 +225,11 @@ export function render(p: Pipeline, ui: UIState): string {
   if (ui.status) out.push(`  ${ui.status}`);
   out.push(rule());
   const promoteKeys = p.gaps.map((g, i) => `[${keys[i]}] →${g.to}`).join("  ");
-  out.push(c.dim(`  ${promoteKeys}   [↑/↓] select  [space] details  [f] fetch  [r] CI  [q] quit`));
+  out.push(
+    c.dim(
+      `  ${promoteKeys}   [↑/↓] select  [space] details  [m] maintain  [f] fetch  [r] CI  [q] quit`,
+    ),
+  );
 
   const frame = out.join("\n");
   if (ui.modal) return renderModal(ui.modal.title, ui.modal.body, W) + frame;
