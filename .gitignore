@@ -7,5 +7,9 @@ bun.lockb
 dist/
 .DS_Store
 .chong/
-.claude/
+# Ignore personal Claude Code config, but track the shared opt-in hook script.
+.claude/*
+!.claude/hooks/
+.claude/hooks/*
+!.claude/hooks/git-guard.ts
 server/.dry/
