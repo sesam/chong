@@ -19,6 +19,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   let baseline: Set<string> | null = null; // remote incoming shas at the moment watch started
   let localBaseline: Set<string> | null = null; // local branch shas at the moment watch started
   let refreshing = false;
+  const warnedBlocks = new Set<string>(); // "branch@sha" pairs already warned as blocked
   const checkedShas = new Set<string>(); // shas that have been through post-commit checks
   let checkQueue = Promise.resolve(); // serializes shadow work — prevents index.lock races
 
@@ -122,7 +123,27 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     refreshing = true;
     ui.busy = true;
     paint();
-    const { pipeline: p, error } = await computePipeline(cfg);
+    const { pipeline: p, error, synced } = await computePipeline(cfg);
+
+    // Report auto-fast-forwarded local refs. Successes are self-clearing (the ref
+    // catches up to origin), so they don't repeat; blocked branches would re-report
+    // every poll, so warn once per target sha.
+    for (const s of synced) {
+      if (s.ok) {
+        addNotice(c.green(`⇡ ${s.branch}: fast-forwarded ${s.behind} commit(s) → ${s.toShort}`));
+      } else if (s.blocked) {
+        const key = `${s.branch}@${s.originSha}`;
+        if (!warnedBlocks.has(key)) {
+          warnedBlocks.add(key);
+          addNotice(
+            c.yellow(
+              `⚠ ${s.branch}: ${s.behind} behind origin — local changes block auto fast-forward`,
+            ),
+          );
+        }
+      }
+    }
+
     if (p) {
       if (baseline === null) {
         baseline = new Set(p.incoming.map((cm) => cm.sha));

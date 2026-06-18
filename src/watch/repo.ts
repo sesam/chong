@@ -162,4 +162,70 @@ export const repo = {
     const r = await git(["push", remote, `${sha}:refs/heads/${to}`], cwd);
     return r.ok ? null : r.err || "push failed";
   },
+
+  /** Sha of a local branch, or null if the branch doesn't exist locally. */
+  async localSha(cwd: string, branch: string): Promise<string | null> {
+    const r = await git(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], cwd);
+    return r.ok && r.out ? r.out : null;
+  },
+
+  /** True if `a` is an ancestor of `b` — i.e. b can be reached from a by fast-forward. */
+  async isAncestor(cwd: string, a: string, b: string): Promise<boolean> {
+    return (await git(["merge-base", "--is-ancestor", a, b], cwd)).ok;
+  },
+
+  /** Count of commits reachable from `to` but not `from` (how far `from` is behind `to`). */
+  async behindCount(cwd: string, from: string, to: string): Promise<number> {
+    const r = await git(["rev-list", "--count", `${from}..${to}`], cwd);
+    return r.ok ? Number.parseInt(r.out, 10) || 0 : 0;
+  },
+
+  /**
+   * The worktree path where `branch` is currently checked out, or null if it isn't
+   * checked out in any worktree. Used to decide whether a local ref can be moved
+   * directly (safe) or must go through a fast-forward merge in its worktree.
+   */
+  async worktreeFor(cwd: string, branch: string): Promise<string | null> {
+    const r = await git(["worktree", "list", "--porcelain"], cwd);
+    if (!r.ok) return null;
+    let path: string | null = null;
+    for (const line of r.out.split("\n")) {
+      if (line.startsWith("worktree ")) path = line.slice("worktree ".length);
+      else if (line.startsWith("branch ")) {
+        const name = line.slice("branch ".length).replace(/^refs\/heads\//, "");
+        if (name === branch) return path;
+      }
+    }
+    return null;
+  },
+
+  /**
+   * Move a local branch ref to `newSha`, but only if it still points at `oldSha`
+   * (guards against a concurrent update). Caller must have verified this is a
+   * fast-forward; never call for a branch checked out in a worktree.
+   */
+  async updateLocalRef(
+    cwd: string,
+    branch: string,
+    newSha: string,
+    oldSha: string,
+  ): Promise<string | null> {
+    const r = await git(["update-ref", `refs/heads/${branch}`, newSha, oldSha], cwd);
+    return r.ok ? null : r.err || "update-ref failed";
+  },
+
+  /**
+   * Fast-forward the branch checked out in `worktree` up to `remote/branch`.
+   * `--ff-only` makes git refuse anything but a clean fast-forward, and git aborts
+   * (leaving the tree untouched) if local changes to the incoming files would be
+   * overwritten — so a dirty worktree is only advanced when it's safe to do so.
+   * Returns null on success, else a short reason.
+   */
+  async mergeFastForward(worktree: string, remote: string, branch: string): Promise<string | null> {
+    const r = await git(["merge", "--ff-only", `${remote}/${branch}`], worktree);
+    if (r.ok) return null;
+    // Collapse git's multi-line "local changes would be overwritten" into one line.
+    const msg = (r.err || r.out).split("\n").find(Boolean) ?? "fast-forward merge failed";
+    return msg;
+  },
 };

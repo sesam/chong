@@ -36,14 +36,80 @@ export type WatchConfig = {
   i18nCmd: string; // command to run i18n extraction (default: "pnpm i18n")
 };
 
+/** Outcome of an auto-fast-forward attempt on one local branch ref. */
+export type LocalSync = {
+  branch: string;
+  behind: number; // how many commits the local ref was behind origin
+  toShort: string; // short sha the ref was (or would be) advanced to
+  originSha: string; // full target sha — used by the caller to de-dupe notices
+  ok: boolean; // the local ref was fast-forwarded
+  blocked: boolean; // a fast-forward was possible but local changes prevented it
+  reason?: string; // detail when blocked / failed
+};
+
+/**
+ * Fast-forward local refs for the downstream tracked branches (everything below the
+ * head lane — e.g. stage, prod) up to their origin counterparts, when it's safe:
+ *
+ *  - the local branch exists and is strictly behind origin by a fast-forward
+ *    (origin is a descendant — no divergence / local-only commits), and
+ *  - either the branch isn't checked out in any worktree (we move the ref directly),
+ *    or it is checked out but the worktree changes don't conflict with the incoming
+ *    files (git's `--ff-only` merge fast-forwards, or aborts harmlessly if they do).
+ *
+ * The head lane (the branch you actively develop on) is intentionally left alone.
+ * Assumes refs were just fetched. Never rewrites history and never discards work.
+ */
+export async function syncLocalBranches(cfg: WatchConfig): Promise<LocalSync[]> {
+  const { repoPath, remote, branches } = cfg;
+  const results: LocalSync[] = [];
+
+  for (const branch of branches.slice(1)) {
+    const localSha = await repo.localSha(repoPath, branch);
+    if (!localSha) continue; // not tracked locally — nothing to fast-forward
+
+    const originSha = await repo.tip(repoPath, remote, branch);
+    if (!originSha || originSha === localSha) continue; // missing or already in sync
+
+    // Only fast-forwardable updates: origin must be a strict descendant of local.
+    if (!(await repo.isAncestor(repoPath, localSha, originSha))) continue; // diverged
+
+    const behind = await repo.behindCount(repoPath, localSha, originSha);
+    const base = {
+      branch,
+      behind,
+      toShort: originSha.slice(0, 7),
+      originSha,
+    };
+
+    const worktree = await repo.worktreeFor(repoPath, branch);
+    const err =
+      worktree === null
+        ? await repo.updateLocalRef(repoPath, branch, originSha, localSha)
+        : await repo.mergeFastForward(worktree, remote, branch);
+
+    results.push(
+      err === null
+        ? { ...base, ok: true, blocked: false }
+        : { ...base, ok: false, blocked: true, reason: err },
+    );
+  }
+
+  return results;
+}
+
 /** Fetch refs and assemble the full pipeline state (without CI — see enrichCI). */
 export async function computePipeline(
   cfg: WatchConfig,
-): Promise<{ pipeline: Pipeline | null; error: string | null }> {
+): Promise<{ pipeline: Pipeline | null; error: string | null; synced: LocalSync[] }> {
   const { repoPath, remote, branches } = cfg;
 
   const fetchErr = await repo.fetch(repoPath, remote, branches);
   // A failed fetch isn't fatal — we can still show the last-known local refs.
+
+  // Keep local downstream refs (stage/prod) in step with origin when it's safe.
+  // Done before reading branch state so the pipeline reflects the post-sync refs.
+  const synced = fetchErr ? [] : await syncLocalBranches(cfg);
 
   const present = await repo.existingRemoteBranches(repoPath, remote, branches);
   if (present.length === 0) {
@@ -52,6 +118,7 @@ export async function computePipeline(
       error:
         fetchErr ??
         `none of [${branches.join(", ")}] exist on ${remote} — pass --branches to set the right names`,
+      synced,
     };
   }
 
@@ -91,6 +158,7 @@ export async function computePipeline(
       fetchedAt: Date.now(),
     },
     error: fetchErr, // surfaced as a non-fatal warning
+    synced,
   };
 }
 
