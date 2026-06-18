@@ -1,0 +1,36 @@
+#!/bin/sh
+# Shared-index safety backstop.
+#
+# A porcelain `git commit` (or `git commit -a`) commits the ENTIRE staging area.
+# In a worktree shared with parallel agents, that can sweep in changes another
+# agent staged — e.g. a `git rm` deletion landing under an unrelated commit.
+#
+# `chong commit` assembles its commit in a private index and lands it with
+# `git commit-tree`, so it bypasses this hook entirely. This hook therefore only
+# fires for porcelain commits, which it blocks by default. Prefer:
+#
+#     chong commit -m "msg" <path>...        # commit only these paths
+#     chong commit -m "msg" --rm <a,b>        # commit deletions
+#     chong commit -m "msg" --patch <file>    # commit specific hunks
+#
+# To make a raw porcelain commit on purpose, opt in explicitly:
+#
+#     CHONG_ALLOW_COMMIT=1 git commit ...
+#
+# Enable in your clone with:  git config core.hooksPath .githooks
+[ -n "$CHONG_ALLOW_COMMIT" ] && exit 0
+
+{
+  echo "✗ blocked by chong pre-commit hook (shared-index safety)."
+  echo
+  echo "  Porcelain 'git commit' stages the whole index and can sweep in changes"
+  echo "  staged by a parallel agent in this worktree."
+  echo
+  echo "  Use an atomic commit instead:"
+  echo "      chong commit -m \"msg\" <path>...      # commit only these paths"
+  echo "      chong commit -m \"msg\" --rm <a,b>      # commit deletions"
+  echo "      chong commit -m \"msg\" --patch <file>  # commit specific hunks"
+  echo
+  echo "  To commit the whole index on purpose:  CHONG_ALLOW_COMMIT=1 git commit ..."
+} >&2
+exit 1

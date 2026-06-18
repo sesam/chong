@@ -1,9 +1,18 @@
+import { randomUUID } from "node:crypto";
+import { unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Commit } from "./types";
 
 type Run = { ok: boolean; out: string; err: string; code: number };
 
-async function git(args: string[], cwd: string): Promise<Run> {
-  const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+async function git(args: string[], cwd: string, env?: Record<string, string>): Promise<Run> {
+  const proc = Bun.spawn(["git", ...args], {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+    ...(env ? { env: { ...process.env, ...env } } : {}),
+  });
   const [out, err] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -11,6 +20,29 @@ async function git(args: string[], cwd: string): Promise<Run> {
   const code = await proc.exited;
   return { ok: code === 0, out: out.trim(), err: err.trim(), code };
 }
+
+/** Files touched by a patch, parsed from `git apply --numstat` (last tab field). */
+async function pathsInPatch(cwd: string, patchFile?: string): Promise<string[]> {
+  if (!patchFile) return [];
+  const r = await git(["apply", "--numstat", "--", patchFile], cwd);
+  if (!r.ok || !r.out) return [];
+  return r.out
+    .split("\n")
+    .map((line) => line.split("\t").pop()?.trim() ?? "")
+    .filter(Boolean);
+}
+
+export type CommitInput = {
+  message: string;
+  /** Paths whose current working-tree content should be committed (new or modified). */
+  add?: string[];
+  /** Paths to delete (committed as removals regardless of working-tree state). */
+  remove?: string[];
+  /** A unified-diff file applied with `git apply --cached` for hunk-level commits. */
+  patchFile?: string;
+};
+
+export type CommitResult = { sha: string | null; error: string | null };
 
 const SEP = "\x1f"; // unit separator — safe field delimiter inside commit metadata
 const FORMAT = ["%H", "%an", "%ar", "%aI", "%s"].join(SEP);
@@ -227,5 +259,86 @@ export const repo = {
     // Collapse git's multi-line "local changes would be overwritten" into one line.
     const msg = (r.err || r.out).split("\n").find(Boolean) ?? "fast-forward merge failed";
     return msg;
+  },
+
+  /**
+   * Build and land a commit WITHOUT touching the worktree's shared index (`.git/index`).
+   *
+   * The whole commit is assembled in a throwaway private index (`GIT_INDEX_FILE`) seeded
+   * from HEAD, turned into a tree with `write-tree`, sealed with `commit-tree`, then landed
+   * with a compare-and-swap `update-ref <new> <old>`. Because the shared index is never read
+   * or written, a parallel agent's `git add`/`commit`/`reset` in the same worktree can neither
+   * leak into this commit nor be swept up by it. If HEAD moves between read and ref update,
+   * the CAS fails and we rebuild onto the new tip (up to a few attempts).
+   *
+   * Afterwards we resync ONLY the committed paths in the shared index (`git reset -- <paths>`)
+   * so `git status` is clean for them while leaving any unrelated staged work intact.
+   */
+  async commit(cwd: string, input: CommitInput): Promise<CommitResult> {
+    const add = input.add ?? [];
+    const remove = input.remove ?? [];
+    const msg = input.message;
+    if (!msg.trim()) return { sha: null, error: "empty commit message" };
+    if (add.length === 0 && remove.length === 0 && !input.patchFile) {
+      return { sha: null, error: "nothing to commit (pass paths, --rm, or --patch)" };
+    }
+
+    // The ref HEAD points at (a branch), or "HEAD" itself when detached.
+    const sym = await git(["symbolic-ref", "--quiet", "HEAD"], cwd);
+    const ref = sym.ok && sym.out ? sym.out : "HEAD";
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const head = await git(["rev-parse", "HEAD"], cwd);
+      if (!head.ok || !head.out) return { sha: null, error: head.err || "could not resolve HEAD" };
+      const old = head.out;
+
+      const idx = join(tmpdir(), `chong-index-${randomUUID()}`);
+      const env = { GIT_INDEX_FILE: idx };
+      try {
+        // Seed the PRIVATE index from HEAD — the shared .git/index is left untouched.
+        const seed = await git(["read-tree", old], cwd, env);
+        if (!seed.ok) return { sha: null, error: seed.err || "read-tree failed" };
+
+        if (input.patchFile) {
+          const ap = await git(["apply", "--cached", "--", input.patchFile], cwd, env);
+          if (!ap.ok) return { sha: null, error: ap.err || "git apply --cached failed" };
+        }
+        if (add.length > 0) {
+          const u = await git(["update-index", "--add", "--", ...add], cwd, env);
+          if (!u.ok) return { sha: null, error: u.err || "update-index (add) failed" };
+        }
+        if (remove.length > 0) {
+          const u = await git(["update-index", "--force-remove", "--", ...remove], cwd, env);
+          if (!u.ok) return { sha: null, error: u.err || "update-index (remove) failed" };
+        }
+
+        const tree = await git(["write-tree"], cwd, env);
+        if (!tree.ok || !tree.out) return { sha: null, error: tree.err || "write-tree failed" };
+
+        // Refuse a no-op commit (resulting tree identical to HEAD's tree).
+        const oldTree = await git(["rev-parse", `${old}^{tree}`], cwd);
+        if (oldTree.ok && oldTree.out === tree.out) {
+          return { sha: null, error: "no changes to commit (tree matches HEAD)" };
+        }
+
+        // commit-tree never consults the porcelain index or runs commit hooks.
+        const made = await git(["commit-tree", tree.out, "-p", old, "-m", msg], cwd, env);
+        if (!made.ok || !made.out) return { sha: null, error: made.err || "commit-tree failed" };
+        const newSha = made.out;
+
+        // Land the branch only if it still points at `old` — atomic compare-and-swap.
+        const upd = await git(["update-ref", ref, newSha, old], cwd);
+        if (!upd.ok) continue; // HEAD moved under us; rebuild onto the new tip.
+
+        // Resync only the paths we committed so they show clean; other staged work stays put.
+        const touched = [...add, ...remove, ...(await pathsInPatch(cwd, input.patchFile))];
+        if (touched.length > 0) await git(["reset", "-q", "--", ...touched], cwd);
+
+        return { sha: newSha, error: null };
+      } finally {
+        await unlink(idx).catch(() => {});
+      }
+    }
+    return { sha: null, error: "HEAD moved repeatedly during commit; retry" };
   },
 };

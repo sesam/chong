@@ -1,4 +1,6 @@
-import { existsSync, lstatSync, rmSync, symlinkSync, unlinkSync } from "fs";
+import { createHash } from "node:crypto";
+import { lstatSync, mkdirSync, rmSync, symlinkSync, unlinkSync } from "fs";
+import { homedir } from "node:os";
 import path from "path";
 
 type Run = { ok: boolean; out: string; err: string };
@@ -57,12 +59,36 @@ export async function isAutoFix(repoPath: string, sha: string): Promise<boolean>
 
 export type ShadowInfo = { shadowPath: string; error: string | null };
 
+/**
+ * Where chong keeps a repo's main-shadow worktree: under ~/.chong/worktrees/ rather
+ * than as a sibling of the repo, so unrelated tooling (and the user) never trip over
+ * it. Keyed by repo basename + a short hash of the absolute top-level path, so two
+ * checkouts that share a basename get distinct shadow worktrees.
+ */
+export function shadowPathFor(repoPath: string): string {
+  const base = path.basename(repoPath);
+  const hash = createHash("sha1").update(repoPath).digest("hex").slice(0, 8);
+  return path.join(homedir(), ".chong", "worktrees", `${base}-main-shadow-${hash}`);
+}
+
 /** Ensure the main-shadow worktree exists and is hard-reset to `ref`. */
 export async function ensureShadow(repoPath: string, ref: string): Promise<ShadowInfo> {
-  const shadowPath = path.join(path.dirname(repoPath), "main-shadow");
+  const shadowPath = shadowPathFor(repoPath);
+  mkdirSync(path.dirname(shadowPath), { recursive: true });
 
   // Prune stale worktree entries first
   await git(["worktree", "prune"], repoPath);
+
+  // Migrate away from the old sibling location (../main-shadow), if one is still
+  // registered, so we don't leave an orphaned worktree behind.
+  const legacyPath = path.join(path.dirname(repoPath), "main-shadow");
+  if (legacyPath !== shadowPath) {
+    const reg = await git(["worktree", "list", "--porcelain"], repoPath);
+    const legacyLinked = reg.out
+      .split("\n")
+      .some((l) => l.startsWith("worktree ") && l.slice("worktree ".length).trim() === legacyPath);
+    if (legacyLinked) await git(["worktree", "remove", "--force", legacyPath], repoPath);
+  }
 
   const listR = await git(["worktree", "list", "--porcelain"], repoPath);
   const linked = listR.out
@@ -90,13 +116,16 @@ export async function ensureShadow(repoPath: string, ref: string): Promise<Shado
   }
 
   // Symlink node_modules from the source repo — same lockfile, avoids pnpm hoisting
-  // differences and is much faster than a fresh install.
+  // differences and is much faster than a fresh install. Clear any existing entry
+  // (real dir or stale/dangling symlink) with lstat so we don't follow the link.
   const nmSource = path.join(repoPath, "node_modules");
   const nmLink = path.join(shadowPath, "node_modules");
-  if (existsSync(nmLink)) {
+  try {
     const stat = lstatSync(nmLink);
-    if (!stat.isSymbolicLink()) rmSync(nmLink, { recursive: true, force: true });
-    else unlinkSync(nmLink);
+    if (stat.isSymbolicLink()) unlinkSync(nmLink);
+    else rmSync(nmLink, { recursive: true, force: true });
+  } catch {
+    /* nothing there yet */
   }
   symlinkSync(nmSource, nmLink);
 

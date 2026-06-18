@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { cmdAbandon } from "./commands/abandon";
 import { authLogin } from "./commands/auth";
+import { cmdCommit } from "./commands/commit";
 import { cmdHistory } from "./commands/history";
 import { cmdNew } from "./commands/new";
 import { cmdShow } from "./commands/show";
@@ -12,6 +13,10 @@ import { c } from "./util";
 
 const HELP = `chong — ship change-lists to the company git backend
 
+  chong commit -m "<msg>" [<path>...] [--rm <a,b>] [--patch <file>]
+                                        atomic commit that bypasses the shared git
+                                        index — safe alongside parallel agents in the
+                                        same worktree
   chong new "<title>" [--repo <name>]   create a CL + worktree off latest main
   chong upload                          format, push, squash-merge to main
   chong status                          your open chongs (local + remote)
@@ -44,6 +49,8 @@ async function main(): Promise<void> {
       console.error(c.red(`unknown auth subcommand: ${sub ?? "(none)"}`));
       process.exit(1);
     }
+    case "commit":
+      return await cmdCommit(rest);
     case "new":
       return await cmdNew(rest);
     case "upload":
