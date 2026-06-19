@@ -376,11 +376,13 @@ function failingTestFiles(output: string): string[] {
 
 /**
  * Manual maintenance pass, run in the main-shadow worktree:
- *   1. apply minor (same-major) `pnpm outdated` updates, commit + push
- *   2. run the formatter, commit `CLEAN: code style` + push
- *   3. `pnpm test` — on failure, emit a copy-friendly LLM prompt scoped to the broken test
- *   4. `pnpm i18n` — if it leaves the tree dirty or errors, emit a copy-friendly LLM prompt
- * Steps 1–2 commit with a `CLEAN:` prefix so isAutoFix skips re-checking them.
+ *   1.  apply minor (same-major) `pnpm outdated` updates, commit + push
+ *   1b. reconcile pnpm-lock.yaml with package.json, commit `FIX: pnpm lockfile` + push
+ *   2.  run the formatter, commit `CLEAN: code style` + push
+ *   3.  `pnpm test` — on failure, emit a copy-friendly LLM prompt scoped to the broken test
+ *   4.  `pnpm i18n` — if it leaves the tree dirty or errors, emit a copy-friendly LLM prompt
+ *   5.  scan the tree for hardcoded strings not wrapped in t(), emit a prompt if any
+ * Steps that commit use a `CLEAN:`/`FIX:` prefix so isAutoFix skips re-checking them.
  */
 export async function runMaintenance(
   repoPath: string,
@@ -435,6 +437,33 @@ export async function runMaintenance(
       step(`⚠ deps: pnpm update failed (${up.err || up.out})`);
     } else {
       step("✓ deps: nothing changed");
+    }
+  }
+
+  // ── 1b. reconcile the lockfile with package.json (catches a pre-existing
+  // overrides/deps mismatch on origin/main that the post-commit fix never saw,
+  // i.e. one that would break CI's `pnpm install --frozen-lockfile`).
+  onStep?.("lockfile: reconciling with package.json…");
+  const lock = await sh(["pnpm", "install", "--lockfile-only", "--no-frozen-lockfile"], shadowPath);
+  if (!lock.ok) {
+    step(`⚠ lockfile: pnpm install failed (${lock.err || lock.out})`);
+  } else {
+    const lockDirty = (await git(["status", "--porcelain"], shadowPath)).out
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => l.slice(3).trim())
+      .filter(isLockfile);
+    if (lockDirty.length === 0) {
+      step("✓ lockfile: in sync with package.json");
+    } else {
+      await git(["add", "--", ...lockDirty], shadowPath);
+      await git(["commit", "-m", "FIX: pnpm lockfile", "--no-verify"], shadowPath);
+      const pr = await push();
+      step(
+        pr.ok
+          ? `✓ lockfile: regenerated → committed & pushed to ${branch}`
+          : `⚠ lockfile: committed but push failed (${pr.err})`,
+      );
     }
   }
 

@@ -55,6 +55,7 @@ Options:
 
 **Maintenance** (`[m]`) runs a manual pass in the `main-shadow` worktree:
 1. Applies minor (same-major) `pnpm outdated` updates and commits `CLEAN: bump minor deps`
+1b. Reconciles `pnpm-lock.yaml` with `package.json` (`pnpm install --lockfile-only`) and commits `FIX: pnpm lockfile` — catches a pre-existing mismatch on origin/main that the per-commit fix never saw
 2. Runs the formatter and commits `CLEAN: code style`
 3. Runs `pnpm test` — if any unit tests break, shows a short, copy-friendly LLM prompt scoped to just the broken test file(s) (so the LLM can fix and re-run only those, not the whole suite)
 4. Runs `pnpm i18n` — if it errors or leaves the tree dirty, shows a copy-friendly LLM prompt to finish the translations
