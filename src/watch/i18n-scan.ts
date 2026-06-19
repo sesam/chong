@@ -15,11 +15,25 @@
  * positives low. The scanner is intentionally a *candidate flagger*: it points at
  * the right files/lines so a human (or an LLM, via the maintenance prompt) can do
  * the exhaustive wrapping — it does not try to be a complete extractor.
+ *
+ * To keep the report high-signal it deliberately does NOT flag:
+ *   - string literals inside a `const` object/array initializer (data tables — see
+ *     `constructionTimelineObcine.js`, colour maps, country lists, …),
+ *   - arguments to `console.*` (logs are never user copy),
+ *   - files under a `Debug*` path segment (debug-only tooling, not shipped UI).
+ * It additionally surfaces two *advisories* that the literal-only heuristic would
+ * otherwise miss: dynamic `t(variable)` keys (invisible to extraction) and
+ * user-text built by `+` concatenation; plus a "suspicious escape" flag for a
+ * stray `\n`/`\t` inside display copy.
  */
+
+export type FindingKind = "hardcoded" | "dynamic" | "concat";
 
 export type Untranslated = {
   line: number; // 1-based line within the file
   text: string; // the offending string, trimmed (and truncated for display)
+  kind?: FindingKind; // default "hardcoded"; "dynamic" = t(variable); "concat" = '…'+x
+  escape?: boolean; // true when the literal carried a stray \n / \t (suspicious in copy)
 };
 
 // .mjs is excluded: in practice it's build/tooling scripts, not product UI code.
@@ -50,13 +64,17 @@ const EXCLUDED_DIRS = new Set([
 /**
  * Paths that are scannable by extension but aren't product UI code, so they're
  * skipped by default: build scripts, tests/specs/stories, fixtures/mocks, type
- * declarations, config, and data files (e.g. `co2Data.js`, `mock-data.ts`). These
- * routinely carry non-English strings that should NOT be wrapped in t(). The
- * `chong check i18n --all` flag bypasses this to inspect everything.
+ * declarations, config, data files (e.g. `co2Data.js`, `mock-data.ts`), and
+ * anything under a `Debug*` path segment (debug-only tooling — `DebugProjects/`,
+ * `DebugRoof/`, `DebugCo2Calculator/`, …). These routinely carry non-English
+ * strings that should NOT be wrapped in t(). The `chong check i18n --all` flag
+ * bypasses this to inspect everything.
  */
 export function isExcludedPath(file: string): boolean {
   const segs = file.split("/");
   if (segs.some((s) => EXCLUDED_DIRS.has(s))) return true;
+  // Debug-only tooling: any folder or file whose name starts with "Debug".
+  if (segs.some((s) => /^Debug/.test(s))) return true;
   const base = segs[segs.length - 1];
   if (/\.(?:test|spec|stories|config)\.[cm]?[jt]sx?$/i.test(base)) return true;
   if (/\.d\.ts$/i.test(base)) return true;
@@ -89,10 +107,11 @@ export function isDisplayFile(file: string, content: string): boolean {
   return DISPLAY_SIGNALS.some((re) => re.test(content));
 }
 
-// A non-ASCII *letter* (č/š/ž and the wider European set). Uses set subtraction so
-// non-letter symbols that live in the same Unicode blocks — × ÷ © ² € — — are NOT
-// matched; those carry no language signal. The strongest "this is non-English" tell.
-const ACCENTED = /[\p{L}--\p{ASCII}]/v;
+// A non-ASCII *Latin* letter (č/š/ž and the wider accented Latin set). Restricted
+// to the Latin script via set subtraction so that (a) non-letter symbols sharing a
+// block — × ÷ © ² € — are excluded, and (b) Greek/Cyrillic/math letters — Σ Δ µ —
+// are excluded too: those show up in debug/units (`Σ rooms`, `max|Δ|`), not copy.
+const ACCENTED = /[\p{Script=Latin}--\p{ASCII}]/v;
 
 // Distinctive Slovenian function/domain words, used only for diacritic-free phrases.
 // Chosen to (almost) never collide with English UI copy or code identifiers.
@@ -103,7 +122,7 @@ const SL_WORDS =
 export function localeSignal(text: string): boolean {
   const t = text.trim();
   if (!/\p{L}{2,}/u.test(t)) return false; // needs real letters, not just punctuation/digits
-  if (ACCENTED.test(t)) return true; // accented letters → almost certainly non-English copy
+  if (ACCENTED.test(t)) return true; // accented Latin letters → almost certainly non-English copy
   // Diacritic-free: only trust multi-word phrases that hit a Slovenian function word,
   // so a lone identifier like `od` or a CSS token can't trip the check.
   if (/\S\s+\S/.test(t) && SL_WORDS.test(t)) return true;
@@ -113,13 +132,32 @@ export function localeSignal(text: string): boolean {
 // A string literal opener is "wrapped" when the code right before it is a
 // translation call: t( · $t( · tc( · te( · i18n.t( · this.$t( …
 const TRANS_CALL = /(?:[^\w$.]|^)(?:\$?t|tc|te|i18n\.t|i18n\.tc)\s*\(\s*$/;
+// Same translation-call name, but tested against the code just before a `(` (so we
+// can spot a *dynamic* `t(variable)` whose argument is not a string literal).
+const TRANS_OPEN = /(?:[^\w$.]|^)(?:\$?t|tc|te|i18n\.t|i18n\.tc)\s*$/;
+// A `console.<method>(` opener — its string arguments are diagnostics, never copy.
+const CONSOLE_OPEN =
+  /(?:^|[^\w$.])console\s*\.\s*(?:log|warn|error|info|debug|trace|group|groupCollapsed|groupEnd|table|dir|assert|count|time|timeEnd|timeLog)\s*$/;
 
-type Cand = { value: string; line: number; wrapped: boolean };
+// Characters that, as the last code token before a line break, mean the statement
+// continues onto the next line (so a `const` initializer hasn't ended yet).
+const CONTINUATION = new Set("=+-*/%&|^<>?:,.([{".split(""));
+
+type Cand = {
+  value: string;
+  line: number;
+  wrapped: boolean;
+  kind: FindingKind;
+  escape: boolean;
+};
 
 /**
- * Walk JS/TS source, yielding string-literal candidates with their 1-based line
- * (offset by `baseLine`) and whether they're a translation-call argument. Skips
- * `//` / `/* *\/` comments and `${…}` template interpolations.
+ * Walk JS/TS source, yielding candidates with their 1-based line (offset by
+ * `baseLine`). Tracks just enough structure to suppress non-copy strings:
+ *   - inside a `console.*( … )` call,
+ *   - inside a `const` object/array initializer (data tables),
+ * and to surface dynamic `t(variable)` keys. Skips `//` / `/* *\/` comments and
+ * `${…}` template interpolations (their inner code is rescanned separately).
  */
 function scanJs(src: string, baseLine: number): Cand[] {
   const out: Cand[] = [];
@@ -132,9 +170,37 @@ function scanJs(src: string, baseLine: number): Cand[] {
     if (buf.length > 48) buf = buf.slice(-48);
   };
 
+  // ── structural state ───────────────────────────────────────────────────────
+  const brackets: string[] = []; // open ( [ { chars, innermost last
+  const depth = () => brackets.length;
+  const parenConsole: boolean[] = []; // one bool per open "(" — true if a console.* call
+  let declActive = false; // inside a `const … = …` initializer
+  let declBaseDepth = 0; // bracket depth at which that `const` keyword sat
+  let declHasFunc = false; // the const initializer contains a function (=> / function)
+  let lastCode = ""; // last non-whitespace code char seen
+  const inConsole = () => parenConsole.some(Boolean);
+  // A string is "const data" only when every bracket opened inside the const
+  // initializer is an object/array literal ({ or [) — never a call (…). That keeps
+  // `const T = { a: '…' }` (a data table) suppressed while still flagging copy
+  // passed to a call like `const x = format('…')`.
+  const inConstData = () =>
+    declActive &&
+    !declHasFunc &&
+    brackets.length > declBaseDepth &&
+    brackets.slice(declBaseDepth).every((b) => b !== "(");
+
   while (i < n) {
     const ch = src[i];
     const nx = src[i + 1];
+
+    // End a `const` initializer: back at its base depth and either a `;` or a
+    // newline whose preceding token completes the expression (handles ASI / no-semi).
+    if (declActive && depth() <= declBaseDepth) {
+      if (ch === ";" || (ch === "\n" && lastCode !== "" && !CONTINUATION.has(lastCode))) {
+        declActive = false;
+        declHasFunc = false;
+      }
+    }
 
     if (ch === "\n") {
       line++;
@@ -193,22 +259,87 @@ function scanJs(src: string, baseLine: number): Cand[] {
           i++;
         }
         pushBuf(" ");
+        lastCode = "/";
         continue;
       }
       // otherwise: division operator — fall through to record it as code
+    }
+
+    // Opening bracket: maintain depth and the console-call paren stack, and detect a
+    // dynamic `t(variable)` argument (a translation call whose first arg isn't a string).
+    if (ch === "(") {
+      if (TRANS_OPEN.test(buf)) {
+        let j = i + 1;
+        while (j < n && /\s/.test(src[j] ?? "")) j++;
+        const c0 = src[j] ?? "";
+        if (c0 && !/['"`]/.test(c0) && /[A-Za-z_$]/.test(c0)) {
+          let arg = "";
+          let k = j;
+          while (k < n && src[k] !== ")" && src[k] !== "," && arg.length < 40) {
+            if (src[k] === "\n") break;
+            arg += src[k];
+            k++;
+          }
+          out.push({ value: arg.trim(), line, wrapped: false, kind: "dynamic", escape: false });
+        }
+      }
+      parenConsole.push(CONSOLE_OPEN.test(buf));
+      brackets.push("(");
+      pushBuf("(");
+      lastCode = "(";
+      i++;
+      continue;
+    }
+    if (ch === ")") {
+      parenConsole.pop();
+      if (brackets[brackets.length - 1] === "(") brackets.pop();
+      pushBuf(")");
+      lastCode = ")";
+      i++;
+      continue;
+    }
+    if (ch === "[" || ch === "{") {
+      brackets.push(ch);
+      pushBuf(ch);
+      lastCode = ch;
+      i++;
+      continue;
+    }
+    if (ch === "]" || ch === "}") {
+      const want = ch === "]" ? "[" : "{";
+      if (brackets[brackets.length - 1] === want) brackets.pop();
+      pushBuf(ch);
+      lastCode = ch;
+      i++;
+      continue;
     }
 
     if (ch === "'" || ch === '"' || ch === "`") {
       const quote = ch;
       const startLine = line;
       const wrapped = TRANS_CALL.test(buf);
+      const precededByPlus = /\+\s*$/.test(buf);
       let value = "";
+      let escape = false;
       i++; // past the opening quote
       while (i < n) {
         const cc = src[i];
         if (cc === "\\") {
-          if (src[i + 1] === "\n") line++;
-          value += src[i + 1] ?? "";
+          const e = src[i + 1];
+          if (e === "\n") {
+            line++; // line-continuation: backslash before a real newline, contributes nothing
+          } else if (e === "n") {
+            value += "\n";
+            escape = true;
+          } else if (e === "t") {
+            value += "\t";
+            escape = true;
+          } else if (e === "r") {
+            value += "\r";
+            escape = true;
+          } else {
+            value += e ?? "";
+          }
           i += 2;
           continue;
         }
@@ -227,11 +358,11 @@ function scanJs(src: string, baseLine: number): Cand[] {
         if (quote === "`" && cc === "$" && src[i + 1] === "{") {
           // skip the interpolation entirely; treat it as a word boundary
           i += 2;
-          let depth = 1;
-          while (i < n && depth > 0) {
+          let d = 1;
+          while (i < n && d > 0) {
             const k = src[i];
-            if (k === "{") depth++;
-            else if (k === "}") depth--;
+            if (k === "{") d++;
+            else if (k === "}") d--;
             else if (k === "\n") line++;
             i++;
           }
@@ -245,13 +376,44 @@ function scanJs(src: string, baseLine: number): Cand[] {
         value += cc;
         i++;
       }
-      if (localeSignal(value)) out.push({ value: value.trim(), line: startLine, wrapped });
+      // A string is non-copy when it's a console argument or a value inside a
+      // `const` data table (object/array initializer) — skip those entirely.
+      const suppressed = inConsole() || inConstData();
+      if (!suppressed && localeSignal(value)) {
+        let followedByPlus = false;
+        let p = i;
+        while (p < n && /\s/.test(src[p] ?? "")) p++;
+        if (src[p] === "+") followedByPlus = true;
+        out.push({
+          value: value.trim(),
+          line: startLine,
+          wrapped,
+          kind: precededByPlus || followedByPlus ? "concat" : "hardcoded",
+          escape,
+        });
+      }
       buf = ")"; // a string is an operand: a following `/` is division, not regex
+      lastCode = ")";
       continue;
     }
 
+    // Plain code char. Record it, then watch for `const` / function markers.
+    if (!/\s/.test(ch)) lastCode = ch;
     pushBuf(ch);
     i++;
+
+    // A `const` keyword just completed (followed by a space/tab — "constructor"
+    // and friends never match because the boundary char is a word char).
+    if (!declActive && /(?:^|[^\w$.])const[ \t]$/.test(buf)) {
+      declActive = true;
+      declBaseDepth = depth();
+      declHasFunc = false;
+    }
+    // A function inside the initializer means its body is real code, not a data
+    // table, so const-data suppression must not apply to strings within it.
+    if (declActive && (buf.endsWith("=>") || /(?:^|[^\w$.])function\b/.test(buf))) {
+      declHasFunc = true;
+    }
   }
   return out;
 }
@@ -293,6 +455,8 @@ function scanVueTemplate(content: string): Cand[] {
         value: text.trim().replace(/\s+/g, " "),
         line: lineAt(content, at),
         wrapped: false,
+        kind: "hardcoded",
+        escape: false,
       });
     }
   }
@@ -334,8 +498,16 @@ export function findUntranslated(content: string, filename: string): Untranslate
   }
 
   return cands
-    .filter((cd) => !cd.wrapped && cd.value.trim().length > 0 && !looksLikeCode(cd.value))
-    .map((cd) => ({ line: cd.line, text: truncate(cd.value) }));
+    .filter((cd) => {
+      if (cd.wrapped || cd.value.trim().length === 0) return false;
+      if (cd.kind === "dynamic") return true; // advisory: the arg is an identifier, not copy
+      return !looksLikeCode(cd.value);
+    })
+    .map((cd) => {
+      const f: Untranslated = { line: cd.line, text: truncate(cd.value), kind: cd.kind };
+      if (cd.escape) f.escape = true;
+      return f;
+    });
 }
 
 /**

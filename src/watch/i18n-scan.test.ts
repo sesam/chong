@@ -118,6 +118,84 @@ describe("findUntranslated", () => {
   });
 });
 
+describe("localeSignal — narrowed to Latin script", () => {
+  test("does not flag Greek/math letters used as symbols (Σ, Δ, µ)", () => {
+    expect(localeSignal("Σ rooms")).toBe(false);
+    expect(localeSignal("max|Δ|≈ %")).toBe(false);
+    expect(localeSignal("µ value")).toBe(false);
+  });
+  test("still flags accented Latin copy", () => {
+    expect(localeSignal("Površina objekta")).toBe(true);
+  });
+});
+
+describe("findUntranslated — suppressions", () => {
+  test("skips strings inside a const object/array data table", () => {
+    const src = [
+      "const OBCINE = [",
+      "  { name: 'Ajdovščina' },", // data table → skipped
+      "]",
+      "const title = 'Dobrodošli'", // scalar const → still flagged
+    ].join("\n");
+    const found = findUntranslated(src, "data.ts");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.text).toBe("Dobrodošli");
+    expect(found[0]?.line).toBe(4);
+  });
+
+  test("still flags copy passed to a call inside a const (not a data literal)", () => {
+    const src = "const label = format('Sončna elektrarna')";
+    const found = findUntranslated(src, "a.ts");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.text).toContain("Sončna");
+  });
+
+  test("skips console.* arguments (incl. non-first args)", () => {
+    const src = "console.log('[Tag]', 'Napaka pri nalaganju', x)";
+    expect(findUntranslated(src, "a.ts")).toHaveLength(0);
+  });
+});
+
+describe("findUntranslated — advisories", () => {
+  test("flags a dynamic t(variable) key", () => {
+    const src = "const s = t(messageKey)";
+    const found = findUntranslated(src, "a.ts");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.kind).toBe("dynamic");
+    expect(found[0]?.text).toBe("messageKey");
+  });
+
+  test("does not flag t('literal') as dynamic", () => {
+    const src = "const s = t('Cost estimate')";
+    expect(findUntranslated(src, "a.ts")).toHaveLength(0);
+  });
+
+  test("classifies concatenated user text as concat", () => {
+    const src = "const s = 'Vaša hiša: ' + area + ' m²'";
+    const found = findUntranslated(src, "a.ts");
+    expect(found.some((f) => f.kind === "concat" && f.text.includes("Vaša"))).toBe(true);
+  });
+
+  test("flags a stray \\n inside copy and de-mangles the text", () => {
+    const src = "function f(){ return 'Ključni\\npoudarek' }";
+    const found = findUntranslated(src, "a.ts");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.text).toBe("Ključni poudarek");
+    expect(found[0]?.escape).toBe(true);
+  });
+});
+
+describe("isExcludedPath — Debug* tooling", () => {
+  test("excludes Debug* folders and files", () => {
+    expect(isExcludedPath("src/features/DebugProjects/i2FootprintClusters.js")).toBe(true);
+    expect(isExcludedPath("src/features/DebugRoof/DebugFloorCards.vue")).toBe(true);
+    expect(isExcludedPath("src/features/DebugCo2Calculator/GeometryStep.vue")).toBe(true);
+  });
+  test("does not exclude normal feature folders", () => {
+    expect(isExcludedPath("src/features/Journal/BuildabilityReportTab.vue")).toBe(false);
+  });
+});
+
 describe("addedLineNumbers", () => {
   test("collects added new-side line numbers per file", () => {
     const diff = [
