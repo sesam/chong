@@ -22,9 +22,10 @@ export type Untranslated = {
   text: string; // the offending string, trimmed (and truncated for display)
 };
 
-const SCANNABLE = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue"]);
+// .mjs is excluded: in practice it's build/tooling scripts, not product UI code.
+const SCANNABLE = new Set([".js", ".jsx", ".ts", ".tsx", ".cjs", ".vue"]);
 
-/** True for source files worth scanning (skips .po/.json/.css/.md/assets/etc.). */
+/** True for source files worth scanning (skips .mjs/.po/.json/.css/.md/assets/etc.). */
 export function isScannable(file: string): boolean {
   const dot = file.lastIndexOf(".");
   return dot >= 0 && SCANNABLE.has(file.slice(dot).toLowerCase());

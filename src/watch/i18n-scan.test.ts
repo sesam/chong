@@ -140,6 +140,7 @@ describe("isScannable", () => {
     expect(isScannable("c.po")).toBe(false);
     expect(isScannable("d.json")).toBe(false);
     expect(isScannable("e.md")).toBe(false);
+    expect(isScannable("f.mjs")).toBe(false);
   });
 });
 
