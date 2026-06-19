@@ -6,6 +6,7 @@ import {
   isAutoFix,
   runFormatFix,
   runI18nFix,
+  runLockfileFix,
   runMaintenance,
   scanCommitForUntranslated,
 } from "./checks";
@@ -119,6 +120,16 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
           ...i18nFix.leftovers.map((f) => `  ${f}`),
         ],
       };
+    }
+    paint();
+
+    // Lockfile fix: a package.json change without a matching lockfile update breaks
+    // CI's --frozen-lockfile install. Regenerate pnpm-lock.yaml and push.
+    const lockFix = await runLockfileFix(repoPath, shadow.shadowPath, sha, remote, headBranch);
+    if (lockFix.error) {
+      addNotice(c.red(`✗ ${sha.slice(0, 7)} lockfile: ${lockFix.error}`));
+    } else if (lockFix.committed) {
+      addNotice(c.green(`✓ ${sha.slice(0, 7)}: pnpm lockfile updated → pushed to ${headBranch}`));
     }
     paint();
 

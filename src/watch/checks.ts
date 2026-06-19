@@ -283,6 +283,66 @@ export async function runFormatFix(
   return { committed: true, pushed: true, leftovers: [], error: null };
 }
 
+const isManifest = (f: string) => f === "package.json" || f.endsWith("/package.json");
+const isLockfile = (f: string) => f === "pnpm-lock.yaml" || f.endsWith("/pnpm-lock.yaml");
+
+/**
+ * When a commit changes a `package.json` (deps, `overrides`, …) but not the
+ * lockfile, CI's `pnpm install --frozen-lockfile` fails with
+ * ERR_PNPM_LOCKFILE_CONFIG_MISMATCH. Regenerate the lockfile in shadow
+ * (`pnpm install --lockfile-only`, which leaves the symlinked node_modules
+ * untouched), commit `FIX: pnpm lockfile`, and push.
+ *
+ * No-ops when the commit didn't touch a manifest, or already updated the lockfile.
+ */
+export async function runLockfileFix(
+  repoPath: string,
+  shadowPath: string,
+  sha: string,
+  remote: string,
+  branch: string,
+): Promise<FixResult> {
+  const files = await commitFiles(repoPath, sha);
+  if (!files.some(isManifest) || files.some(isLockfile)) {
+    return { committed: false, pushed: false, leftovers: [], error: null };
+  }
+
+  const r = await sh(["pnpm", "install", "--lockfile-only", "--no-frozen-lockfile"], shadowPath);
+  if (!r.ok) {
+    return {
+      committed: false,
+      pushed: false,
+      leftovers: [],
+      error: `pnpm install: ${r.err || r.out}`,
+    };
+  }
+
+  const statusR = await git(["status", "--porcelain"], shadowPath);
+  if (!statusR.out) return { committed: false, pushed: false, leftovers: [], error: null };
+
+  const changed = statusR.out
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => l.slice(3).trim());
+  const lockFiles = changed.filter(isLockfile);
+  const leftovers = changed.filter((f) => !isLockfile(f));
+
+  if (lockFiles.length === 0) return { committed: false, pushed: false, leftovers, error: null };
+
+  await git(["add", "--", ...lockFiles], shadowPath);
+  const commitR = await git(["commit", "-m", "FIX: pnpm lockfile", "--no-verify"], shadowPath);
+  if (!commitR.ok) {
+    return { committed: false, pushed: false, leftovers, error: `commit: ${commitR.err}` };
+  }
+
+  const pushR = await git(["push", remote, `HEAD:refs/heads/${branch}`], shadowPath);
+  if (!pushR.ok) {
+    return { committed: true, pushed: false, leftovers, error: `push: ${pushR.err}` };
+  }
+
+  return { committed: true, pushed: true, leftovers, error: null };
+}
+
 // ── maintenance (manual, [m] in the TUI) ─────────────────────────────────────
 
 /** A ready-to-paste prompt for an LLM to fix something maintenance couldn't. */
