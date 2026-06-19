@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import { c, parseArgs } from "../util";
-import { scanRepoForUntranslated } from "../watch/checks";
+import { type FileFindings, scanRepoForUntranslated } from "../watch/checks";
 import { repo } from "../watch/repo";
 
 const log = (s: string) => process.stdout.write(`${s}\n`);
@@ -63,15 +63,31 @@ export async function cmdCheck(argv: string[]): Promise<void> {
     return;
   }
 
-  // Most-affected files first, so the worst offenders are at the top.
-  results.sort((a, b) => b.findings.length - a.findings.length);
-  for (const r of results) {
-    log(`${c.cyan(r.file)} ${c.dim(`(${r.findings.length})`)}`);
-    for (const f of r.findings) log(`  ${c.dim(`${f.line}:`)} ${f.text}`);
-  }
+  // Two groups: user-facing display files (.vue / JSX / UI-rendering) first, then
+  // everything else (logic, services, content/data modules). Worst files first.
+  const byCount = (a: FileFindings, b: FileFindings) => b.findings.length - a.findings.length;
+  const ui = results.filter((r) => r.display).sort(byCount);
+  const other = results.filter((r) => !r.display).sort(byCount);
+  const countOf = (g: FileFindings[]) => g.reduce((s, r) => s + r.findings.length, 0);
 
-  log("");
-  log(`${c.yellow(String(total))} hardcoded string(s) across ${results.length} file(s)`);
+  const section = (title: string, group: FileFindings[]) => {
+    if (group.length === 0) return;
+    log(c.bold(title));
+    for (const r of group) {
+      log(`${c.cyan(r.file)} ${c.dim(`(${r.findings.length})`)}`);
+      for (const f of r.findings) log(`  ${c.dim(`${f.line}:`)} ${f.text}`);
+    }
+    log("");
+  };
+
+  section("▌ display components (.vue / UI) — prioritised", ui);
+  section("▌ other files (logic / content)", other);
+
+  log(
+    `${c.yellow(String(countOf(ui)))} in ${ui.length} display file(s)  ${c.dim("·")}  ${c.yellow(
+      String(countOf(other)),
+    )} in ${other.length} other file(s)  ${c.dim("·")}  ${total} total`,
+  );
   log(c.dim("expect false positives — this is a detection feedback view, not a fix list"));
   if (!includeExcluded) {
     log(c.dim("scripts/tests/fixtures/data files are skipped; pass --all to include them"));

@@ -65,6 +65,30 @@ export function isExcludedPath(file: string): boolean {
   return false;
 }
 
+// Signals that a non-.vue file actually renders UI (and so its strings are
+// user-facing and worth prioritising), rather than being plain logic/content.
+const DISPLAY_SIGNALS = [
+  /\.vue['"]/, // imports a .vue SFC
+  /\bdefineComponent\s*\(/,
+  /\bcreateElement\s*\(|\bReact\.createElement/,
+  /\btemplate\s*:\s*[`'"]/, // Vue options-API inline template
+  /<\/[A-Za-z][\w.-]*>/, // JSX/HTML closing tag
+  /<[A-Z][\w.]*(?:\s|\/?>)/, // JSX component element
+];
+
+/**
+ * Is this a "display" file — a Vue SFC, a JSX/TSX component, or a module that
+ * renders UI? Its strings are the ones a user actually sees, so the scan reports
+ * them first. Everything else (composables, services, content/data modules) is
+ * secondary.
+ */
+export function isDisplayFile(file: string, content: string): boolean {
+  const dot = file.lastIndexOf(".");
+  const ext = dot >= 0 ? file.slice(dot).toLowerCase() : "";
+  if (ext === ".vue" || ext === ".jsx" || ext === ".tsx") return true;
+  return DISPLAY_SIGNALS.some((re) => re.test(content));
+}
+
 // A non-ASCII *letter* (č/š/ž and the wider European set). Uses set subtraction so
 // non-letter symbols that live in the same Unicode blocks — × ÷ © ² € — — are NOT
 // matched; those carry no language signal. The strongest "this is non-English" tell.

@@ -6,6 +6,7 @@ import {
   type Untranslated,
   addedLineNumbers,
   findUntranslated,
+  isDisplayFile,
   isExcludedPath,
   isScannable,
 } from "./i18n-scan";
@@ -58,7 +59,11 @@ export async function checkI18n(repoPath: string, sha: string): Promise<I18nChec
   return { hasPo, hasI18nCode, mismatch: hasPo !== hasI18nCode };
 }
 
-export type FileFindings = { file: string; findings: Untranslated[] };
+export type FileFindings = {
+  file: string;
+  findings: Untranslated[];
+  display: boolean; // true for .vue / JSX / UI-rendering files (user-facing, prioritised)
+};
 
 /**
  * Scan only the lines a commit *added* for hardcoded strings not wrapped in `t()`.
@@ -79,7 +84,7 @@ export async function scanCommitForUntranslated(
     const show = await git(["show", `${sha}:${file}`], repoPath);
     if (!show.ok) continue; // file deleted/renamed-away at this sha
     const findings = findUntranslated(show.out, file).filter((f) => lines.has(f.line));
-    if (findings.length) results.push({ file, findings });
+    if (findings.length) results.push({ file, findings, display: isDisplayFile(file, show.out) });
   }
   return results;
 }
@@ -107,7 +112,7 @@ export async function scanRepoForUntranslated(
       continue;
     }
     const findings = findUntranslated(content, file);
-    if (findings.length) results.push({ file, findings });
+    if (findings.length) results.push({ file, findings, display: isDisplayFile(file, content) });
   }
   return results;
 }
@@ -569,9 +574,13 @@ export async function runMaintenance(
       "",
       "Wrap each in t() (use the component's t / $t in Vue templates), then run i18n extraction and fill in the translations.",
       "",
-      "Detected occurrences (this list may be partial — also scan each file below for any OTHER hardcoded user-facing copy):",
+      "Detected occurrences, user-facing display files (.vue / UI) first (this list may be partial — also scan each file below for any OTHER hardcoded user-facing copy):",
     ];
-    for (const u of untranslated.slice(0, 12)) {
+    // Prioritise display files, then by finding count.
+    const ordered = [...untranslated].sort(
+      (a, b) => Number(b.display) - Number(a.display) || b.findings.length - a.findings.length,
+    );
+    for (const u of ordered.slice(0, 12)) {
       lines.push(`  ${u.file}`);
       for (const f of u.findings.slice(0, 6)) lines.push(`    ${f.line}: ${f.text}`);
       if (u.findings.length > 6) lines.push(`    … +${u.findings.length - 6} more`);
