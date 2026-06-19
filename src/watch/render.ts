@@ -136,7 +136,7 @@ function renderMaintenance(m: NonNullable<UIState["maintenance"]>, W: number): s
   }
 
   out.push(rule());
-  out.push(c.dim(m.running ? "  running…  [q] quit" : "  [m] re-run   [esc] back   [q] quit"));
+  out.push(c.dim(m.running ? "  running…" : "  [m] re-run   [esc] back"));
   return out.join("\n");
 }
 

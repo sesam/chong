@@ -279,7 +279,9 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       return;
     }
     if (ui.maintenance) {
-      if (s === "q" || s === "\x03") {
+      // On the maintenance screen, `q` is NOT bound to quit — esc/n exit the
+      // screen and we don't want `q` to be confused with that. Ctrl+C still quits.
+      if (s === "\x03") {
         quit();
         return;
       }
