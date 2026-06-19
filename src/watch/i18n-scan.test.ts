@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { addedLineNumbers, findUntranslated, isScannable, localeSignal } from "./i18n-scan";
+import {
+  addedLineNumbers,
+  findUntranslated,
+  isExcludedPath,
+  isScannable,
+  localeSignal,
+} from "./i18n-scan";
 
 describe("localeSignal", () => {
   test("flags accented (Slovenian) copy", () => {
@@ -133,5 +139,26 @@ describe("isScannable", () => {
     expect(isScannable("b.ts")).toBe(true);
     expect(isScannable("c.po")).toBe(false);
     expect(isScannable("d.json")).toBe(false);
+    expect(isScannable("e.md")).toBe(false);
+  });
+});
+
+describe("isExcludedPath", () => {
+  test("excludes tests, scripts, fixtures, and data files", () => {
+    expect(isExcludedPath("tests/unit/siteMetadata.test.ts")).toBe(true);
+    expect(isExcludedPath("src/features/Foo/__tests__/foo.js")).toBe(true);
+    expect(isExcludedPath("src/Foo.spec.tsx")).toBe(true);
+    expect(isExcludedPath("scripts/build-renders.mjs")).toBe(true);
+    expect(isExcludedPath("src/__fixtures__/sample.js")).toBe(true);
+    expect(isExcludedPath("src/features/Co2/co2Data.js")).toBe(true);
+    expect(isExcludedPath("src/data/mock-data.ts")).toBe(true);
+    expect(isExcludedPath("src/Button.stories.ts")).toBe(true);
+    expect(isExcludedPath("src/types/api.d.ts")).toBe(true);
+  });
+
+  test("keeps real product source (incl. metadata, not a data file)", () => {
+    expect(isExcludedPath("src/features/HeatingCooling/QuestionBox.vue")).toBe(false);
+    expect(isExcludedPath("src/features/Journal/siteMetadata.js")).toBe(false);
+    expect(isExcludedPath("src/utils/costBreakdownCalculator.js")).toBe(false);
   });
 });

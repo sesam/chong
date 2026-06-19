@@ -2,7 +2,13 @@ import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { type Untranslated, addedLineNumbers, findUntranslated, isScannable } from "./i18n-scan";
+import {
+  type Untranslated,
+  addedLineNumbers,
+  findUntranslated,
+  isExcludedPath,
+  isScannable,
+} from "./i18n-scan";
 
 type Run = { ok: boolean; out: string; err: string };
 
@@ -69,7 +75,7 @@ export async function scanCommitForUntranslated(
   const added = addedLineNumbers(diffR.out);
   const results: FileFindings[] = [];
   for (const [file, lines] of added) {
-    if (!isScannable(file)) continue;
+    if (!isScannable(file) || isExcludedPath(file)) continue;
     const show = await git(["show", `${sha}:${file}`], repoPath);
     if (!show.ok) continue; // file deleted/renamed-away at this sha
     const findings = findUntranslated(show.out, file).filter((f) => lines.has(f.line));
@@ -85,10 +91,13 @@ export async function scanCommitForUntranslated(
 export async function scanRepoForUntranslated(
   repoPath: string,
   pathspec?: string,
+  includeExcluded = false,
 ): Promise<FileFindings[]> {
   const ls = await git(pathspec ? ["ls-files", "--", pathspec] : ["ls-files"], repoPath);
   if (!ls.ok) return [];
-  const files = ls.out.split("\n").filter((f) => f && isScannable(f));
+  const files = ls.out
+    .split("\n")
+    .filter((f) => f && isScannable(f) && (includeExcluded || !isExcludedPath(f)));
   const results: FileFindings[] = [];
   for (const file of files) {
     let content: string;

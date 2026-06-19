@@ -73,17 +73,20 @@ Options:
   --format-cmd <cmd>    formatter command (default: pnpm format)
 ```
 
-### `chong check i18n [<path>] [--json]`
+### `chong check i18n [<path>] [--all] [--json]`
 
 List hardcoded, user-facing strings that aren't wrapped in `t()` — the same detection the watch/maintenance flows use, run on demand so you can see the **complete, untruncated** list and tune the heuristic against real output.
 
 ```
 chong check i18n                      # scan the whole repo, worst files first
 chong check i18n src/features/Foo     # scope to a path
+chong check i18n --all                # also include skipped non-UI files
 chong check i18n --json               # machine-readable
 ```
 
-The heuristic flags string literals / Vue template text carrying a non-source-locale signal (a non-ASCII letter, or a distinctive Slovenian function word) outside a `t(...)` call. It's a candidate flagger, so **expect false positives** — log/throw strings, scripts, test fixtures and data files that are intentionally untranslated. The point is a fast feedback loop for triage, not a fix list.
+The heuristic flags string literals / Vue template text carrying a non-source-locale signal (a non-ASCII letter, or a distinctive Slovenian function word) outside a `t(...)` call. By default it skips files that routinely hold non-UI strings — build scripts, tests/specs/stories, fixtures/mocks, type declarations and data files (`*Data.js`, `*-data.ts`, …); `.md`/`.json`/assets are never scanned. `--all` includes the skipped files.
+
+It's still a candidate flagger, so **expect false positives** (log/throw strings, content/data modules that are intentionally untranslated) — the point is a fast feedback loop for triage, not a fix list.
 
 ### How `main-shadow` works
 

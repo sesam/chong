@@ -5,13 +5,15 @@ import { repo } from "../watch/repo";
 
 const log = (s: string) => process.stdout.write(`${s}\n`);
 
-const USAGE = `usage: chong check i18n [<path>] [--json]
+const USAGE = `usage: chong check i18n [<path>] [--all] [--json]
 
   Scan tracked source for hardcoded, user-facing strings that aren't wrapped in
   t() — the gap pnpm i18n can't see. Prints the complete list (file:line: text)
   so you can eyeball it and tune the detector.
 
   <path>    limit the scan to a file or directory (default: whole repo)
+  --all     include non-UI files skipped by default (scripts, tests, fixtures,
+            data files); .md and other non-source files are never scanned
   --json    machine-readable output
 
   Heuristic: a string literal / template text carrying a non-source-locale signal
@@ -37,12 +39,19 @@ export async function cmdCheck(argv: string[]): Promise<void> {
   // A path argument scopes the scan; resolve it to an absolute path so git ls-files
   // (run from the repo root) accepts it regardless of which subdir we're invoked from.
   const pathspec = positional[0] ? resolve(cwd, positional[0]) : undefined;
+  const includeExcluded = flags.all === true;
 
-  const results = await scanRepoForUntranslated(repoPath, pathspec);
+  const results = await scanRepoForUntranslated(repoPath, pathspec, includeExcluded);
   const total = results.reduce((s, r) => s + r.findings.length, 0);
 
   if (flags.json) {
-    log(JSON.stringify({ repoPath, pathspec: pathspec ?? null, total, files: results }, null, 2));
+    log(
+      JSON.stringify(
+        { repoPath, pathspec: pathspec ?? null, includeExcluded, total, files: results },
+        null,
+        2,
+      ),
+    );
     return;
   }
 
@@ -64,4 +73,7 @@ export async function cmdCheck(argv: string[]): Promise<void> {
   log("");
   log(`${c.yellow(String(total))} hardcoded string(s) across ${results.length} file(s)`);
   log(c.dim("expect false positives — this is a detection feedback view, not a fix list"));
+  if (!includeExcluded) {
+    log(c.dim("scripts/tests/fixtures/data files are skipped; pass --all to include them"));
+  }
 }

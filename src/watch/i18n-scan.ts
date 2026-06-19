@@ -24,10 +24,44 @@ export type Untranslated = {
 
 const SCANNABLE = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue"]);
 
-/** True for source files worth scanning (skips .po/.json/.css/assets/etc.). */
+/** True for source files worth scanning (skips .po/.json/.css/.md/assets/etc.). */
 export function isScannable(file: string): boolean {
   const dot = file.lastIndexOf(".");
   return dot >= 0 && SCANNABLE.has(file.slice(dot).toLowerCase());
+}
+
+// Directory segments that hold non-user-facing code (build scripts, tests, fixtures).
+const EXCLUDED_DIRS = new Set([
+  "scripts",
+  "test",
+  "tests",
+  "__tests__",
+  "__mocks__",
+  "__snapshots__",
+  "__fixtures__",
+  "fixtures",
+  "mocks",
+  "e2e",
+  "cypress",
+  ".storybook",
+]);
+
+/**
+ * Paths that are scannable by extension but aren't product UI code, so they're
+ * skipped by default: build scripts, tests/specs/stories, fixtures/mocks, type
+ * declarations, config, and data files (e.g. `co2Data.js`, `mock-data.ts`). These
+ * routinely carry non-English strings that should NOT be wrapped in t(). The
+ * `chong check i18n --all` flag bypasses this to inspect everything.
+ */
+export function isExcludedPath(file: string): boolean {
+  const segs = file.split("/");
+  if (segs.some((s) => EXCLUDED_DIRS.has(s))) return true;
+  const base = segs[segs.length - 1];
+  if (/\.(?:test|spec|stories|config)\.[cm]?[jt]sx?$/i.test(base)) return true;
+  if (/\.d\.ts$/i.test(base)) return true;
+  if (/[a-z0-9]Data\.[cm]?[jt]sx?$/.test(base)) return true; // camelCase: co2Data.js, siteData.ts
+  if (/(?:^|[-_.])(?:data|fixtures?|mock|mocks|seed|seeds)\.[cm]?[jt]sx?$/i.test(base)) return true;
+  return false;
 }
 
 // A non-ASCII *letter* (č/š/ž and the wider European set). Uses set subtraction so
