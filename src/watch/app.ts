@@ -1,3 +1,4 @@
+import path from "node:path";
 import { c } from "../util";
 import {
   checkI18n,
@@ -6,6 +7,7 @@ import {
   runFormatFix,
   runI18nFix,
   runMaintenance,
+  scanCommitForUntranslated,
 } from "./checks";
 import { type WatchConfig, computePipeline, enrichCI, gapHotkeys, promote } from "./model";
 import { type UIState, render } from "./render";
@@ -70,6 +72,25 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
           : c.yellow(`⚠ ${sha.slice(0, 7)}: .po/.pot changed without i18n code changes`),
       );
       paint();
+    }
+
+    // Hardcoded strings not wrapped in t() — cheap, diff-scoped, so run on every
+    // new commit (local or remote). pnpm i18n can't catch these; this can.
+    if (cfg.i18nScan) {
+      const untrans = await scanCommitForUntranslated(repoPath, sha);
+      if (untrans.length) {
+        const total = untrans.reduce((s, u) => s + u.findings.length, 0);
+        const where = untrans
+          .slice(0, 2)
+          .map((u) => path.basename(u.file))
+          .join(", ");
+        addNotice(
+          c.yellow(
+            `⚠ ${sha.slice(0, 7)}: ${total} hardcoded string(s) not wrapped in t() (${where}${untrans.length > 2 ? ", …" : ""}) — run [m]`,
+          ),
+        );
+        paint();
+      }
     }
 
     if (src !== "remote") return;

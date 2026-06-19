@@ -34,6 +34,7 @@ export type WatchConfig = {
   formatCmd: string; // command to run for code formatting (default: "pnpm format")
   testCmd: string; // command to run the unit tests (default: "pnpm test")
   i18nCmd: string; // command to run i18n extraction (default: "pnpm i18n")
+  i18nScan: boolean; // scan commits for hardcoded strings not wrapped in t() (default: true)
 };
 
 /** Outcome of an auto-fast-forward attempt on one local branch ref. */

@@ -36,6 +36,7 @@ Options:
   --format-cmd <cmd>           formatter for shadow auto-fix (default: pnpm format)
   --test-cmd <cmd>             unit-test command for maintenance (default: pnpm test)
   --i18n-cmd <cmd>             i18n command for maintenance (default: pnpm i18n)
+  --no-i18n-scan               disable scanning commits for hardcoded (untranslated) strings
 ```
 
 ![chong watch TUI](chong-watch-tui-example.webp)
@@ -44,8 +45,9 @@ Options:
 
 **INCOMING** shows your local branch and remote origin/main commits merged by time. Commits that arrived after `chong watch` started are highlighted green.
 
-**Post-commit checks** run automatically on each new remote commit:
+**Post-commit checks** run automatically on each new commit (local and remote):
 - Flags i18n mismatches: `t()`/`useT`/`i18n` code without `.po`/`.pot` changes, or vice versa
+- Flags **hardcoded strings** in the commit's added lines that aren't wrapped in `t()` — copy `pnpm i18n` can't see because it only extracts already-wrapped strings, so it silently stays in the source locale. Scoped to the diff, so it's cheap. Disable with `--no-i18n-scan`.
 - Resets a `main-shadow` worktree to origin/main, runs `pnpm i18n`, commits `.po`/`.pot` changes as `FIX: pnpm i18n` and pushes
 - Runs the format command on the changed files, commits as `FIX: code formatting` and pushes
 - Shows a modal in the TUI if leftover files remain after the i18n fix
@@ -55,6 +57,7 @@ Options:
 2. Runs the formatter and commits `CLEAN: code style`
 3. Runs `pnpm test` — if any unit tests break, shows a short, copy-friendly LLM prompt scoped to just the broken test file(s) (so the LLM can fix and re-run only those, not the whole suite)
 4. Runs `pnpm i18n` — if it errors or leaves the tree dirty, shows a copy-friendly LLM prompt to finish the translations
+5. Scans the whole tree for hardcoded strings not wrapped in `t()` — if any are found, shows a copy-friendly LLM prompt listing the files/lines so they can be wrapped and translated
 
 Steps 1–2 commit with a `CLEAN:` prefix and push; those commits are skipped by the post-commit checks. The prompts are printed flush-left and color-free so they paste cleanly. Press `[esc]` to return to the pipeline, `[m]` to re-run.
 
