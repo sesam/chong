@@ -22,6 +22,14 @@ describe("localeSignal", () => {
     expect(localeSignal("")).toBe(false);
     expect(localeSignal("€1,000")).toBe(false);
   });
+
+  test("does not treat non-letter symbols as accents (×, ÷, ², €, —)", () => {
+    expect(localeSignal("1376×768")).toBe(false);
+    expect(localeSignal("long / short × 100")).toBe(false);
+    expect(localeSignal("12 ÷ 4")).toBe(false);
+    expect(localeSignal("area in m²")).toBe(false);
+    expect(localeSignal("price — total")).toBe(false);
+  });
 });
 
 describe("findUntranslated", () => {
@@ -52,6 +60,33 @@ describe("findUntranslated", () => {
     const found = findUntranslated(src, "a.js");
     expect(found).toHaveLength(1);
     expect(found[0]?.text).toContain("Hlajenje");
+  });
+
+  test("does not desync on a regex literal containing a quote", () => {
+    // The apostrophe inside /['"]/ must not open a phantom string that swallows
+    // the following real code as one giant 'string'.
+    const src = ["const re = /['\"]/g", "const ok = bar(x) / 2", "const n = 5"].join("\n");
+    expect(findUntranslated(src, "a.js")).toHaveLength(0);
+  });
+
+  test("treats division after a value as division, not a regex", () => {
+    const src = "const ratio = total / count\nconst label = 'Cena na m²'";
+    // 'Cena na m²' has no accented letter and no SL function word → not flagged,
+    // but crucially the `/` must not start a regex that eats the next line.
+    expect(findUntranslated(src, "a.js")).toHaveLength(0);
+  });
+
+  test("rejects code captured as a string after a lexer mis-read", () => {
+    // Even if a desync slips through, a value carrying code syntax is dropped.
+    const src = "const x = 'const fp = scene.getObjectByName() => bar'";
+    expect(findUntranslated(src, "a.js")).toHaveLength(0);
+  });
+
+  test("a single-quoted string cannot span a newline (bails at the line)", () => {
+    const src = "const a = 'Trajnost\nconst sONČNO = 'Sončna elektrarna'";
+    // The first quote is bogus; the scanner must recover and still find the real one.
+    const found = findUntranslated(src, "a.js");
+    expect(found.some((f) => f.text.includes("Sončna"))).toBe(true);
   });
 
   test("scans Vue <script> blocks with correct line numbers", () => {

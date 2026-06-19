@@ -73,6 +73,18 @@ Options:
   --format-cmd <cmd>    formatter command (default: pnpm format)
 ```
 
+### `chong check i18n [<path>] [--json]`
+
+List hardcoded, user-facing strings that aren't wrapped in `t()` — the same detection the watch/maintenance flows use, run on demand so you can see the **complete, untruncated** list and tune the heuristic against real output.
+
+```
+chong check i18n                      # scan the whole repo, worst files first
+chong check i18n src/features/Foo     # scope to a path
+chong check i18n --json               # machine-readable
+```
+
+The heuristic flags string literals / Vue template text carrying a non-source-locale signal (a non-ASCII letter, or a distinctive Slovenian function word) outside a `t(...)` call. It's a candidate flagger, so **expect false positives** — log/throw strings, scripts, test fixtures and data files that are intentionally untranslated. The point is a fast feedback loop for triage, not a fix list.
+
 ### How `main-shadow` works
 
 For each new remote commit, chong creates (or resets) a git worktree called `main-shadow` as a sibling of the watched repo:

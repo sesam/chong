@@ -30,10 +30,10 @@ export function isScannable(file: string): boolean {
   return dot >= 0 && SCANNABLE.has(file.slice(dot).toLowerCase());
 }
 
-// Accented Latin letters (Latin-1 Supplement letters + Latin Extended-A) — covers
-// č/š/ž and the wider European set, but deliberately excludes symbols like ²/€/—
-// (those carry no language signal). The strongest "this is non-English copy" tell.
-const ACCENTED = /[À-ÿĀ-ſ]/;
+// A non-ASCII *letter* (č/š/ž and the wider European set). Uses set subtraction so
+// non-letter symbols that live in the same Unicode blocks — × ÷ © ² € — — are NOT
+// matched; those carry no language signal. The strongest "this is non-English" tell.
+const ACCENTED = /[\p{L}--\p{ASCII}]/v;
 
 // Distinctive Slovenian function/domain words, used only for diacritic-free phrases.
 // Chosen to (almost) never collide with English UI copy or code identifiers.
@@ -99,6 +99,46 @@ function scanJs(src: string, baseLine: number): Cand[] {
       continue;
     }
 
+    // A `/` that isn't a comment is either division or a regex literal. Guessing
+    // wrong desyncs the lexer (a quote inside the regex opens a phantom string that
+    // swallows code), so detect regex position: it follows an operator, an opening
+    // bracket, or a keyword — never an operand (identifier, `)`, `]`, number).
+    if (ch === "/") {
+      const before = buf.replace(/\s+$/, "");
+      const last = before.slice(-1);
+      const isRegex =
+        before === "" ||
+        "([{,;:=!&|?+-*%^~<>".includes(last) ||
+        /(?:^|[^\w$])(?:return|typeof|instanceof|case|in|of|new|delete|void|do|else|yield|await)$/.test(
+          before,
+        );
+      if (isRegex) {
+        i++; // past the opening /
+        let inClass = false;
+        while (i < n) {
+          const cc = src[i];
+          if (cc === "\\") {
+            i += 2;
+            continue;
+          }
+          if (cc === "\n") {
+            i++;
+            break;
+          } // regex can't span a raw newline → bail
+          if (cc === "[") inClass = true;
+          else if (cc === "]") inClass = false;
+          else if (cc === "/" && !inClass) {
+            i++;
+            break;
+          }
+          i++;
+        }
+        pushBuf(" ");
+        continue;
+      }
+      // otherwise: division operator — fall through to record it as code
+    }
+
     if (ch === "'" || ch === '"' || ch === "`") {
       const quote = ch;
       const startLine = line;
@@ -115,6 +155,12 @@ function scanJs(src: string, baseLine: number): Cand[] {
         }
         if (cc === "\n") {
           line++;
+          // Only template literals hold raw newlines; a newline inside '…' or "…"
+          // means we mis-read the opening quote (desync) — bail at the line.
+          if (quote !== "`") {
+            i++;
+            break;
+          }
           value += "\n";
           i++;
           continue;
@@ -141,7 +187,7 @@ function scanJs(src: string, baseLine: number): Cand[] {
         i++;
       }
       if (localeSignal(value)) out.push({ value: value.trim(), line: startLine, wrapped });
-      buf = ""; // a string token resets the look-behind for the next opener
+      buf = ")"; // a string is an operand: a following `/` is division, not regex
       continue;
     }
 
@@ -205,6 +251,12 @@ const truncate = (s: string) => {
   return one.length > DISPLAY_MAX ? `${one.slice(0, DISPLAY_MAX - 1)}…` : one;
 };
 
+// Safety net for any residual lexer desync: a captured "string" that carries code
+// syntax (arrow fns, method calls, declarations, statement breaks) is not copy.
+const CODE_ISH =
+  /=>|\)\s*\{|\?\.|;[\s)]|\.\w+\(|\b(?:const|let|var|function|return|new|RegExp|forEach|map|filter)\b/;
+const looksLikeCode = (s: string) => CODE_ISH.test(s);
+
 /** Find hardcoded, non-source-locale strings not wrapped in `t()` within one file. */
 export function findUntranslated(content: string, filename: string): Untranslated[] {
   const dot = filename.lastIndexOf(".");
@@ -223,7 +275,7 @@ export function findUntranslated(content: string, filename: string): Untranslate
   }
 
   return cands
-    .filter((cd) => !cd.wrapped && cd.value.trim().length > 0)
+    .filter((cd) => !cd.wrapped && cd.value.trim().length > 0 && !looksLikeCode(cd.value))
     .map((cd) => ({ line: cd.line, text: truncate(cd.value) }));
 }
 

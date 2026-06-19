@@ -1,13 +1,14 @@
 #!/usr/bin/env bun
 import { cmdAbandon } from "./commands/abandon";
 import { authLogin } from "./commands/auth";
+import { cmdCheck } from "./commands/check";
 import { cmdCommit } from "./commands/commit";
 import { cmdHistory } from "./commands/history";
 import { cmdNew } from "./commands/new";
+import { cmdShadowWork } from "./commands/shadow-work";
 import { cmdShow } from "./commands/show";
 import { cmdStatus } from "./commands/status";
 import { cmdUpload } from "./commands/upload";
-import { cmdShadowWork } from "./commands/shadow-work";
 import { cmdWatch } from "./commands/watch";
 import { c } from "./util";
 
@@ -31,6 +32,8 @@ const HELP = `chong — ship change-lists to the company git backend
   chong shadow-work [<path>] [--remote <r>] [--format-cmd <cmd>]
                                         manually run i18n + format checks on the
                                         latest origin/main commit via main-shadow
+  chong check i18n [<path>] [--json]    list hardcoded user-facing strings not
+                                        wrapped in t() (detection feedback view)
   chong auth login                      save server URL + PAT to ~/.chong/auth.json
 `;
 
@@ -67,6 +70,8 @@ async function main(): Promise<void> {
       return await cmdWatch(rest);
     case "shadow-work":
       return await cmdShadowWork(rest);
+    case "check":
+      return await cmdCheck(rest);
     default:
       console.error(c.red(`unknown command: ${cmd}`));
       process.stdout.write(HELP);

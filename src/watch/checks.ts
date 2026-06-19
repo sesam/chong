@@ -82,8 +82,11 @@ export async function scanCommitForUntranslated(
  * Full-tree scan for hardcoded strings not wrapped in `t()`, across all tracked
  * source files. Used by the manual maintenance pass to audit the whole repo.
  */
-export async function scanRepoForUntranslated(repoPath: string): Promise<FileFindings[]> {
-  const ls = await git(["ls-files"], repoPath);
+export async function scanRepoForUntranslated(
+  repoPath: string,
+  pathspec?: string,
+): Promise<FileFindings[]> {
+  const ls = await git(pathspec ? ["ls-files", "--", pathspec] : ["ls-files"], repoPath);
   if (!ls.ok) return [];
   const files = ls.out.split("\n").filter((f) => f && isScannable(f));
   const results: FileFindings[] = [];
@@ -564,10 +567,16 @@ export async function runMaintenance(
       for (const f of u.findings.slice(0, 6)) lines.push(`    ${f.line}: ${f.text}`);
       if (u.findings.length > 6) lines.push(`    … +${u.findings.length - 6} more`);
     }
-    if (untranslated.length > 12) lines.push(`  … +${untranslated.length - 12} more file(s)`);
+    if (untranslated.length > 12) {
+      lines.push(`  … +${untranslated.length - 12} more file(s)`);
+      lines.push("  (run `chong check i18n` for the complete, untruncated list)");
+    }
     lines.push("");
     lines.push(
-      `Some of these strings may be asserted in unit tests or shared across components — update those call sites/assertions too. After wrapping, run \`${cmds.i18n}\` and fill in the new msgstr entries until the tree is clean. Edit source + translation files only; do not run the full test suite.`,
+      "Heads up: the heuristic flags non-English string literals, so it includes false positives — log/throw messages, scripts, test fixtures, and data files that are intentionally untranslated. Use judgement; only wrap genuine user-facing copy.",
+    );
+    lines.push(
+      `Some strings may be asserted in unit tests or shared across components — update those call sites/assertions too. After wrapping, run \`${cmds.i18n}\` and fill in the new msgstr entries until the tree is clean. Edit source + translation files only; do not run the full test suite.`,
     );
     prompts.push({ title: "wrap hardcoded strings in t()", text: lines.join("\n") });
   }
