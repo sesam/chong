@@ -38,6 +38,34 @@ async function commitFiles(repoPath: string, sha: string): Promise<string[]> {
   return r.ok && r.out ? r.out.split("\n").filter(Boolean) : [];
 }
 
+/**
+ * For a `.po`/`.pot` file left dirty by `pnpm i18n`, decide whether the diff is
+ * genuine translation work (added/removed `msgid`/`msgstr`/`msgctxt` or string
+ * continuation lines) rather than only auto-regenerated comment churn — the
+ * `#. Context:` / `#: file` reference comments the extractor rewrites without
+ * touching any actual entry. Non-PO files can't be classified this way, so
+ * they're conservatively treated as meaningful.
+ */
+async function hasMeaningfulI18nChange(file: string, cwd: string): Promise<boolean> {
+  if (!file.endsWith(".po") && !file.endsWith(".pot")) return true;
+  const d = await git(["diff", "--no-color", "-U0", "--", file], cwd);
+  if (!d.ok) return true; // can't read the diff → don't suppress the warning
+  for (const l of d.out.split("\n")) {
+    if (l.startsWith("+++") || l.startsWith("---")) continue;
+    if (l[0] !== "+" && l[0] !== "-") continue;
+    const body = l.slice(1).trimStart();
+    if (
+      body.startsWith("msgid") ||
+      body.startsWith("msgstr") ||
+      body.startsWith("msgctxt") ||
+      body.startsWith('"')
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export type I18nCheck = {
   hasPo: boolean;
   hasI18nCode: boolean;
@@ -530,18 +558,30 @@ export async function runMaintenance(
         .filter(Boolean)
         .map((l) => l.slice(3).trim())
     : [];
-  if (i18n.ok && changed.length === 0) {
-    step("✓ i18n: clean");
+  // Only count files with genuine entry changes — ignore .po/.pot files left
+  // dirty by auto-regenerated comment churn (which needs no translation work).
+  const meaningful: string[] = [];
+  if (i18n.ok && changed.length) {
+    for (const f of changed) {
+      if (await hasMeaningfulI18nChange(f, shadowPath)) meaningful.push(f);
+    }
+  }
+  if (i18n.ok && meaningful.length === 0) {
+    if (changed.length) {
+      step(`✓ i18n: clean (only regenerated comments in ${changed.length} file(s))`);
+    } else {
+      step("✓ i18n: clean");
+    }
   } else {
     step(
-      `⚠ i18n: ${i18n.ok ? `${changed.length} file(s) need attention` : "command failed"} — see copy prompt below`,
+      `⚠ i18n: ${i18n.ok ? `${meaningful.length} file(s) need attention` : "command failed"} — see copy prompt below`,
     );
     const lines = [
       `Running \`${cmds.i18n}\` in this repo did not leave a clean tree. Finish the i18n work.`,
     ];
-    if (changed.length) {
+    if (meaningful.length) {
       lines.push("Files it changed (likely new/untranslated strings):");
-      for (const f of changed.slice(0, 20)) lines.push(`  ${f}`);
+      for (const f of meaningful.slice(0, 20)) lines.push(`  ${f}`);
       lines.push(
         `Fill in the missing translations (msgstr) for the new/changed entries in those .po/.pot files, then re-run \`${cmds.i18n}\` until the tree is clean.`,
       );
