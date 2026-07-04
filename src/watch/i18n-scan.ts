@@ -130,14 +130,29 @@ export function localeSignal(text: string): boolean {
 }
 
 // A string literal opener is "wrapped" when the code right before it is a
-// translation call: t( · $t( · tc( · te( · i18n.t( · this.$t( …
-const TRANS_CALL = /(?:[^\w$.]|^)(?:\$?t|tc|te|i18n\.t|i18n\.tc)\s*\(\s*$/;
+// translation call: t( · $t( · tc( · te( · i18n.t( · this.t( · this.$t( …
+const TRANS_CALL = /(?:[^\w$.]|^)(?:this\s*\.\s*)?(?:\$?t|tc|te|i18n\.t|i18n\.tc)\s*\(\s*$/;
 // Same translation-call name, but tested against the code just before a `(` (so we
 // can spot a *dynamic* `t(variable)` whose argument is not a string literal).
-const TRANS_OPEN = /(?:[^\w$.]|^)(?:\$?t|tc|te|i18n\.t|i18n\.tc)\s*$/;
+const TRANS_OPEN = /(?:[^\w$.]|^)(?:this\s*\.\s*)?(?:\$?t|tc|te|i18n\.t|i18n\.tc)\s*$/;
 // A `console.<method>(` opener — its string arguments are diagnostics, never copy.
+// Tolerates the optional-call form `console.table?.(` (used behind feature checks).
 const CONSOLE_OPEN =
-  /(?:^|[^\w$.])console\s*\.\s*(?:log|warn|error|info|debug|trace|group|groupCollapsed|groupEnd|table|dir|assert|count|time|timeEnd|timeLog)\s*$/;
+  /(?:^|[^\w$.])console\s*\.\s*(?:log|warn|error|info|debug|trace|group|groupCollapsed|groupEnd|table|dir|assert|count|time|timeEnd|timeLog)\s*(?:\?\.)?\s*$/;
+
+// The code tail right before a string literal that marks it as a *comparison /
+// lookup key*, not display copy: a `case '…'` label or an (in)equality check.
+const KEY_POSITION = /(?:(?:^|[^\w$])case\s*|[=!]==?\s*)$/;
+// Bracket member access like `props['POVRŠINA']`: the `[` follows an operand.
+// A trailing keyword (`return [`, `yield [`, …) starts an array literal instead.
+const BRACKET_AFTER_OPERAND = /(?:([A-Za-z_$][\w$]*)|[)\]])\s*\[\s*$/;
+const PRE_BRACKET_KEYWORDS =
+  /^(?:return|typeof|case|in|of|instanceof|new|delete|void|do|else|yield|await)$/;
+const isBracketAccess = (buf: string): boolean => {
+  const m = buf.match(BRACKET_AFTER_OPERAND);
+  if (!m) return false;
+  return m[1] === undefined || !PRE_BRACKET_KEYWORDS.test(m[1]);
+};
 
 // Characters that, as the last code token before a line break, mean the statement
 // continues onto the next line (so a `const` initializer hasn't ended yet).
@@ -171,23 +186,35 @@ function scanJs(src: string, baseLine: number): Cand[] {
   };
 
   // ── structural state ───────────────────────────────────────────────────────
-  const brackets: string[] = []; // open ( [ { chars, innermost last
+  const brackets: string[] = []; // open ( [ { chars, innermost last ("F" = Object.freeze()
   const depth = () => brackets.length;
   const parenConsole: boolean[] = []; // one bool per open "(" — true if a console.* call
   let declActive = false; // inside a `const … = …` initializer
   let declBaseDepth = 0; // bracket depth at which that `const` keyword sat
   let declHasFunc = false; // the const initializer contains a function (=> / function)
   let lastCode = ""; // last non-whitespace code char seen
+  let eslintDynamicOff = false; // inside an `eslint-disable no-restricted-syntax` region
+  let eslintDynamicOffLine = -1; // line covered by an `eslint-disable-next-line …`
   const inConsole = () => parenConsole.some(Boolean);
   // A string is "const data" only when every bracket opened inside the const
   // initializer is an object/array literal ({ or [) — never a call (…). That keeps
   // `const T = { a: '…' }` (a data table) suppressed while still flagging copy
-  // passed to a call like `const x = format('…')`.
+  // passed to a call like `const x = format('…')`. An `Object.freeze(…)` paren
+  // ("F") is transparent: `const D = Object.freeze({ a: '…' })` is still a table.
   const inConstData = () =>
     declActive &&
     !declHasFunc &&
     brackets.length > declBaseDepth &&
     brackets.slice(declBaseDepth).every((b) => b !== "(");
+  // The project already polices dynamic t(variable) via ESLint's
+  // no-restricted-syntax; an explicit eslint-disable for it is a deliberate
+  // opt-out (e.g. element-catalog codes), so don't re-advise on those regions.
+  const noteComment = (text: string) => {
+    if (!/no-restricted-syntax/.test(text)) return;
+    if (/eslint-disable-next-line/.test(text)) eslintDynamicOffLine = line + 1;
+    else if (/eslint-disable(?!-)/.test(text)) eslintDynamicOff = true;
+    else if (/eslint-enable/.test(text)) eslintDynamicOff = false;
+  };
 
   while (i < n) {
     const ch = src[i];
@@ -210,15 +237,19 @@ function scanJs(src: string, baseLine: number): Cand[] {
     }
     if (ch === "/" && nx === "/") {
       i += 2;
+      const start = i;
       while (i < n && src[i] !== "\n") i++;
+      noteComment(src.slice(start, i));
       continue;
     }
     if (ch === "/" && nx === "*") {
       i += 2;
+      const start = i;
       while (i < n && !(src[i] === "*" && src[i + 1] === "/")) {
         if (src[i] === "\n") line++;
         i++;
       }
+      noteComment(src.slice(start, i));
       i += 2;
       pushBuf(" ");
       continue;
@@ -280,11 +311,13 @@ function scanJs(src: string, baseLine: number): Cand[] {
             arg += src[k];
             k++;
           }
-          out.push({ value: arg.trim(), line, wrapped: false, kind: "dynamic", escape: false });
+          if (!eslintDynamicOff && line !== eslintDynamicOffLine) {
+            out.push({ value: arg.trim(), line, wrapped: false, kind: "dynamic", escape: false });
+          }
         }
       }
       parenConsole.push(CONSOLE_OPEN.test(buf));
-      brackets.push("(");
+      brackets.push(/Object\s*\.\s*freeze\s*$/.test(buf) ? "F" : "(");
       pushBuf("(");
       lastCode = "(";
       i++;
@@ -292,7 +325,8 @@ function scanJs(src: string, baseLine: number): Cand[] {
     }
     if (ch === ")") {
       parenConsole.pop();
-      if (brackets[brackets.length - 1] === "(") brackets.pop();
+      const top = brackets[brackets.length - 1];
+      if (top === "(" || top === "F") brackets.pop();
       pushBuf(")");
       lastCode = ")";
       i++;
@@ -318,6 +352,9 @@ function scanJs(src: string, baseLine: number): Cand[] {
       const quote = ch;
       const startLine = line;
       const wrapped = TRANS_CALL.test(buf);
+      // A `case '…'` label, `=== '…'` comparison, or `obj['…']` member access is a
+      // lookup key, not display copy.
+      const keyish = KEY_POSITION.test(buf) || isBracketAccess(buf);
       const precededByPlus = /\+\s*$/.test(buf);
       let value = "";
       let escape = false;
@@ -376,9 +413,10 @@ function scanJs(src: string, baseLine: number): Cand[] {
         value += cc;
         i++;
       }
-      // A string is non-copy when it's a console argument or a value inside a
-      // `const` data table (object/array initializer) — skip those entirely.
-      const suppressed = inConsole() || inConstData();
+      // A string is non-copy when it's a console argument, a value inside a
+      // `const` data table (object/array initializer), or a lookup key
+      // (case label / comparison / bracket access) — skip those entirely.
+      const suppressed = keyish || inConsole() || inConstData();
       if (!suppressed && localeSignal(value)) {
         let followedByPlus = false;
         let p = i;
@@ -480,8 +518,48 @@ const CODE_ISH =
   /=>|\)\s*\{|\?\.|;[\s)]|\.\w+\(|\b(?:const|let|var|function|return|new|RegExp|forEach|map|filter)\b/;
 const looksLikeCode = (s: string) => CODE_ISH.test(s);
 
+// Opt-out pragmas for files/lines that intentionally carry non-source-locale
+// strings that are NOT user copy (LLM prompt/context builders, ops diagnostics).
+// Usage: `// chong-i18n-disable-file — <why>` anywhere in the file, or
+// `// chong-i18n-disable-next-line <why>` / a trailing `// chong-i18n-disable-line`.
+const PRAGMA_FILE = /chong-i18n-disable-file/;
+
+/** Line numbers (1-based) covered by a line-level chong-i18n pragma. */
+function pragmaLines(content: string): Set<number> {
+  const out = new Set<number>();
+  const lines = content.split("\n");
+  for (let ln = 0; ln < lines.length; ln++) {
+    const s = lines[ln] ?? "";
+    if (s.includes("chong-i18n-disable-next-line")) out.add(ln + 2);
+    else if (s.includes("chong-i18n-disable-line")) out.add(ln + 1);
+  }
+  return out;
+}
+
+// Every string literal passed to a translation call anywhere in the file —
+// including `// t('…')` marker comments the extractor workflow recommends. Used
+// to suppress the *unwrapped* twin of a wrapped string: lookup tables and
+// normalizers ('X': () => t('X'), case 'X': return t('X')) repeat the msgid as a
+// key, and that key is not itself display copy.
+function wrappedLiterals(content: string): Set<string> {
+  const out = new Set<string>();
+  const re =
+    /(?:[^\w$.]|^)(?:this\s*\.\s*)?(?:\$?t|tc|te|i18n\.tc?)\s*\(\s*(['"`])((?:\\.|(?!\1)[^\\\n])+?)\1/g;
+  for (const m of content.matchAll(re)) {
+    out.add((m[2] ?? "").replace(/\\(.)/g, "$1").trim());
+  }
+  return out;
+}
+
 /** Find hardcoded, non-source-locale strings not wrapped in `t()` within one file. */
 export function findUntranslated(content: string, filename: string): Untranslated[] {
+  if (PRAGMA_FILE.test(content)) return [];
+  const skipLines = pragmaLines(content);
+  const wrappedElsewhere = wrappedLiterals(content);
+  // A `// t('…')` marker comment is the documented fix for dynamic keys (it makes
+  // the extractor see them). A file that carries markers has handled its dynamic
+  // t(variable) sites — stop re-advising on it.
+  const hasTMarkers = /\/\/\s*t\(\s*['"`]/.test(content);
   const dot = filename.lastIndexOf(".");
   const ext = dot >= 0 ? filename.slice(dot).toLowerCase() : "";
   const cands: Cand[] = [];
@@ -500,7 +578,9 @@ export function findUntranslated(content: string, filename: string): Untranslate
   return cands
     .filter((cd) => {
       if (cd.wrapped || cd.value.trim().length === 0) return false;
-      if (cd.kind === "dynamic") return true; // advisory: the arg is an identifier, not copy
+      if (skipLines.has(cd.line)) return false;
+      if (cd.kind === "dynamic") return !hasTMarkers; // advisory: the arg is an identifier, not copy
+      if (cd.kind === "hardcoded" && wrappedElsewhere.has(cd.value.trim())) return false;
       return !looksLikeCode(cd.value);
     })
     .map((cd) => {

@@ -154,6 +154,94 @@ describe("findUntranslated — suppressions", () => {
     const src = "console.log('[Tag]', 'Napaka pri nalaganju', x)";
     expect(findUntranslated(src, "a.ts")).toHaveLength(0);
   });
+
+  test("skips optional-call console.table?.() arguments", () => {
+    const src =
+      "console.table?.(rows.map((p) => ({ 'površina parcele (m²)': p.a, 'št. rab': p.n })))";
+    expect(findUntranslated(src, "a.ts")).toHaveLength(0);
+  });
+
+  test("treats this.t('…') / this.$t('…') as wrapped", () => {
+    const src = [
+      "function f() {",
+      "  return this.t('Življenjski slog') + this.$t('Otroška soba')",
+      "}",
+    ].join("\n");
+    expect(findUntranslated(src, "a.ts")).toHaveLength(0);
+  });
+
+  test("skips case labels and equality comparisons (lookup keys, not copy)", () => {
+    const src = [
+      "function f(v) {",
+      "  switch (v) {",
+      "    case 'Začetna faza, raziskujem možnosti':",
+      "      return 1",
+      "  }",
+      "  if (v === 'Aktivno iščem parcelo') return 2",
+      "  return v !== 'Imam parcelo, želim graditi' ? 3 : 4",
+      "}",
+    ].join("\n");
+    expect(findUntranslated(src, "a.ts")).toHaveLength(0);
+  });
+
+  test("skips bracket member-access keys like props['POVRŠINA']", () => {
+    const src = "function a(props) { return Number(props.POVRSINA ?? props['POVRŠINA']) }";
+    expect(findUntranslated(src, "a.ts")).toHaveLength(0);
+  });
+
+  test("still flags array-literal elements (a `[` after an operator is not access)", () => {
+    const src = "function f() { return ['Sončna elektrarna'] }";
+    expect(findUntranslated(src, "a.ts")).toHaveLength(1);
+  });
+
+  test("treats Object.freeze(…) as a transparent const data table", () => {
+    const src = [
+      "const DEFAULTS = Object.freeze({",
+      "  roof: 'dvokapne ali ravne strehe',",
+      "})",
+    ].join("\n");
+    expect(findUntranslated(src, "a.ts")).toHaveLength(0);
+  });
+
+  test("suppresses the unwrapped twin of a string wrapped in t() elsewhere in the file", () => {
+    const src = [
+      "const LOOKUP = [",
+      "  { base: 'Otroška soba', tr: () => t('Otroška soba') },",
+      "]",
+      "const other = 'Kopalnica in spalnica ter hodnik'", // not wrapped anywhere → flagged
+    ].join("\n");
+    const found = findUntranslated(src, "a.ts");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.text).toContain("Kopalnica");
+  });
+
+  test("a `// t('…')` marker comment counts as wrapped-elsewhere", () => {
+    const src = [
+      "// t('Začetna faza, raziskujem možnosti')",
+      "const v = 'Začetna faza, raziskujem možnosti'",
+    ].join("\n");
+    expect(findUntranslated(src, "a.ts")).toHaveLength(0);
+  });
+
+  test("chong-i18n-disable-file pragma silences the whole file", () => {
+    const src = [
+      "// chong-i18n-disable-file — LLM context, not UI",
+      "const s = 'Proračun projekta presežen'",
+    ].join("\n");
+    expect(findUntranslated(src, "a.ts")).toHaveLength(0);
+  });
+
+  test("chong-i18n-disable-next-line / -line pragmas silence single lines", () => {
+    const src = [
+      "// chong-i18n-disable-next-line ops diagnostic",
+      "const a = 'Konfiguracija hiše ni več zelena'",
+      "const b = 'Nezazidljivo zemljišče' // chong-i18n-disable-line",
+      "const c = 'Sončna elektrarna'",
+    ].join("\n");
+    const found = findUntranslated(src, "a.ts");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.text).toContain("Sončna");
+  });
 });
 
 describe("findUntranslated — advisories", () => {
@@ -182,6 +270,25 @@ describe("findUntranslated — advisories", () => {
     expect(found).toHaveLength(1);
     expect(found[0]?.text).toBe("Ključni poudarek");
     expect(found[0]?.escape).toBe(true);
+  });
+
+  test("a file with // t('…') marker comments stops getting dynamic-key advisories", () => {
+    const src = ["// t('The email field is required')", "const msg = t(errors.email)"].join("\n");
+    expect(findUntranslated(src, "Login.vue")).toHaveLength(0);
+  });
+
+  test("honors eslint-disable no-restricted-syntax for dynamic t(variable) advisories", () => {
+    const src = [
+      "/* eslint-disable no-restricted-syntax -- dynamic element catalog codes */",
+      "const a = t(code)",
+      "/* eslint-enable no-restricted-syntax */",
+      "const b = t(otherKey)",
+      "// eslint-disable-next-line no-restricted-syntax",
+      "const c = t(thirdKey)",
+    ].join("\n");
+    const found = findUntranslated(src, "a.ts");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.text).toBe("otherKey");
   });
 });
 
