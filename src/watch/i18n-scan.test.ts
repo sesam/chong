@@ -242,6 +242,17 @@ describe("findUntranslated — suppressions", () => {
     expect(found).toHaveLength(1);
     expect(found[0]?.text).toContain("Sončna");
   });
+
+  test("skips lookup / probe arguments (fieldAfter, startsWith, includes, replace)", () => {
+    const src = [
+      "fieldAfter(cover, 'številka lokacijske informacije')",
+      "if (eup.startsWith('ŽUV-')) return true",
+      "if (hay.includes('idp zupan selič - pdf app')) return true",
+      ".replace(/številka\\s*\\n\\s*informacije/gi, 'številka lokacijske informacije')",
+      "new RegExp('(?:^|\\\\n)[a-zčšž]', 'i')",
+    ].join("\n");
+    expect(findUntranslated(src, "a.ts")).toHaveLength(0);
+  });
 });
 
 describe("findUntranslated — advisories", () => {

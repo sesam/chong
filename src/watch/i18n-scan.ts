@@ -143,6 +143,11 @@ const CONSOLE_OPEN =
 // The code tail right before a string literal that marks it as a *comparison /
 // lookup key*, not display copy: a `case '…'` label or an (in)equality check.
 const KEY_POSITION = /(?:(?:^|[^\w$])case\s*|[=!]==?\s*)$/;
+// Second (or later) argument to a lookup / pattern helper — PDF field labels,
+// filename probes, EUP code prefixes, regex sources, etc. Single-arg
+// startsWith/includes probes are included when the string is a short code token.
+const LOOKUP_KEY_POSITION =
+  /(?:fieldAfter|match|split)\s*\([^)]*,\s*$|(?:startsWith|endsWith|includes|search|indexOf)\s*\(\s*$|(?:startsWith|endsWith|includes|search|indexOf)\s*\([^)]*,\s*$|(?:^|[^\w$])(?:new\s+)?RegExp\s*\(\s*$|String\.raw\s*$|\.replace\([^,]+,\s*$/;
 // Bracket member access like `props['POVRŠINA']`: the `[` follows an operand.
 // A trailing keyword (`return [`, `yield [`, …) starts an array literal instead.
 const BRACKET_AFTER_OPERAND = /(?:([A-Za-z_$][\w$]*)|[)\]])\s*\[\s*$/;
@@ -354,7 +359,7 @@ function scanJs(src: string, baseLine: number): Cand[] {
       const wrapped = TRANS_CALL.test(buf);
       // A `case '…'` label, `=== '…'` comparison, or `obj['…']` member access is a
       // lookup key, not display copy.
-      const keyish = KEY_POSITION.test(buf) || isBracketAccess(buf);
+      const keyish = KEY_POSITION.test(buf) || LOOKUP_KEY_POSITION.test(buf) || isBracketAccess(buf);
       const precededByPlus = /\+\s*$/.test(buf);
       let value = "";
       let escape = false;
@@ -516,7 +521,11 @@ const truncate = (s: string) => {
 // syntax (arrow fns, method calls, declarations, statement breaks) is not copy.
 const CODE_ISH =
   /=>|\)\s*\{|\?\.|;[\s)]|\.\w+\(|\b(?:const|let|var|function|return|new|RegExp|forEach|map|filter)\b/;
-const looksLikeCode = (s: string) => CODE_ISH.test(s);
+// Regex pattern sources (e.g. `(?:^|\\n)…`, `[a-zčšž]…`) are never display copy.
+const REGEX_ISH = /\\[sdnwtrbDSW]|(?:\(\?[:=!])|(?:\[\^?[\w-]*\])|(?:\{\d)|(?:\|[^|]+\|)/;
+const looksLikeCode = (s: string) => CODE_ISH.test(s) || REGEX_ISH.test(s);
+// Short spatial-unit / EUP code prefixes (ŽUV-, KRŠ-) used in startsWith probes.
+const looksLikeCodePrefix = (s: string) => /^[\p{Lu}ŠŽČ0-9-]{2,8}-$/u.test(s.trim());
 
 // Opt-out pragmas for files/lines that intentionally carry non-source-locale
 // strings that are NOT user copy (LLM prompt/context builders, ops diagnostics).
@@ -581,6 +590,7 @@ export function findUntranslated(content: string, filename: string): Untranslate
       if (skipLines.has(cd.line)) return false;
       if (cd.kind === "dynamic") return !hasTMarkers; // advisory: the arg is an identifier, not copy
       if (cd.kind === "hardcoded" && wrappedElsewhere.has(cd.value.trim())) return false;
+      if (cd.kind === "hardcoded" && looksLikeCodePrefix(cd.value)) return false;
       return !looksLikeCode(cd.value);
     })
     .map((cd) => {
