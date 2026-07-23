@@ -1,7 +1,7 @@
 chong — ONGOING (continue-here notes)
 =====================================
-Last updated: 2026-06-11
-Repo: /Users/simonbohlin/42b/chong   Branch: main   HEAD: dc015d8
+Last updated: 2026-07-23
+Repo: /Users/simonbohlin/42b/chong   Branch: main   HEAD: (see git)
 
 WHAT chong IS
 -------------
@@ -105,14 +105,29 @@ NOT DONE / PLANNED / OPEN DECISIONS  (the actual next-steps list)
 
 8. [OUT OF SCOPE, locked 2026-05-08] Stacked CLs; code review / PR approvals.
 
+9. [BUILT 2026-07-23] `chong watch` auto-injects local `main` commits onto
+   `origin/main` (push if linear; cherry-pick via main-shadow if diverged), then
+   FF `stage` when clean. Conflicts → yellow warning only (abort, leave origin).
+   Maintain runs the same inject first; steps 1–2 push immediately + FF stage.
+
+10. [BUILT 2026-07-23] Agent-assisted cherry-pick + i18n via cursor-agent Auto
+    (default on for `chong watch`; opt out with `--no-agent`).
+    Confidence gate (`VERDICT: SAFE|UNSAFE`) before any `--force` edit.
+    Uncertain i18n → pause post-commit i18n auto-fix for 2h.
+    Auto-maintain (commits only): on start, every 20 remote commits, every 2h
+    (`--no-auto-maintain` to disable). Full `[m]` still runs diagnostics + agent i18n.
+
 SUGGESTED ORDER TO RESUME
   a) Stand up one Pi + tunnel, run init.ts + user-add.ts, smoke-test end to end.
   b) Make `chong new`/auth configure the `origin` remote automatically (#1).
   c) Decide server/ fate (#2) and reconcile CLI status types (#4).
   d) Decide on the build/deploy pipeline scope (#3).
+  e) (done) Agent resolve + auto-maintain — see #10.
 
 KEY FILES TO REREAD
   PLAN.md ............ design rationale + locked decisions
   pi/README.md ....... deploy + API surface + "decisions that bit us"
   pi/src/routes/cls.ts, pi/src/git.ts ...... the real upload/merge path
   src/commands/new.ts, src/commands/upload.ts ...... CLI flow
+  src/watch/checks.ts  reconcileLocalMain + maintain inject/push
+  src/watch/app.ts ..... watch loop queues reconcile on each poll

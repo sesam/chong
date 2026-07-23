@@ -37,6 +37,8 @@ Options:
   --test-cmd <cmd>             unit-test command for maintenance (default: pnpm test)
   --i18n-cmd <cmd>             i18n command for maintenance (default: pnpm i18n)
   --no-i18n-scan               disable scanning commits for hardcoded (untranslated) strings
+  --no-agent                   disable cursor-agent Auto for conflicts / i18n
+  --no-auto-maintain           disable scheduled commit-producing maintain
 ```
 
 ![chong watch TUI](chong-watch-tui-example.webp)
@@ -45,23 +47,28 @@ Options:
 
 **INCOMING** shows your local branch and remote origin/main commits merged by time. Commits that arrived after `chong watch` started are highlighted green.
 
+**Local → origin inject:** when local `main` has commits that aren't on `origin/main` (plain push if linear, or cherry-pick onto the clean `main-shadow` worktree when histories have diverged), watch lands them automatically. On cherry-pick conflict, `cursor-agent --model auto` is asked for a `VERDICT: SAFE|UNSAFE`; only SAFE runs get an auto-resolve attempt. Failures stay a yellow warning and leave origin untouched. Stage/prod promote stays manual (`[s]` / `[p]`).
+
+**Auto-maintain (commit steps only):** runs once when watch starts, then every **20** remote commits or every **2 hours** — deps bump, lockfile reconcile, and format (pushed to `origin/main`). Background notices only (no maintain screen). Full diagnostics stay on `[m]`.
+
 **Post-commit checks** run automatically on each new commit (local and remote):
 - Flags i18n mismatches: `t()`/`useT`/`i18n` code without `.po`/`.pot` changes, or vice versa
 - Flags **hardcoded strings** in the commit's added lines that aren't wrapped in `t()` — copy `pnpm i18n` can't see because it only extracts already-wrapped strings, so it silently stays in the source locale. Scoped to the diff, so it's cheap. Disable with `--no-i18n-scan`.
 - Resets a `main-shadow` worktree to origin/main, runs `pnpm i18n`, commits `.po`/`.pot` changes as `FIX: pnpm i18n` and pushes
 - Regenerates the lockfile when a commit changed `package.json` but not `pnpm-lock.yaml` (otherwise CI's `--frozen-lockfile` install fails with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`); commits as `FIX: pnpm lockfile` and pushes
 - Runs the format command on the changed files, commits as `FIX: code formatting` and pushes
-- Shows a modal in the TUI if leftover files remain after the i18n fix
+- Leftover non-.po files after i18n: cursor-agent (Auto) may fix when SAFE; otherwise pauses i18n auto-fix for 2h
 
 **Maintenance** (`[m]`) runs a manual pass in the `main-shadow` worktree:
-1. Applies minor (same-major) `pnpm outdated` updates and commits `CLEAN: bump minor deps`
-1b. Reconciles `pnpm-lock.yaml` with `package.json` (`pnpm install --lockfile-only`) and commits `FIX: pnpm lockfile` — catches a pre-existing mismatch on origin/main that the per-commit fix never saw
-2. Runs the formatter and commits `CLEAN: code style`
+0. Injects any local `main` commits onto `origin/main` first (same as the watch auto-inject), so maintain starts from a tip that already includes them
+1. Applies minor (same-major) `pnpm outdated` updates and commits `CLEAN: bump minor deps` (pushed immediately)
+1b. Reconciles `pnpm-lock.yaml` with `package.json` (`pnpm install --lockfile-only`) and commits `FIX: pnpm lockfile` — catches a pre-existing mismatch on origin/main that the per-commit fix never saw (pushed immediately)
+2. Runs the formatter and commits `CLEAN: code style` (pushed immediately)
 3. Runs `pnpm test` — if any unit tests break, shows a short, copy-friendly LLM prompt scoped to just the broken test file(s) (so the LLM can fix and re-run only those, not the whole suite)
-4. Runs `pnpm i18n` — if it errors or leaves the tree dirty, shows a copy-friendly LLM prompt to finish the translations
-5. Scans the whole tree for hardcoded strings not wrapped in `t()` — if any are found, shows a copy-friendly LLM prompt listing the files/lines so they can be wrapped and translated
+4. Runs `pnpm i18n` — if it errors or leaves the tree dirty, asks cursor-agent (Auto) when confident; else pauses post-commit i18n auto-fix for 2h and shows a copy prompt
+5. Scans the whole tree for hardcoded strings not wrapped in `t()` — same agent gate as step 4
 
-Steps 1–2 commit with a `CLEAN:` prefix and push; those commits are skipped by the post-commit checks. The prompts are printed flush-left and color-free so they paste cleanly. Press `[esc]` to return to the pipeline, `[m]` to re-run.
+Steps 1–2 commit with a `CLEAN:`/`FIX:` prefix and push so `origin/main` never goes stale mid-maintain. Those commits are skipped by the post-commit checks. The prompts are printed flush-left and color-free so they paste cleanly. Press `[esc]` to return to the pipeline, `[m]` to re-run.
 
 ### `chong shadow-work [<path>] [options]`
 

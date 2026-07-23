@@ -3,6 +3,15 @@ import { lstatSync, mkdirSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import {
+  agentEdit,
+  agentGate,
+  cherryPickGatePrompt,
+  cherryPickResolvePrompt,
+  findAgentBin,
+  i18nGatePrompt,
+  i18nResolvePrompt,
+} from "./agent";
+import {
   type Untranslated,
   addedLineNumbers,
   findUntranslated,
@@ -10,6 +19,7 @@ import {
   isExcludedPath,
   isScannable,
 } from "./i18n-scan";
+import { repo } from "./repo";
 
 type Run = { ok: boolean; out: string; err: string };
 
@@ -204,6 +214,10 @@ export async function ensureShadow(repoPath: string, ref: string): Promise<Shado
       }
     }
 
+    // Clear any leftover cherry-pick/rebase/merge state before hard-reset.
+    await git(["cherry-pick", "--abort"], shadowPath);
+    await git(["rebase", "--abort"], shadowPath);
+    await git(["merge", "--abort"], shadowPath);
     await git(["clean", "-fd"], shadowPath);
     const resetR = await git(["reset", "--hard", ref], shadowPath);
     if (!resetR.ok) return { shadowPath, error: `reset to ${ref}: ${resetR.err}` };
@@ -224,6 +238,260 @@ export async function ensureShadow(repoPath: string, ref: string): Promise<Shado
   symlinkSync(nmSource, nmLink);
 
   return { shadowPath, error: null };
+}
+
+const MAX_INJECT = 30; // refuse runaway cherry-pick batches
+export const I18N_PAUSE_MS = 2 * 60 * 60 * 1000; // 2h pause after uncertain i18n agent verdict
+export const AUTO_MAINT_EVERY_COMMITS = 20;
+export const AUTO_MAINT_EVERY_MS = 2 * 60 * 60 * 1000; // 2h
+
+/** True when a cherry-pick is still in progress in `cwd`. */
+async function cherryPickInProgress(cwd: string): Promise<boolean> {
+  const r = await git(["rev-parse", "--git-path", "CHERRY_PICK_HEAD"], cwd);
+  if (!r.ok || !r.out) return false;
+  const p = path.isAbsolute(r.out) ? r.out : path.join(cwd, r.out);
+  try {
+    return (await Bun.file(p).exists()) === true;
+  } catch {
+    return false;
+  }
+}
+
+/** True when any tracked file still has conflict markers. */
+async function hasConflictMarkers(cwd: string): Promise<boolean> {
+  const r = await git(["diff", "--check"], cwd);
+  // `--check` exits 2 when conflict markers are present; also scan stderr/stdout.
+  const blob = `${r.out}\n${r.err}`;
+  return /^(?:.*:)?\d+: leftover conflict marker/m.test(blob) || /<<<<<<</.test(blob);
+}
+
+/**
+ * Ask cursor-agent (Auto) whether a conflicted cherry-pick is safe, and if so
+ * have it finish the cherry-pick. Returns ok=true only when the worktree no
+ * longer has an in-progress cherry-pick and no conflict markers.
+ */
+export async function resolveCherryPickWithAgent(
+  shadowPath: string,
+  sha: string,
+): Promise<{ ok: boolean; message: string }> {
+  if (!findAgentBin()) {
+    return { ok: false, message: "cursor-agent not on PATH — cannot auto-resolve" };
+  }
+  const short = sha.slice(0, 7);
+  const gate = await agentGate(shadowPath, cherryPickGatePrompt(short));
+  if (gate.verdict !== "SAFE") {
+    return {
+      ok: false,
+      message: `agent ${gate.verdict.toLowerCase()} on ${short}${gate.text ? `: ${gate.text.split("\n").pop()}` : ""}`,
+    };
+  }
+
+  const edit = await agentEdit(shadowPath, cherryPickResolvePrompt(short));
+  if (!edit.ok) {
+    return { ok: false, message: `agent resolve failed: ${edit.text.slice(0, 200)}` };
+  }
+
+  // If the agent left the cherry-pick mid-continue, try once more ourselves.
+  if (await cherryPickInProgress(shadowPath)) {
+    const cont = await git(["-c", "core.editor=true", "cherry-pick", "--continue"], shadowPath);
+    if (!cont.ok && (await cherryPickInProgress(shadowPath))) {
+      return {
+        ok: false,
+        message: `agent left cherry-pick incomplete (${cont.err || cont.out})`.slice(0, 200),
+      };
+    }
+  }
+
+  if (await hasConflictMarkers(shadowPath)) {
+    return { ok: false, message: "conflict markers remain after agent resolve" };
+  }
+  if (await cherryPickInProgress(shadowPath)) {
+    return { ok: false, message: "cherry-pick still in progress after agent resolve" };
+  }
+  return { ok: true, message: `agent resolved cherry-pick ${short}` };
+}
+
+export type ReconcileResult = {
+  /** What happened. */
+  action: "noop" | "pushed" | "cherry-picked" | "conflict" | "error" | "skipped";
+  /** How many local-only (non-equivalent) commits were considered. */
+  count: number;
+  /** True when origin/<branch> advanced. */
+  pushed: boolean;
+  /** Short human-readable summary for the TUI notice line. */
+  message: string;
+};
+
+export type ReconcileOpts = {
+  /** Try cursor-agent (Auto) on cherry-pick conflicts (default true when bin present). */
+  agentResolve?: boolean;
+};
+
+/**
+ * Land commits that exist on the local head-lane branch (e.g. `main`) but not on
+ * `origin/main` — including the diverged case where origin has moved ahead too.
+ *
+ *  - origin is ancestor of local → plain push
+ *  - diverged → reset main-shadow to origin, cherry-pick local-only commits
+ *    (skipping patches `git cherry` already sees on origin), push if clean
+ *  - conflict → optional agent resolve; else abort, leave origin untouched
+ *
+ * Does not promote to stage/prod — that stays a manual `[s]`/`[p]` action.
+ */
+export async function reconcileLocalMain(
+  repoPath: string,
+  remote: string,
+  branch: string,
+  opts: ReconcileOpts = {},
+): Promise<ReconcileResult> {
+  const agentResolve = opts.agentResolve !== false && !!findAgentBin();
+  const noop = (message: string, count = 0): ReconcileResult => ({
+    action: "noop",
+    count,
+    pushed: false,
+    message,
+  });
+
+  const localSha = await repo.localSha(repoPath, branch);
+  if (!localSha) return noop(`no local ${branch}`);
+
+  const originRef = `${remote}/${branch}`;
+  const originSha = await repo.tip(repoPath, remote, branch);
+  if (!originSha) return noop(`no ${originRef}`);
+  if (localSha === originSha) return noop("in sync");
+
+  // Only commits whose patches aren't already on origin (handles prior cherry-picks).
+  const unique = await repo.uniqueCommits(repoPath, originRef, branch);
+  if (unique.length === 0) return noop("no unique local commits");
+
+  if (unique.length > MAX_INJECT) {
+    return {
+      action: "skipped",
+      count: unique.length,
+      pushed: false,
+      message: `${unique.length} local ${branch} commit(s) exceed auto-inject limit (${MAX_INJECT})`,
+    };
+  }
+
+  // Skip merge commits — cherry-pick needs -m and is rarely what we want here.
+  const toInject: string[] = [];
+  for (const sha of unique) {
+    if (await repo.isMergeCommit(repoPath, sha)) {
+      return {
+        action: "skipped",
+        count: unique.length,
+        pushed: false,
+        message: `local ${branch} has merge commit ${sha.slice(0, 7)} — inject manually`,
+      };
+    }
+    toInject.push(sha);
+  }
+
+  const originIsAncestor = await repo.isAncestor(repoPath, originSha, localSha);
+
+  let pushErr: string | null;
+  let action: ReconcileResult["action"];
+  let newTip: string | null = null;
+  let agentNote = "";
+
+  if (originIsAncestor) {
+    // Linear: local tip is a fast-forward of origin — push the local tip directly.
+    pushErr = await repo.pushSha(repoPath, remote, branch, localSha);
+    action = "pushed";
+    if (!pushErr) newTip = localSha;
+  } else {
+    // Diverged: replay local-only commits onto a clean shadow at origin tip.
+    const shadow = await ensureShadow(repoPath, originRef);
+    if (shadow.error) {
+      return {
+        action: "error",
+        count: toInject.length,
+        pushed: false,
+        message: `shadow: ${shadow.error}`,
+      };
+    }
+    if (!(await repo.isClean(shadow.shadowPath))) {
+      return {
+        action: "error",
+        count: toInject.length,
+        pushed: false,
+        message: "main-shadow is dirty after reset — refusing to inject",
+      };
+    }
+
+    for (const sha of toInject) {
+      const err = await repo.cherryPick(shadow.shadowPath, sha);
+      if (!err) continue;
+
+      // Conflict: optionally ask cursor-agent (Auto) to finish if SAFE.
+      if (agentResolve) {
+        const resolved = await resolveCherryPickWithAgent(shadow.shadowPath, sha);
+        if (resolved.ok) {
+          agentNote = ` · ${resolved.message}`;
+          continue;
+        }
+        agentNote = ` · ${resolved.message}`;
+      }
+
+      await repo.abortInProgress(shadow.shadowPath);
+      await git(["reset", "--hard", originRef], shadow.shadowPath);
+      await git(["clean", "-fd"], shadow.shadowPath);
+      return {
+        action: "conflict",
+        count: toInject.length,
+        pushed: false,
+        message: `cherry-pick ${sha.slice(0, 7)} conflicted — left origin/${branch} untouched${agentNote}`,
+      };
+    }
+
+    const head = await git(["rev-parse", "HEAD"], shadow.shadowPath);
+    pushErr = await repo.pushSha(shadow.shadowPath, remote, branch);
+    action = "cherry-picked";
+    if (!pushErr && head.ok) newTip = head.out;
+  }
+
+  if (pushErr) {
+    return {
+      action: "error",
+      count: toInject.length,
+      pushed: false,
+      message: `push ${branch}: ${pushErr}`,
+    };
+  }
+
+  // Point the remote-tracking ref at what we just pushed so the next poll's
+  // `git cherry` sees the landed patches even if fetch is slow/fails.
+  if (newTip) {
+    await git(["update-ref", `refs/remotes/${remote}/${branch}`, newTip], repoPath);
+  }
+  await git(["fetch", "--quiet", remote, branch], repoPath);
+
+  const how = action === "pushed" ? "pushed" : "cherry-picked onto origin & pushed";
+  return {
+    action,
+    count: toInject.length,
+    pushed: true,
+    message: `${toInject.length} local ${branch} commit(s) ${how}${agentNote}`,
+  };
+}
+
+/**
+ * Fast-forward `to` up to `from` on the remote when it's a clean FF with commits
+ * queued. Returns null on success / nothing-to-do, else an error string.
+ * Used by the manual promote UI (`[s]` / `[p]`), not by auto-inject/maintain.
+ */
+export async function promoteFastForward(
+  repoPath: string,
+  remote: string,
+  from: string,
+  to: string,
+): Promise<string | null> {
+  const { ahead } = await repo.aheadBehind(repoPath, remote, from, to);
+  if (ahead === 0) return null;
+  if (!(await repo.isFastForward(repoPath, remote, from, to))) {
+    return `${from} → ${to} is not a fast-forward`;
+  }
+  return repo.pushFastForward(repoPath, remote, from, to);
 }
 
 export type FixResult = {
@@ -397,6 +665,20 @@ export type MaintResult = {
   steps: string[]; // human-readable log of what each step did, in order
   prompts: MaintPrompt[]; // copy-friendly LLM prompts for whatever isn't perfect
   error: string | null; // a fatal error that aborted the run
+  /** When set, watch should skip post-commit i18n auto-fix until this epoch ms. */
+  i18nPauseUntil?: number;
+  /** True when agent landed an i18n fix commit. */
+  i18nAgentFixed?: boolean;
+};
+
+export type MaintOpts = {
+  /**
+   * `commits` — only steps that produce git commits (deps / lockfile / format + FF).
+   * `full` — also tests, i18n diagnostics, and optional agent i18n resolve (default).
+   */
+  mode?: "full" | "commits";
+  /** Try cursor-agent on i18n complaints (default true when bin present). */
+  agentI18n?: boolean;
 };
 
 // Built via RegExp so the ESC control char isn't a literal in a regex (biome rule).
@@ -413,6 +695,12 @@ function tail(s: string, n: number): string {
   return lines.slice(-n).join("\n");
 }
 
+function compactPath(p: string): string {
+  const parts = p.split("/").filter(Boolean);
+  if (parts.length <= 2) return p;
+  return `${parts.slice(0, 1).join("/")}/…/${parts.slice(-2).join("/")}`;
+}
+
 /** Unique test-file paths mentioned in runner output (`*.test.ts`, `*.spec.tsx`, …). */
 function failingTestFiles(output: string): string[] {
   const re = /[\w./@-]*[\w-]+\.(?:test|spec)\.[cm]?[jt]sx?/g;
@@ -420,14 +708,119 @@ function failingTestFiles(output: string): string[] {
 }
 
 /**
- * Manual maintenance pass, run in the main-shadow worktree:
- *   1.  apply minor (same-major) `pnpm outdated` updates, commit + push
- *   1b. reconcile pnpm-lock.yaml with package.json, commit `FIX: pnpm lockfile` + push
- *   2.  run the formatter, commit `CLEAN: code style` + push
- *   3.  `pnpm test` — on failure, emit a copy-friendly LLM prompt scoped to the broken test
- *   4.  `pnpm i18n` — if it leaves the tree dirty or errors, emit a copy-friendly LLM prompt
- *   5.  scan the tree for hardcoded strings not wrapped in t(), emit a prompt if any
- * Steps that commit use a `CLEAN:`/`FIX:` prefix so isAutoFix skips re-checking them.
+ * Ask cursor-agent (Auto) to fix i18n issues described by `summary`.
+ * On SAFE + clean commit → pushes. On UNSAFE/uncertain → returns pauseUntil.
+ */
+export async function tryAgentI18nFix(
+  repoPath: string,
+  shadowPath: string,
+  summary: string,
+  i18nCmd: string,
+  remote: string,
+  branch: string,
+): Promise<{
+  fixed: boolean;
+  paused: boolean;
+  pauseUntil?: number;
+  message: string;
+}> {
+  if (!findAgentBin()) {
+    return {
+      fixed: false,
+      paused: true,
+      pauseUntil: Date.now() + I18N_PAUSE_MS,
+      message: "cursor-agent not on PATH — pausing i18n auto-fix 2h",
+    };
+  }
+
+  const gate = await agentGate(shadowPath, i18nGatePrompt(summary));
+  if (gate.verdict !== "SAFE") {
+    const until = Date.now() + I18N_PAUSE_MS;
+    return {
+      fixed: false,
+      paused: true,
+      pauseUntil: until,
+      message: `i18n agent ${gate.verdict.toLowerCase()} — pausing auto-fix 2h`,
+    };
+  }
+
+  const edit = await agentEdit(shadowPath, i18nResolvePrompt(summary, i18nCmd));
+  if (!edit.ok) {
+    const until = Date.now() + I18N_PAUSE_MS;
+    return {
+      fixed: false,
+      paused: true,
+      pauseUntil: until,
+      message: `i18n agent edit failed — pausing auto-fix 2h (${edit.text.slice(0, 120)})`,
+    };
+  }
+
+  // Re-run i18n extraction so .po/.pot match source wraps the agent may have added.
+  const [icmd, ...iargs] = i18nCmd.trim().split(/\s+/);
+  await sh([icmd, ...iargs], shadowPath);
+
+  const statusR = await git(["status", "--porcelain"], shadowPath);
+  if (!statusR.out) {
+    return { fixed: false, paused: false, message: "i18n agent: nothing to commit" };
+  }
+
+  // Commit only translation/source-ish paths; refuse if conflict markers remain.
+  if (await hasConflictMarkers(shadowPath)) {
+    await git(["checkout", "--", "."], shadowPath);
+    await git(["clean", "-fd"], shadowPath);
+    const until = Date.now() + I18N_PAUSE_MS;
+    return {
+      fixed: false,
+      paused: true,
+      pauseUntil: until,
+      message: "i18n agent left conflict markers — pausing auto-fix 2h",
+    };
+  }
+
+  const changed = statusR.out
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => l.slice(3).trim());
+  await git(["add", "-A"], shadowPath);
+  const commitR = await git(["commit", "-m", "FIX: i18n (agent)", "--no-verify"], shadowPath);
+  if (!commitR.ok) {
+    await git(["checkout", "--", "."], shadowPath);
+    await git(["clean", "-fd"], shadowPath);
+    const until = Date.now() + I18N_PAUSE_MS;
+    return {
+      fixed: false,
+      paused: true,
+      pauseUntil: until,
+      message: `i18n agent commit failed — pausing 2h (${commitR.err})`,
+    };
+  }
+
+  const pushR = await git(["push", remote, `HEAD:refs/heads/${branch}`], shadowPath);
+  if (!pushR.ok) {
+    return {
+      fixed: false,
+      paused: false,
+      message: `i18n agent committed but push failed (${pushR.err})`,
+    };
+  }
+  const head = await git(["rev-parse", "HEAD"], shadowPath);
+  if (head.ok) {
+    await git(["update-ref", `refs/remotes/${remote}/${branch}`, head.out], repoPath);
+  }
+  return {
+    fixed: true,
+    paused: false,
+    message: `i18n agent fixed ${changed.length} file(s) → pushed to ${branch}`,
+  };
+}
+
+/**
+ * Maintenance pass in the main-shadow worktree.
+ *   1 / 1b / 2 — commit-producing (deps, lockfile, format); push to origin/<branch>
+ *   3–5 — diagnostics (tests, i18n, hardcoded scan); skipped when mode=`commits`
+ * On i18n complaints (full mode), optionally ask cursor-agent (Auto) to fix when SAFE;
+ * otherwise pause post-commit i18n auto-fix for 2h.
+ * Does not promote to stage/prod — that stays a manual `[s]`/`[p]` action.
  */
 export async function runMaintenance(
   repoPath: string,
@@ -436,14 +829,29 @@ export async function runMaintenance(
   remote: string,
   branch: string,
   onStep?: (msg: string) => void,
+  opts: MaintOpts = {},
 ): Promise<MaintResult> {
+  const mode = opts.mode ?? "full";
+  const agentI18n = opts.agentI18n !== false && !!findAgentBin();
   const steps: string[] = [];
   const prompts: MaintPrompt[] = [];
   const step = (msg: string) => {
     steps.push(msg);
     onStep?.(msg);
   };
-  const push = async () => git(["push", remote, `HEAD:refs/heads/${branch}`], shadowPath);
+  let i18nPauseUntil: number | undefined;
+  let i18nAgentFixed = false;
+  const push = async (): Promise<{ ok: boolean; err: string }> => {
+    const pr = await git(["push", remote, `HEAD:refs/heads/${branch}`], shadowPath);
+    if (pr.ok) {
+      // Keep remote-tracking ref fresh so watch/INCOMING don't look stale mid-run.
+      const head = await git(["rev-parse", "HEAD"], shadowPath);
+      if (head.ok) {
+        await git(["update-ref", `refs/remotes/${remote}/${branch}`, head.out], repoPath);
+      }
+    }
+    return { ok: pr.ok, err: pr.err };
+  };
 
   // ── 1. minor dependency updates
   onStep?.("deps: checking pnpm outdated…");
@@ -530,6 +938,10 @@ export async function runMaintenance(
     step("✓ code style: already clean");
   }
 
+  if (mode === "commits") {
+    return { steps, prompts, error: null };
+  }
+
   // ── 3. unit tests
   onStep?.("test: running unit tests…");
   const [tcmd, ...targs] = cmds.test.trim().split(/\s+/);
@@ -539,11 +951,23 @@ export async function runMaintenance(
   } else {
     const files = failingTestFiles(`${test.out}\n${test.err}`);
     step(`⚠ tests: ${files.length || "some"} failing — see copy prompt below`);
+    const cmd =
+      files.length > 0
+        ? `${cmds.test} ${files.join(" ")}`
+        : `${cmds.test} (then re-run only the failing test file(s))`;
     prompts.push({
       title: "fix failing test(s)",
       text: files.length
-        ? `Fix failing unit test(s): ${files.join(" ")}. Reproduce/verify with only these (not the full suite): ${cmds.test} ${files.join(" ")}`
-        : "Unit tests fail. Find the broken test(s), then fix and verify by running only those (not the full suite).",
+        ? [
+            "Fix the failing unit tests.",
+            "",
+            "Reproduce (only failing files):",
+            cmd,
+            "",
+            `Failing files (${files.length}):`,
+            ...files.map((f) => `- ${compactPath(f)}`),
+          ].join("\n")
+        : ["Unit tests fail.", "", "Reproduce:", cmd].join("\n"),
     });
   }
 
@@ -566,6 +990,7 @@ export async function runMaintenance(
       if (await hasMeaningfulI18nChange(f, shadowPath)) meaningful.push(f);
     }
   }
+  const i18nIssues: string[] = [];
   if (i18n.ok && meaningful.length === 0) {
     if (changed.length) {
       step(`✓ i18n: clean (only regenerated comments in ${changed.length} file(s))`);
@@ -573,27 +998,23 @@ export async function runMaintenance(
       step("✓ i18n: clean");
     }
   } else {
-    step(
-      `⚠ i18n: ${i18n.ok ? `${meaningful.length} file(s) need attention` : "command failed"} — see copy prompt below`,
-    );
-    const lines = [
-      `Running \`${cmds.i18n}\` in this repo did not leave a clean tree. Finish the i18n work.`,
-    ];
+    step(`⚠ i18n: ${i18n.ok ? `${meaningful.length} file(s) need attention` : "command failed"}`);
+    const lines = [`\`${cmds.i18n}\` did not leave a clean tree. Finish the i18n work.`];
     if (meaningful.length) {
       lines.push("Files it changed (likely new/untranslated strings):");
       for (const f of meaningful.slice(0, 20)) lines.push(`  ${f}`);
       lines.push(
-        `Fill in the missing translations (msgstr) for the new/changed entries in those .po/.pot files, then re-run \`${cmds.i18n}\` until the tree is clean.`,
+        `Fill in missing translations (msgstr) for new/changed entries, then re-run \`${cmds.i18n}\` until clean.`,
       );
     }
     if (!i18n.ok) {
       lines.push(`\`${cmds.i18n}\` exited with an error:`);
       lines.push(tail(`${i18n.out}\n${i18n.err}`, 12));
     }
-    lines.push("Edit only translation files; do not run the test suite.");
-    prompts.push({ title: "finish i18n", text: lines.join("\n") });
+    lines.push("Edit only source/translation files; do not run the full test suite.");
+    i18nIssues.push(lines.join("\n"));
   }
-  // Don't leave the shadow dirty for the next remote-commit check.
+  // Don't leave the shadow dirty for the next remote-commit check / agent pass.
   if (changed.length) {
     await git(["checkout", "--", "."], shadowPath);
     await git(["clean", "-fd"], shadowPath);
@@ -606,9 +1027,7 @@ export async function runMaintenance(
   if (totalUntranslated === 0) {
     step("✓ i18n-scan: no hardcoded user-facing strings found");
   } else {
-    step(
-      `⚠ i18n-scan: ${totalUntranslated} hardcoded string(s) in ${untranslated.length} file(s) — see copy prompt below`,
-    );
+    step(`⚠ i18n-scan: ${totalUntranslated} hardcoded string(s) in ${untranslated.length} file(s)`);
     const lines = [
       "Some user-facing strings are hardcoded (not wrapped in t()), so they always render in the source locale regardless of the chosen language. `pnpm i18n` can't see them because it only extracts strings already wrapped in a translation call.",
       "",
@@ -636,8 +1055,31 @@ export async function runMaintenance(
     lines.push(
       `Some strings may be asserted in unit tests or shared across components — update those call sites/assertions too. After wrapping, run \`${cmds.i18n}\` and fill in the new msgstr entries until the tree is clean. Edit source + translation files only; do not run the full test suite.`,
     );
-    prompts.push({ title: "wrap hardcoded strings in t()", text: lines.join("\n") });
+    i18nIssues.push(lines.join("\n"));
   }
 
-  return { steps, prompts, error: null };
+  // ── agent i18n resolve (confidence-gated)
+  if (i18nIssues.length > 0) {
+    const summary = i18nIssues.join("\n\n---\n\n").slice(0, 6000);
+    if (agentI18n) {
+      onStep?.("i18n: asking cursor-agent (Auto)…");
+      const res = await tryAgentI18nFix(repoPath, shadowPath, summary, cmds.i18n, remote, branch);
+      step(res.fixed ? `✓ ${res.message}` : `⚠ ${res.message}`);
+      if (res.fixed) i18nAgentFixed = true;
+      if (res.paused && res.pauseUntil) i18nPauseUntil = res.pauseUntil;
+      if (!res.fixed) {
+        prompts.push({
+          title: i18nIssues.length > 1 ? "finish i18n + wrap hardcoded strings" : "finish i18n",
+          text: summary,
+        });
+      }
+    } else {
+      prompts.push({
+        title: i18nIssues.length > 1 ? "finish i18n + wrap hardcoded strings" : "finish i18n",
+        text: summary,
+      });
+    }
+  }
+
+  return { steps, prompts, error: null, i18nPauseUntil, i18nAgentFixed };
 }

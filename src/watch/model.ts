@@ -35,6 +35,10 @@ export type WatchConfig = {
   testCmd: string; // command to run the unit tests (default: "pnpm test")
   i18nCmd: string; // command to run i18n extraction (default: "pnpm i18n")
   i18nScan: boolean; // scan commits for hardcoded strings not wrapped in t() (default: true)
+  /** cursor-agent on cherry-pick conflicts + i18n (default true). */
+  agent: boolean;
+  /** Auto-run commit-producing maintain on start / every N commits / every 2h (default true). */
+  autoMaintain: boolean;
 };
 
 /** Outcome of an auto-fast-forward attempt on one local branch ref. */

@@ -34,8 +34,20 @@ export async function cmdWatch(argv: string[]): Promise<void> {
   const testCmd = typeof flags["test-cmd"] === "string" ? flags["test-cmd"] : "pnpm test";
   const i18nCmd = typeof flags["i18n-cmd"] === "string" ? flags["i18n-cmd"] : "pnpm i18n";
   const i18nScan = flags["no-i18n-scan"] !== true;
+  const agent = flags["no-agent"] !== true;
+  const autoMaintain = flags["no-auto-maintain"] !== true;
 
-  const cfg: WatchConfig = { repoPath, remote, branches, formatCmd, testCmd, i18nCmd, i18nScan };
+  const cfg: WatchConfig = {
+    repoPath,
+    remote,
+    branches,
+    formatCmd,
+    testCmd,
+    i18nCmd,
+    i18nScan,
+    agent,
+    autoMaintain,
+  };
   try {
     await runWatch(cfg, intervalMs);
   } finally {

@@ -213,6 +213,56 @@ export const repo = {
   },
 
   /**
+   * Commits on `head` whose patches are not already on `upstream`, oldest first.
+   * Uses `git cherry` so equivalent (cherry-picked) patches already on upstream
+   * are excluded even when SHAs differ.
+   */
+  async uniqueCommits(cwd: string, upstream: string, head: string): Promise<string[]> {
+    const r = await git(["cherry", upstream, head], cwd);
+    if (!r.ok || !r.out) return [];
+    // `git cherry` prints oldest→newest; keep only "+" (not already on upstream).
+    return r.out
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("+"))
+      .map((line) => line.slice(1).trim().split(/\s+/)[0] ?? "")
+      .filter(Boolean);
+  },
+
+  /** True when `sha` is a merge commit (2+ parents). */
+  async isMergeCommit(cwd: string, sha: string): Promise<boolean> {
+    const r = await git(["rev-list", "--count", "--max-count=1", "--merges", `${sha}^!`], cwd);
+    return r.ok && r.out === "1";
+  },
+
+  /** Working tree + index clean (no staged/unstaged/untracked changes). */
+  async isClean(cwd: string): Promise<boolean> {
+    const r = await git(["status", "--porcelain"], cwd);
+    return r.ok && r.out === "";
+  },
+
+  /** Abort in-progress cherry-pick / rebase / merge (best-effort). */
+  async abortInProgress(cwd: string): Promise<void> {
+    await git(["cherry-pick", "--abort"], cwd);
+    await git(["rebase", "--abort"], cwd);
+    await git(["merge", "--abort"], cwd);
+  },
+
+  /** Cherry-pick a single commit onto HEAD. Returns null on success, else error text. */
+  async cherryPick(cwd: string, sha: string): Promise<string | null> {
+    const r = await git(["cherry-pick", "--allow-empty", sha], cwd);
+    if (r.ok) return null;
+    return (r.err || r.out).split("\n").find(Boolean) ?? "cherry-pick failed";
+  },
+
+  /** Push `sha` (or current HEAD if omitted) to `remote:refs/heads/branch`. */
+  async pushSha(cwd: string, remote: string, branch: string, sha?: string): Promise<string | null> {
+    const spec = sha ? `${sha}:refs/heads/${branch}` : `HEAD:refs/heads/${branch}`;
+    const r = await git(["push", remote, spec], cwd);
+    return r.ok ? null : r.err || "push failed";
+  },
+
+  /**
    * The worktree path where `branch` is currently checked out, or null if it isn't
    * checked out in any worktree. Used to decide whether a local ref can be moved
    * directly (safe) or must go through a fast-forward merge in its worktree.
