@@ -10,6 +10,7 @@ A CLI for watching and managing a git promotion pipeline (main → stage → pro
 - Git
 - `gh` CLI (optional — used for CI status badges and merge operations in `chong watch`)
 - `pnpm` in the watched repo (optional — for i18n/format auto-fix in `chong watch`)
+- Coding agent (optional — cherry-pick / i18n auto-resolve): prefer `mcpify-agent` from the mcp-ify repo’s `offline-agent/` (offline Ollama; see that repo’s README), else Cursor `agent` / `cursor-agent`
 
 ## Install
 
@@ -37,7 +38,7 @@ Options:
   --test-cmd <cmd>             unit-test command for maintenance (default: pnpm test)
   --i18n-cmd <cmd>             i18n command for maintenance (default: pnpm i18n)
   --no-i18n-scan               disable scanning commits for hardcoded (untranslated) strings
-  --no-agent                   disable cursor-agent Auto for conflicts / i18n
+  --no-agent                   disable mcpify-agent / cursor-agent for conflicts / i18n
   --no-auto-maintain           disable scheduled commit-producing maintain
 ```
 
@@ -47,7 +48,9 @@ Options:
 
 **INCOMING** shows your local branch and remote origin/main commits merged by time. Commits that arrived after `chong watch` started are highlighted green.
 
-**Local → origin inject:** when local `main` has commits that aren't on `origin/main` (plain push if linear, or cherry-pick onto the clean `main-shadow` worktree when histories have diverged), watch lands them automatically. On cherry-pick conflict, `cursor-agent --model auto` is asked for a `VERDICT: SAFE|UNSAFE`; only SAFE runs get an auto-resolve attempt. Failures stay a yellow warning and leave origin untouched. Stage/prod promote stays manual (`[s]` / `[p]`).
+**Local → origin inject:** when local `main` has commits that aren't on `origin/main` (plain push if linear, or cherry-pick onto the clean `main-shadow` worktree when histories have diverged), watch lands them automatically. On cherry-pick conflict, the coding agent (`mcpify-agent` if on PATH, else `cursor-agent --model auto`) is asked for a `VERDICT: SAFE|UNSAFE`; only SAFE runs get an auto-resolve attempt. Failures stay a yellow warning and leave origin untouched. Stage/prod promote stays manual (`[s]` / `[p]`).
+
+**Offline agents:** install mcp-ify’s `offline-agent` (`bash offline-agent/install.sh`) so `mcpify-agent` is on PATH — then watch runs fully locally via Ollama + mcp-ify with no Cursor cloud dependency.
 
 **Auto-maintain (commit steps only):** runs once when watch starts, then every **20** remote commits or every **2 hours** — deps bump, lockfile reconcile, and format (pushed to `origin/main`). Background notices only (no maintain screen). Full diagnostics stay on `[m]`.
 
@@ -59,7 +62,7 @@ Dep bumps respect **`minimumReleaseAge`** from the watched repo's `pnpm-workspac
 - Resets a `main-shadow` worktree to origin/main, runs `pnpm i18n`, commits `.po`/`.pot` changes as `FIX: pnpm i18n` and pushes
 - Regenerates the lockfile when a commit changed `package.json` but not `pnpm-lock.yaml` (otherwise CI's `--frozen-lockfile` install fails with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`); commits as `FIX: pnpm lockfile` and pushes
 - Runs the format command on the changed files, commits as `FIX: code formatting` and pushes
-- Leftover non-.po files after i18n: cursor-agent (Auto) may fix when SAFE; otherwise pauses i18n auto-fix for 2h
+- Leftover non-.po files after i18n: coding agent may fix when SAFE; otherwise pauses i18n auto-fix for 2h
 
 **Maintenance** (`[m]`) runs a manual pass in the `main-shadow` worktree:
 0. Injects any local `main` commits onto `origin/main` first (same as the watch auto-inject), so maintain starts from a tip that already includes them
@@ -67,7 +70,7 @@ Dep bumps respect **`minimumReleaseAge`** from the watched repo's `pnpm-workspac
 1b. Reconciles `pnpm-lock.yaml` with `package.json` (`pnpm install --lockfile-only`) and commits `FIX: pnpm lockfile` — catches a pre-existing mismatch on origin/main that the per-commit fix never saw (pushed immediately)
 2. Runs the formatter and commits `CLEAN: code style` (pushed immediately)
 3. Runs `pnpm test` — if any unit tests break, shows a short, copy-friendly LLM prompt scoped to just the broken test file(s) (so the LLM can fix and re-run only those, not the whole suite)
-4. Runs `pnpm i18n` — if it errors or leaves the tree dirty, asks cursor-agent (Auto) when confident; else pauses post-commit i18n auto-fix for 2h and shows a copy prompt
+4. Runs `pnpm i18n` — if it errors or leaves the tree dirty, asks the coding agent when confident; else pauses post-commit i18n auto-fix for 2h and shows a copy prompt
 5. Scans the whole tree for hardcoded strings not wrapped in `t()` — same agent gate as step 4
 
 Steps 1–2 commit with a `CLEAN:`/`FIX:` prefix and push so `origin/main` never goes stale mid-maintain. Those commits are skipped by the post-commit checks. The prompts are printed flush-left and color-free so they paste cleanly. Press `[esc]` to return to the pipeline, `[m]` to re-run.

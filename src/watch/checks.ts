@@ -268,7 +268,7 @@ async function hasConflictMarkers(cwd: string): Promise<boolean> {
 }
 
 /**
- * Ask cursor-agent (Auto) whether a conflicted cherry-pick is safe, and if so
+ * Ask the coding agent whether a conflicted cherry-pick is safe, and if so
  * have it finish the cherry-pick. Returns ok=true only when the worktree no
  * longer has an in-progress cherry-pick and no conflict markers.
  */
@@ -277,7 +277,7 @@ export async function resolveCherryPickWithAgent(
   sha: string,
 ): Promise<{ ok: boolean; message: string }> {
   if (!findAgentBin()) {
-    return { ok: false, message: "cursor-agent not on PATH — cannot auto-resolve" };
+    return { ok: false, message: "no agent on PATH — cannot auto-resolve" };
   }
   const short = sha.slice(0, 7);
   const gate = await agentGate(shadowPath, cherryPickGatePrompt(short));
@@ -731,7 +731,7 @@ export async function tryAgentI18nFix(
       fixed: false,
       paused: true,
       pauseUntil: Date.now() + I18N_PAUSE_MS,
-      message: "cursor-agent not on PATH — pausing i18n auto-fix 2h",
+      message: "no agent on PATH — pausing i18n auto-fix 2h",
     };
   }
 
@@ -1090,7 +1090,7 @@ export async function runMaintenance(
   if (i18nIssues.length > 0) {
     const summary = i18nIssues.join("\n\n---\n\n").slice(0, 6000);
     if (agentI18n) {
-      onStep?.("i18n: asking cursor-agent (Auto)…");
+      onStep?.("i18n: asking coding agent…");
       const res = await tryAgentI18nFix(repoPath, shadowPath, summary, cmds.i18n, remote, branch);
       step(res.fixed ? `✓ ${res.message}` : `⚠ ${res.message}`);
       if (res.fixed) i18nAgentFixed = true;

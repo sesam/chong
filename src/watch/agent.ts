@@ -1,8 +1,10 @@
 /**
- * Headless Cursor Agent (`agent` / `cursor-agent`) helpers for chong watch.
+ * Headless coding-agent helpers for chong watch.
  *
- * Always uses `--model auto` so runs stay on the Auto usage pool.
- * Confidence gates use `--mode ask` (read-only); edits use `--force`.
+ * Prefers offline `mcpify-agent` (Ollama + mcp-ify) when on PATH; falls back to
+ * Cursor Agent (`agent` / `cursor-agent`) with `--model auto`.
+ *
+ * Confidence gates use ask/read-only mode; edits use force/agent mode.
  */
 
 export type AgentRun = {
@@ -14,11 +16,24 @@ export type AgentRun = {
 
 export type Verdict = "SAFE" | "UNSAFE" | "UNKNOWN";
 
+export type AgentKind = "mcpify-agent" | "cursor-agent";
+
 const AGENT_TIMEOUT_MS = 8 * 60 * 1000; // conflict/i18n resolves can take a few minutes
 
-/** Resolve the Cursor Agent CLI binary, or null if not on PATH. */
+export type FoundAgent = { bin: string; kind: AgentKind };
+
+/** Resolve the preferred agent CLI, or null if none on PATH. */
+export function findAgent(): FoundAgent | null {
+  const mcpify = Bun.which("mcpify-agent");
+  if (mcpify) return { bin: mcpify, kind: "mcpify-agent" };
+  const cursor = Bun.which("agent") ?? Bun.which("cursor-agent");
+  if (cursor) return { bin: cursor, kind: "cursor-agent" };
+  return null;
+}
+
+/** @deprecated use findAgent() */
 export function findAgentBin(): string | null {
-  return Bun.which("agent") ?? Bun.which("cursor-agent");
+  return findAgent()?.bin ?? null;
 }
 
 /** Parse a machine verdict line from agent text. */
@@ -28,20 +43,28 @@ export function parseVerdict(text: string): Verdict {
   return m[1].toUpperCase() === "SAFE" ? "SAFE" : "UNSAFE";
 }
 
-/**
- * Run the agent headlessly. `mode: "ask"` is read-only; `mode: "agent"` edits
- * with `--force`. Always pins `--model auto`.
- */
-export async function runAgent(
+function buildArgs(
+  kind: AgentKind,
   workspace: string,
   prompt: string,
-  mode: "ask" | "agent" = "agent",
-): Promise<AgentRun> {
-  const bin = findAgentBin();
-  if (!bin) {
-    return { ok: false, text: "cursor-agent not found on PATH", exitCode: 127 };
+  mode: "ask" | "agent",
+): string[] {
+  if (kind === "mcpify-agent") {
+    const args = [
+      "-p",
+      "--workspace",
+      workspace,
+      "--output-format",
+      "json",
+      "--mode",
+      mode === "ask" ? "ask" : "agent",
+    ];
+    if (mode === "agent") args.push("--force");
+    args.push(prompt);
+    return args;
   }
 
+  // cursor-agent / agent
   const args = [
     "-p",
     "--model",
@@ -55,13 +78,34 @@ export async function runAgent(
   if (mode === "ask") args.push("--mode", "ask");
   else args.push("--force");
   args.push(prompt);
+  return args;
+}
 
-  const proc = Bun.spawn([bin, ...args], {
+/**
+ * Run the agent headlessly. `mode: "ask"` is read-only; `mode: "agent"` edits.
+ */
+export async function runAgent(
+  workspace: string,
+  prompt: string,
+  mode: "ask" | "agent" = "agent",
+): Promise<AgentRun> {
+  const found = findAgent();
+  if (!found) {
+    return {
+      ok: false,
+      text: "no agent on PATH (install mcpify-agent from mcp-ify/offline-agent, or cursor-agent)",
+      exitCode: 127,
+    };
+  }
+
+  const args = buildArgs(found.kind, workspace, prompt, mode);
+
+  const proc = Bun.spawn([found.bin, ...args], {
     cwd: workspace,
     stdout: "pipe",
     stderr: "pipe",
     env: {
-      ...process.env, // inherit login / CURSOR_API_KEY
+      ...process.env,
     },
   });
 
@@ -94,7 +138,6 @@ export async function runAgent(
       }
       return { ok: true, text: String(json.result ?? ""), exitCode: code };
     } catch {
-      // Non-JSON success — treat whole stdout as the answer.
       return { ok: true, text: trimmed, exitCode: code };
     }
   } finally {
@@ -112,7 +155,7 @@ export async function agentGate(
   return { verdict: parseVerdict(run.text), text: run.text, ok: true };
 }
 
-/** Force-mode edit run (Auto model). */
+/** Force-mode edit run. */
 export async function agentEdit(workspace: string, prompt: string): Promise<AgentRun> {
   return runAgent(workspace, prompt, "agent");
 }

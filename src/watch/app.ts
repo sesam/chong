@@ -598,10 +598,17 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     queueAutoMaintain("on start");
   }
   if (cfg.agent && !findAgentBin()) {
-    addNotice(c.yellow("⚠ cursor-agent not on PATH — agent resolve/i18n disabled"));
+    addNotice(
+      c.yellow(
+        "⚠ no agent on PATH — install mcpify-agent (mcp-ify/offline-agent) or cursor-agent",
+      ),
+    );
     paint();
   } else if (agentEnabled) {
-    addNotice(c.dim("agent: cursor-agent Auto enabled (conflicts + i18n)"));
+    const label = Bun.which("mcpify-agent")
+      ? "mcpify-agent (offline)"
+      : "cursor-agent Auto";
+    addNotice(c.dim(`agent: ${label} enabled (conflicts + i18n)`));
     paint();
   }
   await done;
