@@ -45,7 +45,8 @@ export function isScannable(file: string): boolean {
   return dot >= 0 && SCANNABLE.has(file.slice(dot).toLowerCase());
 }
 
-// Directory segments that hold non-user-facing code (build scripts, tests, fixtures).
+// Directory segments that hold non-user-facing code (build scripts, tests, fixtures,
+// static public assets, and generated/geo data tables).
 const EXCLUDED_DIRS = new Set([
   "scripts",
   "test",
@@ -56,6 +57,8 @@ const EXCLUDED_DIRS = new Set([
   "__fixtures__",
   "fixtures",
   "mocks",
+  "data",
+  "public",
   "e2e",
   "cypress",
   ".storybook",
@@ -64,11 +67,12 @@ const EXCLUDED_DIRS = new Set([
 /**
  * Paths that are scannable by extension but aren't product UI code, so they're
  * skipped by default: build scripts, tests/specs/stories, fixtures/mocks, type
- * declarations, config, data files (e.g. `co2Data.js`, `mock-data.ts`), and
- * anything under a `Debug*` path segment (debug-only tooling — `DebugProjects/`,
- * `DebugRoof/`, `DebugCo2Calculator/`, …). These routinely carry non-English
- * strings that should NOT be wrapped in t(). The `chong check i18n --all` flag
- * bypasses this to inspect everything.
+ * declarations, config, data files (e.g. `co2Data.js`, `mock-data.ts`, anything
+ * under a `data/` or `public/` path segment — generated geo fixtures, static
+ * assets), and anything under a `Debug*` path segment (debug-only tooling —
+ * `DebugProjects/`, `DebugRoof/`, `DebugCo2Calculator/`, …). These routinely
+ * carry non-English strings that should NOT be wrapped in t(). The
+ * `chong check i18n --all` flag bypasses this to inspect everything.
  */
 export function isExcludedPath(file: string): boolean {
   const segs = file.split("/");

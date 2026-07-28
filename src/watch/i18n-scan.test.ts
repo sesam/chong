@@ -353,6 +353,12 @@ describe("isExcludedPath", () => {
     expect(isExcludedPath("src/types/api.d.ts")).toBe(true);
   });
 
+  test("excludes public/ and */data/ (static assets / generated geo fixtures)", () => {
+    expect(isExcludedPath("public/opnagent/data/test-plots.js")).toBe(true);
+    expect(isExcludedPath("public/opnagent/data/muni.js")).toBe(true);
+    expect(isExcludedPath("src/features/ParcelSupport/data/roster.js")).toBe(true);
+  });
+
   test("keeps real product source (incl. metadata, not a data file)", () => {
     expect(isExcludedPath("src/features/HeatingCooling/QuestionBox.vue")).toBe(false);
     expect(isExcludedPath("src/features/Journal/siteMetadata.js")).toBe(false);
