@@ -17,6 +17,39 @@ export function parseGitHubSlug(url: string | null): string | null {
   return m ? m[1] : null;
 }
 
+/**
+ * Package names with a dismissed Dependabot alert (Security tab) in this repo — the single
+ * source of truth for "reviewed, not applicable here" instead of a hardcoded exception list
+ * (mirrors the same live lookup in each watched repo's own dependency security-check script).
+ * `-f`/`-F` on `gh api` switch the request to POST unless `--method GET` is explicit, so that
+ * flag is required here even for a read. Best-effort: an empty set on any failure
+ * (unauthenticated, no security_events scope, network) fails open — nothing extra gets
+ * exempted, dep bumps just fall back to the normal age/vetting policy.
+ */
+export async function fetchDismissedPackageNames(slug: string, cwd: string): Promise<Set<string>> {
+  const r = await gh(
+    [
+      "api",
+      "--method",
+      "GET",
+      "--paginate",
+      `repos/${slug}/dependabot/alerts`,
+      "-f",
+      "state=dismissed",
+      "--jq",
+      ".[].dependency.package.name",
+    ],
+    cwd,
+  );
+  if (!r.ok) return new Set();
+  return new Set(
+    r.out
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+}
+
 type CheckRun = { status: string; conclusion: string | null };
 
 const FAIL_CONCLUSIONS = new Set([

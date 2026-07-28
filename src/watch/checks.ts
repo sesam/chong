@@ -11,6 +11,8 @@ import {
   i18nGatePrompt,
   i18nResolvePrompt,
 } from "./agent";
+import { filterDepsByReleasePolicy, readDepsPolicy } from "./deps-policy";
+import { fetchDismissedPackageNames, parseGitHubSlug } from "./gh";
 import {
   type Untranslated,
   addedLineNumbers,
@@ -19,7 +21,6 @@ import {
   isExcludedPath,
   isScannable,
 } from "./i18n-scan";
-import { filterDepsByReleasePolicy, readDepsPolicy } from "./deps-policy";
 import { repo } from "./repo";
 
 type Run = { ok: boolean; out: string; err: string };
@@ -874,7 +875,15 @@ export async function runMaintenance(
     targets = [];
   }
 
-  const { allowed, blocked } = await filterDepsByReleasePolicy(targets, depsPolicy);
+  const ghRepoSlug = parseGitHubSlug(await repo.remoteUrl(shadowPath, remote));
+  const dismissedPackages = ghRepoSlug
+    ? await fetchDismissedPackageNames(ghRepoSlug, shadowPath)
+    : new Set<string>();
+  const { allowed, blocked } = await filterDepsByReleasePolicy(
+    targets,
+    depsPolicy,
+    dismissedPackages,
+  );
   if (blocked.length > 0) {
     const preview = blocked
       .slice(0, 4)
@@ -887,7 +896,11 @@ export async function runMaintenance(
   targets = allowed;
 
   if (targets.length === 0) {
-    step(blocked.length > 0 ? "✓ deps: no updates passed release policy" : "✓ deps: no minor updates available");
+    step(
+      blocked.length > 0
+        ? "✓ deps: no updates passed release policy"
+        : "✓ deps: no minor updates available",
+    );
   } else {
     // --lockfile-only keeps node_modules (symlinked from the source repo) untouched.
     const up = await sh(["pnpm", "update", "--lockfile-only", ...targets], shadowPath);

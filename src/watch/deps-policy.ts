@@ -43,7 +43,9 @@ export async function readDepsPolicy(repoPath: string): Promise<DepsPolicy> {
     : DEFAULT_MINIMUM_RELEASE_AGE_MINUTES;
 
   return {
-    minimumReleaseAge: Number.isFinite(minimumReleaseAge) ? minimumReleaseAge : DEFAULT_MINIMUM_RELEASE_AGE_MINUTES,
+    minimumReleaseAge: Number.isFinite(minimumReleaseAge)
+      ? minimumReleaseAge
+      : DEFAULT_MINIMUM_RELEASE_AGE_MINUTES,
   };
 }
 
@@ -118,7 +120,9 @@ export function decideAutoApplyUpdate(
   };
 }
 
-export function trustMetaFromManifest(manifest: RegistryVersionMeta | null | undefined): TrustMeta | null {
+export function trustMetaFromManifest(
+  manifest: RegistryVersionMeta | null | undefined,
+): TrustMeta | null {
   if (!manifest) return null;
   const npmUser = parseNpmUser(manifest._npmUser);
   return {
@@ -185,10 +189,18 @@ async function fetchPackageRegistryMeta(
   }
 }
 
-/** Filter maintenance bump targets against release age + vetted-publish rules. */
+/**
+ * Filter maintenance bump targets against release age + vetted-publish rules.
+ * `exceptionPackages` (typically this repo's dismissed-Dependabot-alert package names, via
+ * `fetchDismissedPackageNames` in ./gh) bypasses the age/vetting gate entirely — e.g. a
+ * repo pinning brace-expansion to a pre-rewrite 1.x/2.x line for eslint/minimatch@3 CJS
+ * compat shouldn't have same-major bumps blocked by an unrelated freshness check once
+ * that package's advisory has been reviewed and dismissed.
+ */
 export async function filterDepsByReleasePolicy(
   targets: string[],
   policy: DepsPolicy,
+  exceptionPackages: Set<string> = new Set(),
 ): Promise<{ allowed: string[]; blocked: FilteredTarget[] }> {
   const allowed: string[] = [];
   const blocked: FilteredTarget[] = [];
@@ -202,6 +214,10 @@ export async function filterDepsByReleasePolicy(
 
     const { name, version } = parsed;
     if (name.startsWith("@fortawesome/") || name.startsWith("@awesome.me/")) {
+      allowed.push(target);
+      continue;
+    }
+    if (exceptionPackages.has(name)) {
       allowed.push(target);
       continue;
     }
