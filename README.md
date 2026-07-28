@@ -51,7 +51,7 @@ Options:
 
 **Auto-maintain (commit steps only):** runs once when watch starts, then every **20** remote commits or every **2 hours** — deps bump, lockfile reconcile, and format (pushed to `origin/main`). Background notices only (no maintain screen). Full diagnostics stay on `[m]`.
 
-Dep bumps respect **`minimumReleaseAge`** from the watched repo's `pnpm-workspace.yaml` (default 48h if unset). Chong skips same-major updates when the target version is too fresh or lacks npm provenance/signatures; pnpm's own `minimumReleaseAge` / `trustPolicy` settings apply on `pnpm install`.
+Dep bumps respect **`minimumReleaseAge`** from the watched repo's `pnpm-workspace.yaml` (default 48h if unset). Chong only auto-applies a same-major bump when the target version is **aged out**, or when it is **fresh but vetted** (SLSA provenance, staged publish, or trusted publisher + provenance). Fresh releases that are merely npm-signed — without provenance — are skipped until they age out. pnpm's own `minimumReleaseAge` / `trustPolicy` settings apply on `pnpm install`.
 
 **Post-commit checks** run automatically on each new commit (local and remote):
 - Flags i18n mismatches: `t()`/`useT`/`i18n` code without `.po`/`.pot` changes, or vice versa

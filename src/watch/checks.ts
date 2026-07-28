@@ -881,7 +881,7 @@ export async function runMaintenance(
       .map((b) => `${b.target} (${b.reason})`)
       .join("; ");
     step(
-      `⏳ deps: skipped ${blocked.length} too-recent/unverified release(s)${preview ? ` — ${preview}` : ""}`,
+      `⏳ deps: skipped ${blocked.length} release(s) blocked by age/vetting policy${preview ? ` — ${preview}` : ""}`,
     );
   }
   targets = allowed;

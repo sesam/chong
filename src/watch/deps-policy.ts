@@ -9,14 +9,22 @@ export type DepsPolicy = {
   minimumReleaseAge: number;
 };
 
+/** Registry trust signals for a single package version. */
 export type TrustMeta = {
   hasProvenance: boolean;
   hasSignatures: boolean;
+  hasStagedPublish: boolean;
+  hasTrustedPublisher: boolean;
 };
 
 export type FilteredTarget = {
   target: string;
   reason: string;
+};
+
+export type AutoApplyDecision = {
+  allow: boolean;
+  reason?: string;
 };
 
 /** Read `minimumReleaseAge` from the repo's pnpm-workspace.yaml (if present). */
@@ -57,6 +65,87 @@ function encodePackage(name: string): string {
 
 const REGISTRY = "https://registry.npmjs.org";
 
+/** True when the release was vetted by a trustable publisher (not just npm-signed). */
+export function isVettedForFreshRelease(trust: TrustMeta): boolean {
+  if (trust.hasStagedPublish) return true;
+  if (trust.hasProvenance && trust.hasTrustedPublisher) return true;
+  return trust.hasProvenance;
+}
+
+/** Minimum bar: npm registry signature and/or SLSA provenance attestation. */
+export function isRegistrySigned(trust: TrustMeta): boolean {
+  return trust.hasProvenance || trust.hasSignatures;
+}
+
+/**
+ * Maintenance may auto-apply a bump when the target is aged out OR freshly published
+ * but vetted (SLSA provenance, staged publish, or trusted publisher + provenance).
+ * Signatures alone are not enough for fresh releases (axios@1.14.1 had neither).
+ */
+export function decideAutoApplyUpdate(
+  trust: TrustMeta | null,
+  ageMin: number | null,
+  policy: DepsPolicy,
+): AutoApplyDecision {
+  if (!trust) {
+    return { allow: false, reason: "could not verify registry metadata" };
+  }
+
+  if (!isRegistrySigned(trust)) {
+    return { allow: false, reason: "no registry provenance or signatures" };
+  }
+
+  if (policy.minimumReleaseAge <= 0) {
+    return { allow: true };
+  }
+
+  if (ageMin === null) {
+    return { allow: false, reason: "could not verify publish time" };
+  }
+
+  if (ageMin >= policy.minimumReleaseAge) {
+    return { allow: true };
+  }
+
+  if (isVettedForFreshRelease(trust)) {
+    return { allow: true };
+  }
+
+  const hoursLeft = Math.ceil((policy.minimumReleaseAge - ageMin) / 60);
+  return {
+    allow: false,
+    reason: `published ${Math.floor(ageMin / 60)}h ago — fresh release lacks SLSA provenance/staged publish (wait ~${hoursLeft}h)`,
+  };
+}
+
+export function trustMetaFromManifest(manifest: RegistryVersionMeta | null | undefined): TrustMeta | null {
+  if (!manifest) return null;
+  const npmUser = parseNpmUser(manifest._npmUser);
+  return {
+    hasProvenance: Boolean(manifest.dist?.attestations?.provenance),
+    hasSignatures: Array.isArray(manifest.dist?.signatures) && manifest.dist.signatures.length > 0,
+    hasStagedPublish: npmUser.hasStagedPublish,
+    hasTrustedPublisher: npmUser.hasTrustedPublisher,
+  };
+}
+
+type RegistryVersionMeta = {
+  _npmUser?: unknown;
+  dist?: { attestations?: { provenance?: unknown }; signatures?: unknown[] };
+  publishedAt?: string | null;
+};
+
+function parseNpmUser(raw: unknown): { hasStagedPublish: boolean; hasTrustedPublisher: boolean } {
+  if (!raw || typeof raw !== "object") {
+    return { hasStagedPublish: false, hasTrustedPublisher: false };
+  }
+  const user = raw as { approver?: unknown; trustedPublisher?: unknown };
+  return {
+    hasStagedPublish: Boolean(user.approver),
+    hasTrustedPublisher: Boolean(user.trustedPublisher),
+  };
+}
+
 /** Minutes since `name@version` was published to the npm registry, or null on failure. */
 export async function packagePublishAgeMinutes(
   name: string,
@@ -70,20 +159,13 @@ export async function packagePublishAgeMinutes(
 
 export async function packageTrustMeta(name: string, version: string): Promise<TrustMeta | null> {
   const meta = await fetchPackageRegistryMeta(name, version);
-  if (!meta) return null;
-  return {
-    hasProvenance: Boolean(meta.dist?.attestations?.provenance),
-    hasSignatures: Array.isArray(meta.dist?.signatures) && meta.dist.signatures.length > 0,
-  };
+  return trustMetaFromManifest(meta);
 }
 
 async function fetchPackageRegistryMeta(
   name: string,
   version: string,
-): Promise<{
-  dist?: { attestations?: { provenance?: unknown }; signatures?: unknown[] };
-  publishedAt?: string | null;
-} | null> {
+): Promise<RegistryVersionMeta | null> {
   const packumentUrl = `${REGISTRY}/${encodePackage(name)}`;
   try {
     const res = await fetch(packumentUrl, {
@@ -92,10 +174,7 @@ async function fetchPackageRegistryMeta(
     });
     if (!res.ok) return null;
     const pack = (await res.json()) as {
-      versions?: Record<
-        string,
-        { dist?: { attestations?: { provenance?: unknown }; signatures?: unknown[] } }
-      >;
+      versions?: Record<string, RegistryVersionMeta>;
       time?: Record<string, string>;
     };
     const versionMeta = pack.versions?.[version];
@@ -106,10 +185,7 @@ async function fetchPackageRegistryMeta(
   }
 }
 
-/**
- * Drop update targets that are too fresh or lack registry trust evidence
- * (neither SLSA provenance nor npm signatures — the axios@1.14.1 pattern).
- */
+/** Filter maintenance bump targets against release age + vetted-publish rules. */
 export async function filterDepsByReleasePolicy(
   targets: string[],
   policy: DepsPolicy,
@@ -131,36 +207,14 @@ export async function filterDepsByReleasePolicy(
     }
 
     const trust = await packageTrustMeta(name, version);
-    const verified = Boolean(trust?.hasProvenance || trust?.hasSignatures);
-    if (trust && !verified) {
-      blocked.push({
-        target,
-        reason: "no registry provenance or signatures",
-      });
-      continue;
-    }
-
-    if (policy.minimumReleaseAge <= 0) {
-      allowed.push(target);
-      continue;
-    }
-
     const ageMin = await packagePublishAgeMinutes(name, version);
-    if (ageMin === null) {
-      blocked.push({ target, reason: "could not verify publish time" });
-      continue;
-    }
+    const decision = decideAutoApplyUpdate(trust, ageMin, policy);
 
-    if (ageMin < policy.minimumReleaseAge && !verified) {
-      const hours = Math.ceil((policy.minimumReleaseAge - ageMin) / 60);
-      blocked.push({
-        target,
-        reason: `published ${Math.floor(ageMin / 60)}h ago, unverified — wait ~${hours}h more (minimumReleaseAge ${policy.minimumReleaseAge}m)`,
-      });
-      continue;
+    if (decision.allow) {
+      allowed.push(target);
+    } else {
+      blocked.push({ target, reason: decision.reason ?? "blocked by release policy" });
     }
-
-    allowed.push(target);
   }
 
   return { allowed, blocked };
