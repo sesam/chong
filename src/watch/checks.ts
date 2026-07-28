@@ -19,6 +19,7 @@ import {
   isExcludedPath,
   isScannable,
 } from "./i18n-scan";
+import { filterDepsByReleasePolicy, readDepsPolicy } from "./deps-policy";
 import { repo } from "./repo";
 
 type Run = { ok: boolean; out: string; err: string };
@@ -855,6 +856,7 @@ export async function runMaintenance(
 
   // ── 1. minor dependency updates
   onStep?.("deps: checking pnpm outdated…");
+  const depsPolicy = await readDepsPolicy(shadowPath);
   const outdated = await sh(["pnpm", "outdated", "--format", "json"], shadowPath);
   let targets: string[] = [];
   try {
@@ -871,8 +873,21 @@ export async function runMaintenance(
   } catch {
     targets = [];
   }
+
+  const { allowed, blocked } = await filterDepsByReleasePolicy(targets, depsPolicy);
+  if (blocked.length > 0) {
+    const preview = blocked
+      .slice(0, 4)
+      .map((b) => `${b.target} (${b.reason})`)
+      .join("; ");
+    step(
+      `⏳ deps: skipped ${blocked.length} too-recent/unverified release(s)${preview ? ` — ${preview}` : ""}`,
+    );
+  }
+  targets = allowed;
+
   if (targets.length === 0) {
-    step("✓ deps: no minor updates available");
+    step(blocked.length > 0 ? "✓ deps: no updates passed release policy" : "✓ deps: no minor updates available");
   } else {
     // --lockfile-only keeps node_modules (symlinked from the source repo) untouched.
     const up = await sh(["pnpm", "update", "--lockfile-only", ...targets], shadowPath);
