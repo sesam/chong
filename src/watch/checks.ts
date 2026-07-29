@@ -45,6 +45,10 @@ async function sh(cmd: string[], cwd: string): Promise<Run> {
   return { ok: code === 0, out: out.trim(), err: err.trim() };
 }
 
+// Built via RegExp so the ESC control char isn't a literal in a regex (biome rule).
+const ANSI_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
+const stripAnsi = (s: string) => s.replace(ANSI_RE, "");
+
 async function commitFiles(repoPath: string, sha: string): Promise<string[]> {
   const r = await git(["diff-tree", "--no-commit-id", "-r", "--name-only", sha], repoPath);
   return r.ok && r.out ? r.out.split("\n").filter(Boolean) : [];
@@ -501,7 +505,23 @@ export type FixResult = {
   pushed: boolean;
   leftovers: string[];
   error: string | null;
+  /** Raw command stdout+stderr when the i18n command failed (for agent prompts). */
+  failOutput?: string;
 };
+
+/** Discard uncommitted shadow changes so later auto-fixes start clean. */
+async function resetShadowDirty(shadowPath: string): Promise<void> {
+  await git(["checkout", "--", "."], shadowPath);
+  await git(["clean", "-fd"], shadowPath);
+}
+
+/**
+ * True when `pnpm i18n` failed for empty/identical msgstr (or pointed at the
+ * identical-msgstr allowlist) — the mechanical cases cursor-agent should fix.
+ */
+export function isAgentableI18nFailure(output: string): boolean {
+  return /empty msgstr|identical en\/sl msgstr|i18n-identical-msgstr-allowlist/i.test(output);
+}
 
 /** Run `pnpm i18n` in shadow, commit .po/.pot changes, push. Returns leftover files. */
 export async function runI18nFix(
@@ -512,11 +532,13 @@ export async function runI18nFix(
 ): Promise<FixResult> {
   const r = await sh(["pnpm", "i18n"], shadowPath);
   if (!r.ok) {
+    const failOutput = stripAnsi(`${r.out}\n${r.err}`).trim();
     return {
       committed: false,
       pushed: false,
       leftovers: [],
       error: `pnpm i18n: ${r.err || r.out}`,
+      failOutput,
     };
   }
 
@@ -683,9 +705,6 @@ export type MaintOpts = {
   agentI18n?: boolean;
 };
 
-// Built via RegExp so the ESC control char isn't a literal in a regex (biome rule).
-const ANSI_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
-const stripAnsi = (s: string) => s.replace(ANSI_RE, "");
 const major = (v: string) => Number.parseInt(v.replace(/^[^\d]*/, "").split(".")[0] ?? "", 10);
 
 /** Last `n` non-empty lines of `s`, ANSI-stripped — a compact failure excerpt. */
@@ -711,7 +730,7 @@ function failingTestFiles(output: string): string[] {
 
 /**
  * Ask cursor-agent (Auto) to fix i18n issues described by `summary`.
- * On SAFE + clean commit → pushes. On UNSAFE/uncertain → returns pauseUntil.
+ * On SAFE + i18n exit 0 + commit → pushes. On UNSAFE/uncertain → cleans + pauseUntil.
  */
 export async function tryAgentI18nFix(
   repoPath: string,
@@ -726,57 +745,41 @@ export async function tryAgentI18nFix(
   pauseUntil?: number;
   message: string;
 }> {
+  const pause = async (message: string) => {
+    await resetShadowDirty(shadowPath);
+    const until = Date.now() + I18N_PAUSE_MS;
+    return { fixed: false, paused: true, pauseUntil: until, message };
+  };
+
   if (!findAgentBin()) {
-    return {
-      fixed: false,
-      paused: true,
-      pauseUntil: Date.now() + I18N_PAUSE_MS,
-      message: "no agent on PATH — pausing i18n auto-fix 2h",
-    };
+    return pause("no agent on PATH — pausing i18n auto-fix 2h");
   }
 
   const gate = await agentGate(shadowPath, i18nGatePrompt(summary));
   if (gate.verdict !== "SAFE") {
-    const until = Date.now() + I18N_PAUSE_MS;
-    return {
-      fixed: false,
-      paused: true,
-      pauseUntil: until,
-      message: `i18n agent ${gate.verdict.toLowerCase()} — pausing auto-fix 2h`,
-    };
+    return pause(`i18n agent ${gate.verdict.toLowerCase()} — pausing auto-fix 2h`);
   }
 
   const edit = await agentEdit(shadowPath, i18nResolvePrompt(summary, i18nCmd));
   if (!edit.ok) {
-    const until = Date.now() + I18N_PAUSE_MS;
-    return {
-      fixed: false,
-      paused: true,
-      pauseUntil: until,
-      message: `i18n agent edit failed — pausing auto-fix 2h (${edit.text.slice(0, 120)})`,
-    };
+    return pause(`i18n agent edit failed — pausing auto-fix 2h (${edit.text.slice(0, 120)})`);
   }
 
-  // Re-run i18n extraction so .po/.pot match source wraps the agent may have added.
+  // Re-run i18n; refuse to commit unless the project check exits 0.
   const [icmd, ...iargs] = i18nCmd.trim().split(/\s+/);
-  await sh([icmd, ...iargs], shadowPath);
+  const verify = await sh([icmd, ...iargs], shadowPath);
+  if (!verify.ok) {
+    const excerpt = stripAnsi(`${verify.out}\n${verify.err}`).trim().slice(-400);
+    return pause(`i18n still failing after agent — pausing auto-fix 2h (${excerpt})`);
+  }
 
   const statusR = await git(["status", "--porcelain"], shadowPath);
   if (!statusR.out) {
     return { fixed: false, paused: false, message: "i18n agent: nothing to commit" };
   }
 
-  // Commit only translation/source-ish paths; refuse if conflict markers remain.
   if (await hasConflictMarkers(shadowPath)) {
-    await git(["checkout", "--", "."], shadowPath);
-    await git(["clean", "-fd"], shadowPath);
-    const until = Date.now() + I18N_PAUSE_MS;
-    return {
-      fixed: false,
-      paused: true,
-      pauseUntil: until,
-      message: "i18n agent left conflict markers — pausing auto-fix 2h",
-    };
+    return pause("i18n agent left conflict markers — pausing auto-fix 2h");
   }
 
   const changed = statusR.out
@@ -786,15 +789,7 @@ export async function tryAgentI18nFix(
   await git(["add", "-A"], shadowPath);
   const commitR = await git(["commit", "-m", "FIX: i18n (agent)", "--no-verify"], shadowPath);
   if (!commitR.ok) {
-    await git(["checkout", "--", "."], shadowPath);
-    await git(["clean", "-fd"], shadowPath);
-    const until = Date.now() + I18N_PAUSE_MS;
-    return {
-      fixed: false,
-      paused: true,
-      pauseUntil: until,
-      message: `i18n agent commit failed — pausing 2h (${commitR.err})`,
-    };
+    return pause(`i18n agent commit failed — pausing 2h (${commitR.err})`);
   }
 
   const pushR = await git(["push", remote, `HEAD:refs/heads/${branch}`], shadowPath);

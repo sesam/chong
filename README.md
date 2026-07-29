@@ -60,9 +60,10 @@ Dep bumps respect **`minimumReleaseAge`** from the watched repo's `pnpm-workspac
 - Flags i18n mismatches: `t()`/`useT`/`i18n` code without `.po`/`.pot` changes, or vice versa
 - Flags **hardcoded strings** in the commit's added lines that aren't wrapped in `t()` — copy `pnpm i18n` can't see because it only extracts already-wrapped strings, so it silently stays in the source locale. Scoped to the diff, so it's cheap. Disable with `--no-i18n-scan`.
 - Resets a `main-shadow` worktree to origin/main, runs `pnpm i18n`, commits `.po`/`.pot` changes as `FIX: pnpm i18n` and pushes
+- If `pnpm i18n` **fails** (empty `msgstr`, identical en/sl, etc.), asks the coding agent (`cursor-agent --model auto` or `mcpify-agent`) after a SAFE confidence gate; on success commits `FIX: i18n (agent)` and pushes. Uncertain/UNSAFE pauses post-commit i18n auto-fix for 2h
 - Regenerates the lockfile when a commit changed `package.json` but not `pnpm-lock.yaml` (otherwise CI's `--frozen-lockfile` install fails with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`); commits as `FIX: pnpm lockfile` and pushes
 - Runs the format command on the changed files, commits as `FIX: code formatting` and pushes
-- Leftover non-.po files after i18n: coding agent may fix when SAFE; otherwise pauses i18n auto-fix for 2h
+- Leftover non-.po files after a successful i18n run: coding agent may fix when SAFE; otherwise pauses i18n auto-fix for 2h
 
 **Maintenance** (`[m]`) runs a manual pass in the `main-shadow` worktree:
 0. Injects any local `main` commits onto `origin/main` first (same as the watch auto-inject), so maintain starts from a tip that already includes them

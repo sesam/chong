@@ -193,7 +193,32 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     } else {
       const i18nFix = await runI18nFix(repoPath, shadow.shadowPath, remote, headBranch);
       if (i18nFix.error) {
-        addNotice(c.red(`✗ ${sha.slice(0, 7)} i18n: ${i18nFix.error}`));
+        addNotice(c.red(`✗ ${sha.slice(0, 7)} i18n: ${i18nFix.error.slice(0, 200)}`));
+        // Empty msgstr / identical en·sl / other pnpm i18n failures → cursor-agent
+        if (agentEnabled) {
+          const out = i18nFix.failOutput ?? i18nFix.error;
+          const summary = [
+            `\`pnpm i18n\` failed on commit ${sha.slice(0, 7)} in the main-shadow worktree.`,
+            "Fix empty msgstr / identical en·sl (allowlist when intentional) / other mechanical i18n failures until the command exits 0.",
+            "",
+            "Command output:",
+            out.slice(0, 5000),
+          ].join("\n");
+          addNotice(c.dim(`… ${sha.slice(0, 7)}: asking coding agent to fix i18n…`));
+          paint();
+          const agentRes = await tryAgentI18nFix(
+            repoPath,
+            shadow.shadowPath,
+            summary,
+            cfg.i18nCmd,
+            remote,
+            headBranch,
+          );
+          addNotice(
+            agentRes.fixed ? c.green(`✓ ${agentRes.message}`) : c.yellow(`⚠ ${agentRes.message}`),
+          );
+          if (agentRes.pauseUntil) i18nPausedUntil = agentRes.pauseUntil;
+        }
       } else if (i18nFix.committed) {
         addNotice(c.green(`✓ ${sha.slice(0, 7)}: pnpm i18n applied → pushed to ${headBranch}`));
       }
