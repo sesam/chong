@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstatSync, mkdirSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import {
@@ -165,6 +165,72 @@ export async function scanRepoForUntranslated(
 export async function isAutoFix(repoPath: string, sha: string): Promise<boolean> {
   const r = await git(["log", "-1", "--format=%s", sha], repoPath);
   return r.ok && (r.out.startsWith("FIX:") || r.out.startsWith("CLEAN:"));
+}
+
+/** Subject of the current HEAD commit in `cwd` (empty string on failure). */
+async function headSubject(cwd: string): Promise<string> {
+  const r = await git(["log", "-1", "--format=%s"], cwd);
+  return r.ok ? r.out.trim() : "";
+}
+
+/**
+ * True when a commit with this exact subject already appears among the last `n`
+ * commits in `cwd`. Used to detect an auto-fix oscillating (e.g. a formatter that
+ * flip-flops between two outputs on a file with real unresolved conflict markers)
+ * instead of making forward progress — a plain "is HEAD already the fix?" check
+ * misses that case because each oscillation *does* produce a real diff.
+ */
+async function subjectRepeatsRecently(cwd: string, subject: string, n = 10): Promise<boolean> {
+  const r = await git(["log", `-${n}`, "--format=%s"], cwd);
+  if (!r.ok) return false;
+  return r.out.split("\n").includes(subject);
+}
+
+/**
+ * Per-repo+branch persisted flag directory for auto-fix loop guards. Deliberately
+ * outside the shadow worktree (which can be recreated/reset) and outside the repo
+ * itself (nothing to accidentally commit) — under `~/.chong/state/`, alongside the
+ * shadow-worktree cache in `~/.chong/worktrees/`.
+ */
+function autoFixBlockerPath(repoPath: string, branch: string, kind: string): string {
+  const base = path.basename(repoPath);
+  const hash = createHash("sha1").update(repoPath).digest("hex").slice(0, 8);
+  return path.join(homedir(), ".chong", "state", `${base}-${hash}-${branch}-${kind}.block`);
+}
+
+/**
+ * Reads a durable "stop retrying" flag for a repo+branch+kind (e.g. "codestyle").
+ * Unlike the in-memory `i18nPausedUntil` cooldown, this survives process restarts:
+ * once `subjectRepeatsRecently` catches a real oscillation, retrying on the next
+ * poll would just burn another push, so we require a human to delete the file
+ * after fixing the underlying cause.
+ */
+async function autoFixBlockReason(
+  repoPath: string,
+  branch: string,
+  kind: string,
+): Promise<string | null> {
+  const p = autoFixBlockerPath(repoPath, branch, kind);
+  if (!existsSync(p)) return null;
+  try {
+    return (await Bun.file(p).text()).trim() || "blocked";
+  } catch {
+    return "blocked";
+  }
+}
+
+async function setAutoFixBlocker(
+  repoPath: string,
+  branch: string,
+  kind: string,
+  reason: string,
+): Promise<void> {
+  const p = autoFixBlockerPath(repoPath, branch, kind);
+  mkdirSync(path.dirname(p), { recursive: true });
+  await Bun.write(
+    p,
+    `${new Date().toISOString()} ${reason}\nDelete this file once the underlying cause is fixed to re-enable auto-fix.\n`,
+  );
 }
 
 export type ShadowInfo = { shadowPath: string; error: string | null };
@@ -507,6 +573,8 @@ export type FixResult = {
   error: string | null;
   /** Raw command stdout+stderr when the i18n command failed (for agent prompts). */
   failOutput?: string;
+  /** Set when a loop guard suppressed this fix — see `error` for the human-readable reason. */
+  blocked?: boolean;
 };
 
 /** Discard uncommitted shadow changes so later auto-fixes start clean. */
@@ -568,9 +636,18 @@ export async function runI18nFix(
   return { committed: true, pushed: true, leftovers, error: null };
 }
 
+const FORMAT_FIX_SUBJECT = "FIX: code formatting";
+const CODE_STYLE_SUBJECT = "CLEAN: code style";
+
 /**
  * Run the formatter in shadow, commit formatting changes only for files touched by `sha`,
  * revert all other formatter changes, push.
+ *
+ * Guarded against looping: if a repo+branch already has a durable blocker set (from a
+ * previous caught oscillation), this no-ops immediately. Otherwise, before committing,
+ * it checks whether `FORMAT_FIX_SUBJECT` already appears in the last 10 commits — if so
+ * the formatter is flip-flopping (e.g. a file with real unresolved conflict markers)
+ * rather than making progress, so it sets the blocker instead of committing again.
  */
 export async function runFormatFix(
   repoPath: string,
@@ -580,6 +657,11 @@ export async function runFormatFix(
   remote: string,
   branch: string,
 ): Promise<FixResult> {
+  const blockReason = await autoFixBlockReason(repoPath, branch, "format");
+  if (blockReason) {
+    return { committed: false, pushed: false, leftovers: [], error: null, blocked: true };
+  }
+
   const files = await commitFiles(repoPath, sha);
   if (files.length === 0) return { committed: false, pushed: false, leftovers: [], error: null };
 
@@ -606,8 +688,26 @@ export async function runFormatFix(
 
   if (toCommit.length === 0) return { committed: false, pushed: false, leftovers: [], error: null };
 
+  if (await subjectRepeatsRecently(shadowPath, FORMAT_FIX_SUBJECT)) {
+    await setAutoFixBlocker(
+      repoPath,
+      branch,
+      "format",
+      `"${FORMAT_FIX_SUBJECT}" already in the last 10 commits but the formatter produced a diff ` +
+        `again on ${toCommit.join(", ")} — looks like an oscillation, not forward progress.`,
+    );
+    await resetShadowDirty(shadowPath);
+    return {
+      committed: false,
+      pushed: false,
+      leftovers: [],
+      error: `format fix loop detected on ${toCommit.join(", ")} — blocked, see ~/.chong/state/`,
+      blocked: true,
+    };
+  }
+
   await git(["add", "--", ...toCommit], shadowPath);
-  const commitR = await git(["commit", "-m", "FIX: code formatting", "--no-verify"], shadowPath);
+  const commitR = await git(["commit", "-m", FORMAT_FIX_SUBJECT, "--no-verify"], shadowPath);
   if (!commitR.ok) {
     return { committed: false, pushed: false, leftovers: [], error: `commit: ${commitR.err}` };
   }
@@ -944,21 +1044,41 @@ export async function runMaintenance(
   }
 
   // ── 2. code formatting
-  onStep?.("format: running formatter…");
-  const [fcmd, ...fargs] = cmds.format.trim().split(/\s+/);
-  await sh([fcmd, ...fargs], shadowPath); // formatters exit non-zero when they rewrite files
-  const fmtDirty = (await git(["status", "--porcelain"], shadowPath)).out;
-  if (fmtDirty) {
-    await git(["add", "-A"], shadowPath);
-    await git(["commit", "-m", "CLEAN: code style", "--no-verify"], shadowPath);
-    const pr = await push();
-    step(
-      pr.ok
-        ? `✓ code style: committed & pushed to ${branch}`
-        : `⚠ code style: committed but push failed (${pr.err})`,
-    );
+  const codestyleBlock = await autoFixBlockReason(repoPath, branch, "codestyle");
+  const lastSubject = await headSubject(shadowPath);
+  if (codestyleBlock) {
+    step(`⏸ code style: blocked — ${codestyleBlock}`);
+  } else if (lastSubject === CODE_STYLE_SUBJECT) {
+    // The tip is already our own formatting-only commit — running the formatter
+    // again here can't fix anything further, and if it's *still* dirty that's the
+    // oscillation case caught below, not a fresh issue this cycle.
+    step("✓ code style: already clean (last commit was the fix)");
   } else {
-    step("✓ code style: already clean");
+    onStep?.("format: running formatter…");
+    const [fcmd, ...fargs] = cmds.format.trim().split(/\s+/);
+    await sh([fcmd, ...fargs], shadowPath); // formatters exit non-zero when they rewrite files
+    const fmtDirty = (await git(["status", "--porcelain"], shadowPath)).out;
+    if (!fmtDirty) {
+      step("✓ code style: already clean");
+    } else if (await subjectRepeatsRecently(shadowPath, CODE_STYLE_SUBJECT)) {
+      await setAutoFixBlocker(
+        repoPath,
+        branch,
+        "codestyle",
+        `"${CODE_STYLE_SUBJECT}" already in the last 10 commits but the formatter produced a diff again — looks like an oscillation (e.g. a file with real unresolved conflict markers), not forward progress.`,
+      );
+      await resetShadowDirty(shadowPath);
+      step(`⚠ code style: loop detected — blocked, see ~/.chong/state/ (${branch})`);
+    } else {
+      await git(["add", "-A"], shadowPath);
+      await git(["commit", "-m", CODE_STYLE_SUBJECT, "--no-verify"], shadowPath);
+      const pr = await push();
+      step(
+        pr.ok
+          ? `✓ code style: committed & pushed to ${branch}`
+          : `⚠ code style: committed but push failed (${pr.err})`,
+      );
+    }
   }
 
   if (mode === "commits") {
