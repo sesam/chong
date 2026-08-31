@@ -807,6 +807,26 @@ export type MaintOpts = {
 
 const major = (v: string) => Number.parseInt(v.replace(/^[^\d]*/, "").split(".")[0] ?? "", 10);
 
+/** Apply same-major bumps one target at a time so one engine/policy failure doesn't abort the batch. */
+async function applyMinorDepUpdates(
+  shadowPath: string,
+  targets: string[],
+): Promise<{ updated: string[]; skipped: { target: string; reason: string }[] }> {
+  const updated: string[] = [];
+  const skipped: { target: string; reason: string }[] = [];
+  for (const target of targets) {
+    const up = await sh(["pnpm", "update", "--lockfile-only", target], shadowPath);
+    if (!up.ok) {
+      const reason = tail(`${up.err}\n${up.out}`, 4);
+      skipped.push({ target, reason: reason || "pnpm update failed" });
+      continue;
+    }
+    const dirty = (await git(["status", "--porcelain"], shadowPath)).out;
+    if (dirty) updated.push(target);
+  }
+  return { updated, skipped };
+}
+
 /** Last `n` non-empty lines of `s`, ANSI-stripped — a compact failure excerpt. */
 function tail(s: string, n: number): string {
   const lines = stripAnsi(s)
@@ -998,21 +1018,30 @@ export async function runMaintenance(
     );
   } else {
     // --lockfile-only keeps node_modules (symlinked from the source repo) untouched.
-    const up = await sh(["pnpm", "update", "--lockfile-only", ...targets], shadowPath);
+    const { updated, skipped } = await applyMinorDepUpdates(shadowPath, targets);
+    if (skipped.length > 0) {
+      const preview = skipped
+        .slice(0, 3)
+        .map((s) => `${s.target} (${s.reason})`)
+        .join("; ");
+      step(
+        `⚠ deps: skipped ${skipped.length} update(s)${preview ? ` — ${preview}` : ""}`,
+      );
+    }
     const dirty = (await git(["status", "--porcelain"], shadowPath)).out;
-    if (up.ok && dirty) {
+    if (updated.length > 0 && dirty) {
       await git(["add", "-A"], shadowPath);
       await git(["commit", "-m", "CLEAN: bump minor deps", "--no-verify"], shadowPath);
       const pr = await push();
       step(
         pr.ok
-          ? `✓ deps: updated ${targets.length} package(s) → committed & pushed to ${branch}`
+          ? `✓ deps: updated ${updated.length} package(s) → committed & pushed to ${branch}`
           : `⚠ deps: committed but push failed (${pr.err})`,
       );
-    } else if (!up.ok) {
-      step(`⚠ deps: pnpm update failed (${up.err || up.out})`);
-    } else {
+    } else if (updated.length === 0 && skipped.length === 0) {
       step("✓ deps: nothing changed");
+    } else if (updated.length === 0) {
+      step("✓ deps: no updates applied (all targets skipped or unchanged)");
     }
   }
 
