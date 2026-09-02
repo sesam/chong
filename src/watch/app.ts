@@ -14,6 +14,7 @@ import {
   runMaintenance,
   scanCommitForUntranslated,
   tryAgentI18nFix,
+  tryAutoPromoteStage,
 } from "./checks";
 import { type WatchConfig, computePipeline, enrichCI, gapHotkeys, promote } from "./model";
 import { type UIState, render } from "./render";
@@ -36,6 +37,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   let remoteCommitsSinceMaint = 0;
   let lastAutoMaintAt = 0;
   let startupMaintQueued = false;
+  let stagePromoteBlockedForTip: string | null = null;
   const agentEnabled = cfg.agent && !!findAgentBin();
 
   const ui: UIState = {
@@ -69,6 +71,42 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
 
   function addNotice(msg: string): void {
     ui.notices = [msg, ...ui.notices].slice(0, 5);
+  }
+
+  /** Queue main→stage auto-promote after lint checks (CI parity). Serialized on checkQueue. */
+  function queueAutoPromoteStage(reason: string): void {
+    if (!cfg.autoPromoteStage || !pipeline) return;
+    const gap = pipeline.gaps[0];
+    if (!gap || gap.ahead === 0 || !gap.ff) return;
+    const mainTip = pipeline.lanes[0]?.tip;
+    if (!mainTip || stagePromoteBlockedForTip === mainTip) return;
+
+    const { repoPath, remote } = pipeline;
+    const { from, to } = gap;
+    const run = async (): Promise<void> => {
+      const res = await tryAutoPromoteStage(repoPath, remote, from, to, {
+        agent: agentEnabled,
+      });
+      if (res.action === "noop") return;
+      if (res.action === "promoted") {
+        stagePromoteBlockedForTip = null;
+        addNotice(c.green(`✓ ${res.message} (${reason})`));
+        paint();
+        void refresh();
+        return;
+      }
+      if (res.action === "blocked") {
+        stagePromoteBlockedForTip = mainTip;
+        addNotice(c.yellow(`⚠ stage: ${res.message}`));
+        paint();
+        return;
+      }
+      // fixed: eslint commit landed on main — retry promote on next queue pass
+      addNotice(c.green(`✓ ${res.message}`));
+      paint();
+      queueAutoPromoteStage("after eslint fix");
+    };
+    checkQueue = checkQueue.then(run, run);
   }
 
   let maintaining = false;
@@ -126,6 +164,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
         }
         addNotice(c.green(`✓ auto-maintain done (${reason})`));
         paint();
+        queueAutoPromoteStage("after auto-maintain");
         void refresh();
       } catch (e) {
         addNotice(c.red(`✗ auto-maintain: ${e instanceof Error ? e.message : String(e)}`));
@@ -288,11 +327,14 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
         queueAutoMaintain(`every ${AUTO_MAINT_EVERY_COMMITS} commits`);
       }
     }
+
+    queueAutoPromoteStage("after post-commit checks");
   }
 
   /**
    * If local `main` (head lane) has commits origin lacks, land them via push or
-   * cherry-pick onto main-shadow, then optionally FF the next lane (stage).
+   * cherry-pick onto main-shadow. Auto-promote to stage is handled separately
+   * (eslint gate + FF) after post-commit checks / poll.
    * Serialized on checkQueue so it never races i18n/format/maintain shadow work.
    * Fire-and-forget from refresh — does not block the poll loop.
    */
@@ -315,7 +357,11 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
           addNotice(c.green(`✓ ${res.message}`));
         }
         paint();
-        if (res.pushed) void refresh();
+        if (res.pushed) {
+          stagePromoteBlockedForTip = null;
+          void refresh();
+          queueAutoPromoteStage("after local inject");
+        }
       } finally {
         reconciling = false;
       }
@@ -378,6 +424,10 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       pipeline = p;
       if (ui.selectedGap > p.gaps.length - 1) ui.selectedGap = Math.max(0, p.gaps.length - 1);
       ui.status = error ? c.yellow(`⚠ ${error}`) : ui.status;
+      const mainTip = p.lanes[0]?.tip;
+      if (mainTip && stagePromoteBlockedForTip && stagePromoteBlockedForTip !== mainTip) {
+        stagePromoteBlockedForTip = null;
+      }
       paint();
       // CI is slower / best-effort — fill it in and repaint when ready
       enrichCI(p).then(() => {
@@ -391,7 +441,12 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     paint();
 
     // Queue a local→origin inject if needed (runs after any in-flight shadow work).
-    if (pipeline) maybeReconcileLocalMain();
+    if (pipeline) {
+      maybeReconcileLocalMain();
+      if (cfg.autoPromoteStage && baseline !== null) {
+        queueAutoPromoteStage("pipeline poll");
+      }
+    }
   }
 
   async function doPromote(idx: number): Promise<void> {
@@ -488,6 +543,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     ui.busy = false;
     maintaining = false;
     paint();
+    queueAutoPromoteStage("after maintain");
   }
 
   // ── teardown plumbing

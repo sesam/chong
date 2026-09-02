@@ -40,6 +40,7 @@ Options:
   --no-i18n-scan               disable scanning commits for hardcoded (untranslated) strings
   --no-agent                   disable mcpify-agent / cursor-agent for conflicts / i18n
   --no-auto-maintain           disable scheduled commit-producing maintain
+  --no-auto-promote-stage      disable auto-promote main→stage (eslint gate + FF)
 ```
 
 ![chong watch TUI](chong-watch-tui-example.webp)
@@ -48,7 +49,9 @@ Options:
 
 **INCOMING** shows your local branch and remote origin/main commits merged by time. Commits that arrived after `chong watch` started are highlighted green.
 
-**Local → origin inject:** when local `main` has commits that aren't on `origin/main` (plain push if linear, or cherry-pick onto the clean `main-shadow` worktree when histories have diverged), watch lands them automatically. On cherry-pick conflict, the coding agent (`mcpify-agent` if on PATH, else `cursor-agent --model auto`) is asked for a `VERDICT: SAFE|UNSAFE`; only SAFE runs get an auto-resolve attempt. Failures stay a yellow warning and leave origin untouched. Stage/prod promote stays manual (`[s]` / `[p]`).
+**Local → origin inject:** when local `main` has commits that aren't on `origin/main` (plain push if linear, or cherry-pick onto the clean `main-shadow` worktree when histories have diverged), watch lands them automatically. On cherry-pick conflict, the coding agent (`mcpify-agent` if on PATH, else `cursor-agent --model auto`) is asked for a `VERDICT: SAFE|UNSAFE`; only SAFE runs get an auto-resolve attempt. Failures stay a yellow warning and leave origin untouched.
+
+**Auto-promote → stage:** when `main` has commits queued for `stage` and the promote is a clean fast-forward, watch lints the changed JS/TS/Vue files the same way CI does (`pnpm exec eslint` on the `stage..main` diff), runs `eslint --fix` when possible, and asks the coding agent for mechanical fixes (e.g. `no-undef` / missing imports). When lint is clean it fast-forwards `stage` to `main`. Prod promote stays manual (`[p]`). Disable with `--no-auto-promote-stage`.
 
 **Offline agents:** install mcp-ify’s `offline-agent` (`bash offline-agent/install.sh`) so `mcpify-agent` is on PATH — then watch runs fully locally via Ollama + mcp-ify with no Cursor cloud dependency.
 
@@ -64,6 +67,7 @@ Dep bumps respect **`minimumReleaseAge`** from the watched repo's `pnpm-workspac
 - Regenerates the lockfile when a commit changed `package.json` but not `pnpm-lock.yaml` (otherwise CI's `--frozen-lockfile` install fails with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`); commits as `FIX: pnpm lockfile` and pushes
 - Runs the format command on the changed files, commits as `FIX: code formatting` and pushes
 - Leftover non-.po files after a successful i18n run: coding agent may fix when SAFE; otherwise pauses i18n auto-fix for 2h
+- **Auto-promote → stage:** after post-commit fixes, lints the `stage..main` diff (CI parity), applies `FIX: eslint` / agent fixes when needed, then fast-forwards `stage` to `main` when clean (prod stays manual)
 
 **Maintenance** (`[m]`) runs a manual pass in the `main-shadow` worktree:
 0. Injects any local `main` commits onto `origin/main` first (same as the watch auto-inject), so maintain starts from a tip that already includes them

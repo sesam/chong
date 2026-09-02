@@ -36,6 +36,7 @@ export async function cmdWatch(argv: string[]): Promise<void> {
   const i18nScan = flags["no-i18n-scan"] !== true;
   const agent = flags["no-agent"] !== true;
   const autoMaintain = flags["no-auto-maintain"] !== true;
+  const autoPromoteStage = flags["no-auto-promote-stage"] !== true;
 
   const cfg: WatchConfig = {
     repoPath,
@@ -47,6 +48,7 @@ export async function cmdWatch(argv: string[]): Promise<void> {
     i18nScan,
     agent,
     autoMaintain,
+    autoPromoteStage,
   };
   try {
     await runWatch(cfg, intervalMs);

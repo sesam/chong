@@ -106,9 +106,16 @@ NOT DONE / PLANNED / OPEN DECISIONS  (the actual next-steps list)
 8. [OUT OF SCOPE, locked 2026-05-08] Stacked CLs; code review / PR approvals.
 
 9. [BUILT 2026-07-23] `chong watch` auto-injects local `main` commits onto
-   `origin/main` (push if linear; cherry-pick via main-shadow if diverged), then
-   FF `stage` when clean. Conflicts → yellow warning only (abort, leave origin).
-   Maintain runs the same inject first; steps 1–2 push immediately + FF stage.
+   `origin/main` (push if linear; cherry-pick via main-shadow if diverged).
+   Conflicts → yellow warning only (abort, leave origin).
+   Maintain runs the same inject first; steps 1–2 push immediately.
+
+12. [BUILT 2026-09-02] Auto-promote main→stage in `chong watch`: eslint the
+   stage..main diff (CI parity — `pnpm exec eslint` on changed JS/TS/Vue),
+   `eslint --fix` → `FIX: eslint`, agent for no-undef/import/* → `FIX: eslint (agent)`,
+   then FF stage. Prod stays manual. `--no-auto-promote-stage` to disable.
+   Wired in app.ts queueAutoPromoteStage + checks.ts tryAutoPromoteStage
+   (revives promoteFastForward for the FF push).
 
 10. [BUILT 2026-07-23] Agent-assisted cherry-pick + i18n via cursor-agent Auto
     (default on for `chong watch`; opt out with `--no-agent`).

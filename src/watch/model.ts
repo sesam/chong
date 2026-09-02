@@ -39,6 +39,8 @@ export type WatchConfig = {
   agent: boolean;
   /** Auto-run commit-producing maintain on start / every N commits / every 2h (default true). */
   autoMaintain: boolean;
+  /** Auto-promote main→stage after eslint passes (default true). Prod stays manual. */
+  autoPromoteStage: boolean;
 };
 
 /** Outcome of an auto-fast-forward attempt on one local branch ref. */

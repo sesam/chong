@@ -10,7 +10,16 @@ import {
   findAgentBin,
   i18nGatePrompt,
   i18nResolvePrompt,
+  lintGatePrompt,
+  lintResolvePrompt,
 } from "./agent";
+import {
+  type EslintError,
+  formatLintSummary,
+  isAgentableLintFailure,
+  lintableChangedFiles,
+  runEslint,
+} from "./lint";
 import { filterDepsByReleasePolicy, readDepsPolicy } from "./deps-policy";
 import { fetchDismissedPackageNames, parseGitHubSlug } from "./gh";
 import {
@@ -564,6 +573,239 @@ export async function promoteFastForward(
     return `${from} → ${to} is not a fast-forward`;
   }
   return repo.pushFastForward(repoPath, remote, from, to);
+}
+
+const ESLINT_FIX_SUBJECT = "FIX: eslint";
+
+export type AutoPromoteResult = {
+  action: "noop" | "promoted" | "fixed" | "blocked";
+  message: string;
+};
+
+/** ESLint errors on the main→stage diff, mirroring CI's changed-files lint step. */
+export async function lintStageDiff(
+  repoPath: string,
+  shadowPath: string,
+  remote: string,
+  from: string,
+  to: string,
+): Promise<{ ok: boolean; files: string[]; errors: EslintError[]; output: string }> {
+  const fromRef = `${remote}/${to}`;
+  const toRef = `${remote}/${from}`;
+  const files = await lintableChangedFiles(git, shadowPath, fromRef, toRef);
+  if (files.length === 0) return { ok: true, files, errors: [], output: "" };
+  const run = await runEslint(shadowPath, files);
+  return { ok: run.ok, files, errors: run.errors, output: run.output };
+}
+
+/**
+ * Run eslint --fix in shadow, commit only lintable files from the stage diff, push to main.
+ */
+export async function runEslintFix(
+  repoPath: string,
+  shadowPath: string,
+  remote: string,
+  branch: string,
+  from: string,
+  to: string,
+): Promise<FixResult & { errors?: EslintError[] }> {
+  const fromRef = `${remote}/${to}`;
+  const toRef = `${remote}/${from}`;
+  const scope = await lintableChangedFiles(git, shadowPath, fromRef, toRef);
+  if (scope.length === 0) return { committed: false, pushed: false, leftovers: [], error: null };
+
+  await runEslint(shadowPath, scope, true);
+
+  const statusR = await git(["status", "--porcelain"], shadowPath);
+  if (!statusR.out) {
+    const check = await runEslint(shadowPath, scope);
+    return {
+      committed: false,
+      pushed: false,
+      leftovers: [],
+      error: check.ok ? null : `eslint: ${formatLintSummary(check.errors)}`,
+      errors: check.errors,
+    };
+  }
+
+  const modified = statusR.out
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => l.slice(3).trim());
+  const toCommit = scope.filter((f) => modified.includes(f));
+  const leftovers = modified.filter((f) => !scope.includes(f));
+  const toRevert = leftovers;
+
+  if (toRevert.length > 0) {
+    await git(["checkout", "--", ...toRevert], shadowPath);
+  }
+
+  if (toCommit.length === 0) {
+    const check = await runEslint(shadowPath, scope);
+    return {
+      committed: false,
+      pushed: false,
+      leftovers,
+      error: check.ok ? null : `eslint: ${formatLintSummary(check.errors)}`,
+      errors: check.errors,
+    };
+  }
+
+  await git(["add", "--", ...toCommit], shadowPath);
+  const commitR = await git(["commit", "-m", ESLINT_FIX_SUBJECT, "--no-verify"], shadowPath);
+  if (!commitR.ok) {
+    return { committed: false, pushed: false, leftovers, error: `commit: ${commitR.err}` };
+  }
+
+  const pushR = await git(["push", remote, `HEAD:refs/heads/${branch}`], shadowPath);
+  if (!pushR.ok) {
+    return { committed: true, pushed: false, leftovers, error: `push: ${pushR.err}` };
+  }
+
+  const head = await git(["rev-parse", "HEAD"], shadowPath);
+  if (head.ok) {
+    await git(["update-ref", `refs/remotes/${remote}/${branch}`, head.out], repoPath);
+  }
+  return { committed: true, pushed: true, leftovers, error: null };
+}
+
+/** Ask the coding agent to fix agentable eslint errors (e.g. no-undef). */
+export async function tryAgentLintFix(
+  repoPath: string,
+  shadowPath: string,
+  summary: string,
+  files: string[],
+  remote: string,
+  branch: string,
+): Promise<{ fixed: boolean; message: string }> {
+  if (!findAgentBin()) {
+    return { fixed: false, message: "no agent on PATH — cannot auto-fix eslint" };
+  }
+
+  const gate = await agentGate(shadowPath, lintGatePrompt(summary));
+  if (gate.verdict !== "SAFE") {
+    return { fixed: false, message: `eslint agent ${gate.verdict.toLowerCase()} — promote blocked` };
+  }
+
+  const edit = await agentEdit(shadowPath, lintResolvePrompt(summary));
+  if (!edit.ok) {
+    return { fixed: false, message: `eslint agent edit failed (${edit.text.slice(0, 120)})` };
+  }
+
+  const verify = await runEslint(shadowPath, files);
+  if (!verify.ok) {
+    await resetShadowDirty(shadowPath);
+    return {
+      fixed: false,
+      message: `eslint still failing after agent (${formatLintSummary(verify.errors).slice(0, 200)})`,
+    };
+  }
+
+  const statusR = await git(["status", "--porcelain"], shadowPath);
+  if (!statusR.out) {
+    return { fixed: false, message: "eslint agent: nothing to commit" };
+  }
+
+  if (await hasConflictMarkers(shadowPath)) {
+    await resetShadowDirty(shadowPath);
+    return { fixed: false, message: "eslint agent left conflict markers" };
+  }
+
+  await git(["add", "-A"], shadowPath);
+  const commitR = await git(["commit", "-m", "FIX: eslint (agent)", "--no-verify"], shadowPath);
+  if (!commitR.ok) {
+    return { fixed: false, message: `eslint agent commit failed (${commitR.err})` };
+  }
+
+  const pushR = await git(["push", remote, `HEAD:refs/heads/${branch}`], shadowPath);
+  if (!pushR.ok) {
+    return { fixed: false, message: `eslint agent committed but push failed (${pushR.err})` };
+  }
+
+  const head = await git(["rev-parse", "HEAD"], shadowPath);
+  if (head.ok) {
+    await git(["update-ref", `refs/remotes/${remote}/${branch}`, head.out], repoPath);
+  }
+  return { fixed: true, message: `eslint agent fixed → pushed to ${branch}` };
+}
+
+/**
+ * Lint the main→stage diff (CI parity), auto-fix when trivial, then fast-forward promote.
+ * Only acts on the first pipeline gap when it is a clean fast-forward with commits queued.
+ */
+export async function tryAutoPromoteStage(
+  repoPath: string,
+  remote: string,
+  from: string,
+  to: string,
+  opts: { agent?: boolean } = {},
+): Promise<AutoPromoteResult> {
+  const { ahead } = await repo.aheadBehind(repoPath, remote, from, to);
+  if (ahead === 0) return { action: "noop", message: "nothing queued" };
+  if (!(await repo.isFastForward(repoPath, remote, from, to))) {
+    return { action: "blocked", message: `${from} → ${to} is not a fast-forward — promote manually` };
+  }
+
+  const shadow = await ensureShadow(repoPath, `${remote}/${from}`);
+  if (shadow.error) {
+    return { action: "blocked", message: `shadow: ${shadow.error}` };
+  }
+
+  let lint = await lintStageDiff(repoPath, shadow.shadowPath, remote, from, to);
+  if (!lint.ok) {
+    const fix = await runEslintFix(repoPath, shadow.shadowPath, remote, from, from, to);
+    if (fix.committed && fix.pushed) {
+      await git(["reset", "--hard", `${remote}/${from}`], shadow.shadowPath);
+      lint = await lintStageDiff(repoPath, shadow.shadowPath, remote, from, to);
+    } else if (fix.committed) {
+      return { action: "blocked", message: fix.error ?? "eslint fix committed but push failed" };
+    }
+
+    if (!lint.ok) {
+      const errors = fix.errors ?? lint.errors;
+      const agentEnabled = opts.agent !== false && !!findAgentBin();
+      if (agentEnabled && isAgentableLintFailure(errors)) {
+        const summary = [
+          "ESLint errors on files in the main→stage promotion diff:",
+          formatLintSummary(errors),
+          "",
+          "Command output:",
+          lint.output.slice(0, 4000),
+        ].join("\n");
+        const agentRes = await tryAgentLintFix(
+          repoPath,
+          shadow.shadowPath,
+          summary,
+          lint.files,
+          remote,
+          from,
+        );
+        if (agentRes.fixed) {
+          await git(["reset", "--hard", `${remote}/${from}`], shadow.shadowPath);
+          lint = await lintStageDiff(repoPath, shadow.shadowPath, remote, from, to);
+          if (!lint.ok) {
+            return {
+              action: "blocked",
+              message: `eslint still failing after agent (${formatLintSummary(lint.errors).slice(0, 200)})`,
+            };
+          }
+        } else {
+          return { action: "blocked", message: agentRes.message };
+        }
+      } else {
+        const preview = formatLintSummary(errors).slice(0, 300);
+        return {
+          action: "blocked",
+          message: `eslint blocks stage deploy${preview ? `: ${preview}` : ""}`,
+        };
+      }
+    }
+  }
+
+  const err = await promoteFastForward(repoPath, remote, from, to);
+  if (err) return { action: "blocked", message: err };
+  await git(["fetch", "--quiet", remote, to], repoPath);
+  return { action: "promoted", message: `promoted ${from} → ${to} (fast-forward)` };
 }
 
 export type FixResult = {

@@ -204,6 +204,39 @@ export function i18nGatePrompt(summary: string): string {
   ].join("\n");
 }
 
+export function lintGatePrompt(summary: string): string {
+  return [
+    "Chong found ESLint errors on files that would be promoted to stage:",
+    summary,
+    "",
+    "Decide if these can be fixed safely and mechanically (typically a missing import or undefined identifier).",
+    "",
+    "Treat as SAFE when:",
+    "- Adding a missing import / composable destructuring (e.g. useT / tJournal from the correct module)",
+    "- Fixing a typo in an identifier that has an obvious in-repo definition",
+    "",
+    "Treat as UNSAFE when product logic is unclear, many unrelated files would change, or the fix requires guessing behavior.",
+    "Reply with exactly one final line:",
+    "VERDICT: SAFE — <short reason>",
+    "or",
+    "VERDICT: UNSAFE — <short reason>",
+  ].join("\n");
+}
+
+export function lintResolvePrompt(summary: string): string {
+  return [
+    "Fix the ESLint errors below in this worktree. Be conservative.",
+    summary,
+    "",
+    "Rules:",
+    "- Fix only the reported errors (missing imports, undefined identifiers, import resolution).",
+    "- Match existing import style in the file (Vue composables, path aliases, etc.).",
+    "- Do not refactor unrelated code. Do not push.",
+    "- When done, `pnpm exec eslint --no-error-on-unmatched-pattern` on the touched files must exit 0.",
+    "- If anything is ambiguous, leave it untouched and stop.",
+  ].join("\n");
+}
+
 export function i18nResolvePrompt(summary: string, i18nCmd: string): string {
   return [
     "Fix the i18n issues below in this worktree. Be conservative.",
