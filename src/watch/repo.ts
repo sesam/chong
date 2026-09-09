@@ -170,6 +170,18 @@ export const repo = {
     return { behind: left, ahead: right };
   },
 
+  /** Same as aheadBehind but for raw commit SHAs / any resolvable refs. */
+  async aheadBehindShas(
+    cwd: string,
+    fromSha: string,
+    toSha: string,
+  ): Promise<{ ahead: number; behind: number }> {
+    const r = await git(["rev-list", "--left-right", "--count", `${toSha}...${fromSha}`], cwd);
+    if (!r.ok) return { ahead: 0, behind: 0 };
+    const [left, right] = r.out.split(/\s+/).map((n) => Number.parseInt(n, 10) || 0);
+    return { behind: left, ahead: right };
+  },
+
   /** True if promoting from → to is a clean fast-forward (to is an ancestor of from). */
   async isFastForward(cwd: string, remote: string, from: string, to: string): Promise<boolean> {
     const r = await git(
@@ -177,6 +189,23 @@ export const repo = {
       cwd,
     );
     return r.ok;
+  },
+
+  /**
+   * Commits reachable from `fromSha` but not `toSha`, newest first.
+   */
+  async logBetweenShas(
+    cwd: string,
+    fromSha: string,
+    toSha: string,
+    limit: number,
+  ): Promise<Commit[]> {
+    const r = await git(["log", `--format=${FORMAT}`, `-n${limit}`, `${toSha}..${fromSha}`], cwd);
+    if (!r.ok || !r.out) return [];
+    return r.out
+      .split("\n")
+      .map(parseCommit)
+      .filter((x): x is Commit => x !== null);
   },
 
   /**
@@ -191,8 +220,7 @@ export const repo = {
   ): Promise<string | null> {
     const sha = await repo.tip(cwd, remote, from);
     if (!sha) return `could not resolve ${remote}/${from}`;
-    const r = await git(["push", remote, `${sha}:refs/heads/${to}`], cwd);
-    return r.ok ? null : r.err || "push failed";
+    return repo.pushSha(cwd, remote, to, sha);
   },
 
   /** Sha of a local branch, or null if the branch doesn't exist locally. */
@@ -248,11 +276,46 @@ export const repo = {
     await git(["merge", "--abort"], cwd);
   },
 
-  /** Cherry-pick a single commit onto HEAD. Returns null on success, else error text. */
-  async cherryPick(cwd: string, sha: string): Promise<string | null> {
-    const r = await git(["cherry-pick", "--allow-empty", sha], cwd);
-    if (r.ok) return null;
-    return (r.err || r.out).split("\n").find(Boolean) ?? "cherry-pick failed";
+  /**
+   * Stable patch-id for `sha` (content fingerprint used by `git cherry`).
+   * Null when the commit can't be shown / has no patch.
+   */
+  async patchId(cwd: string, sha: string): Promise<string | null> {
+    const show = await git(["show", sha], cwd);
+    if (!show.ok || !show.out) return null;
+    const proc = Bun.spawn(["git", "patch-id", "--stable"], {
+      cwd,
+      stdin: new Blob([show.out]),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    const id = out.trim().split(/\s+/)[0] ?? "";
+    return id || null;
+  },
+
+  /**
+   * Cherry-pick a single commit onto HEAD.
+   * - `ok`: new commit created
+   * - `empty`: patch already in HEAD (skipped; no commit)
+   * - `error`: conflict or other failure (cherry-pick may still be in progress)
+   */
+  async cherryPick(
+    cwd: string,
+    sha: string,
+  ): Promise<{ status: "ok" | "empty" | "error"; message?: string }> {
+    const r = await git(["cherry-pick", sha], cwd);
+    if (r.ok) return { status: "ok" };
+    const blob = `${r.err}\n${r.out}`;
+    // Partial upstream apply / already-present patch → nothing left to commit.
+    if (/nothing to commit|now empty|cherry-pick is now empty/i.test(blob)) {
+      await git(["cherry-pick", "--skip"], cwd);
+      return { status: "empty", message: blob.split("\n").find(Boolean) };
+    }
+    return {
+      status: "error",
+      message: (r.err || r.out).split("\n").find(Boolean) ?? "cherry-pick failed",
+    };
   },
 
   /** Push `sha` (or current HEAD if omitted) to `remote:refs/heads/branch`. */
@@ -293,6 +356,20 @@ export const repo = {
     oldSha: string,
   ): Promise<string | null> {
     const r = await git(["update-ref", `refs/heads/${branch}`, newSha, oldSha], cwd);
+    return r.ok ? null : r.err || "update-ref failed";
+  },
+
+  /**
+   * Create or force-move a local branch to `sha` (no origin push). Used to track
+   * what chong has deployed to app-ci on the local `stage` ref.
+   * Refuses if the branch is checked out in a worktree (would detach mid-edit).
+   */
+  async setLocalBranch(cwd: string, branch: string, sha: string): Promise<string | null> {
+    const wt = await repo.worktreeFor(cwd, branch);
+    if (wt !== null) {
+      return `local ${branch} is checked out in ${wt} — refuse to move deploy-tracking ref`;
+    }
+    const r = await git(["update-ref", `refs/heads/${branch}`, sha], cwd);
     return r.ok ? null : r.err || "update-ref failed";
   },
 

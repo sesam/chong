@@ -30,8 +30,10 @@ const HELP = `chong — ship change-lists to the company git backend
               [--format-cmd <cmd>]      live TUI of commits queueing through the
                                         promotion pipeline; promote between branches.
                                         Default: agent Auto conflicts/i18n, auto-maintain
-                                        on start / every 20 commits / 2h
-                                        (--no-agent, --no-auto-maintain to disable)
+                                        on start / every 20 commits / 2h, and (FRONTEND)
+                                        local stage deploy after 60s quiet on origin/main
+                                        (--no-agent, --no-auto-maintain,
+                                         --no-auto-deploy-stage, --deploy-cooldown <s>)
   chong shadow-work [<path>] [--remote <r>] [--format-cmd <cmd>]
                                         manually run i18n + format checks on the
                                         latest origin/main commit via main-shadow

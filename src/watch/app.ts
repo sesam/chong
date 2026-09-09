@@ -14,10 +14,14 @@ import {
   runMaintenance,
   scanCommitForUntranslated,
   tryAgentI18nFix,
-  tryAutoPromoteStage,
 } from "./checks";
 import { type WatchConfig, computePipeline, enrichCI, gapHotkeys, promote } from "./model";
 import { type UIState, render } from "./render";
+import {
+  resolveDeployedStageSha,
+  resolveStageDeployCmd,
+  runLocalStageDeploy,
+} from "./stage-deploy";
 import type { Pipeline } from "./types";
 
 const ALT_ON = "\x1b[?1049h\x1b[?25l"; // alt screen + hide cursor
@@ -37,8 +41,39 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   let remoteCommitsSinceMaint = 0;
   let lastAutoMaintAt = 0;
   let startupMaintQueued = false;
-  let stagePromoteBlockedForTip: string | null = null;
+  let stageDeployBlockedForTip: string | null = null;
+  /** Cooldown: deploy this origin/main tip once `stageDeployAt` elapses. */
+  let pendingStageDeploySha: string | null = null;
+  let stageDeployAt: number | null = null; // epoch ms
+  let stageDeploying = false;
+  const stageDeployCmd = resolveStageDeployCmd(cfg.repoPath, cfg.stageDeployCmd);
+  const localStageDeploy = cfg.autoDeployStage && !!stageDeployCmd;
+  /** Local SHAs that must not be re-injected (partial cherry-pick / patch-id mismatch). */
+  const injectBlockedShas = new Set<string>();
+  /** Local tip when injectBlockedShas was last filled — clear blocks when tip moves. */
+  let injectBlockedForLocalTip: string | null = null;
   const agentEnabled = cfg.agent && !!findAgentBin();
+
+  function noteInjectBlocks(res: { blockShas?: string[]; localTip?: string }): void {
+    const tip = res.localTip ?? null;
+    if (tip && injectBlockedForLocalTip !== tip) {
+      injectBlockedShas.clear();
+      injectBlockedForLocalTip = tip;
+    }
+    if (!res.blockShas?.length) return;
+    for (const sha of res.blockShas) injectBlockedShas.add(sha);
+  }
+
+  function injectOpts(localTip: string | null | undefined): {
+    agentResolve: boolean;
+    skipShas: ReadonlySet<string>;
+  } {
+    if (localTip && injectBlockedForLocalTip && injectBlockedForLocalTip !== localTip) {
+      injectBlockedShas.clear();
+      injectBlockedForLocalTip = null;
+    }
+    return { agentResolve: agentEnabled, skipShas: injectBlockedShas };
+  }
 
   const ui: UIState = {
     selectedGap: 0,
@@ -51,6 +86,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     notices: [],
     modal: null,
     maintenance: null,
+    stageDeploy: null,
   };
 
   const write = (s: string) => process.stdout.write(s);
@@ -73,40 +109,149 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     ui.notices = [msg, ...ui.notices].slice(0, 5);
   }
 
-  /** Queue main→stage auto-promote after lint checks (CI parity). Serialized on checkQueue. */
-  function queueAutoPromoteStage(reason: string): void {
-    if (!cfg.autoPromoteStage || !pipeline) return;
-    const gap = pipeline.gaps[0];
-    if (!gap || gap.ahead === 0 || !gap.ff) return;
-    const mainTip = pipeline.lanes[0]?.tip;
-    if (!mainTip || stagePromoteBlockedForTip === mainTip) return;
+  function syncStageDeployUi(): void {
+    if (!localStageDeploy) {
+      ui.stageDeploy = null;
+      return;
+    }
+    if (stageDeploying) {
+      ui.stageDeploy = {
+        kind: "deploying",
+        shaShort: (pendingStageDeploySha ?? cfg.stageDeployedSha ?? "").slice(0, 7),
+        secsLeft: 0,
+      };
+      return;
+    }
+    if (pendingStageDeploySha && stageDeployAt) {
+      const secsLeft = Math.max(0, Math.ceil((stageDeployAt - Date.now()) / 1000));
+      ui.stageDeploy = {
+        kind: "countdown",
+        shaShort: pendingStageDeploySha.slice(0, 7),
+        secsLeft,
+      };
+      return;
+    }
+    if (cfg.stageDeployedSha) {
+      ui.stageDeploy = {
+        kind: "live",
+        shaShort: cfg.stageDeployedSha.slice(0, 7),
+        secsLeft: 0,
+      };
+      return;
+    }
+    ui.stageDeploy = { kind: "idle", shaShort: "", secsLeft: 0 };
+  }
 
-    const { repoPath, remote } = pipeline;
-    const { from, to } = gap;
-    const run = async (): Promise<void> => {
-      const res = await tryAutoPromoteStage(repoPath, remote, from, to, {
+  /**
+   * Arm / reset the stage-deploy cooldown whenever origin/main tip moves past
+   * what's already live on app-ci. Additional commits reset the 60s window.
+   */
+  function armStageDeployCooldown(mainTip: string, reason: string): void {
+    if (!localStageDeploy || !mainTip) return;
+    if (cfg.stageDeployedSha && cfg.stageDeployedSha === mainTip) {
+      pendingStageDeploySha = null;
+      stageDeployAt = null;
+      stageDeployBlockedForTip = null;
+      syncStageDeployUi();
+      return;
+    }
+    if (stageDeployBlockedForTip === mainTip) return;
+    if (stageDeploying) return;
+
+    const reset = pendingStageDeploySha !== mainTip;
+    pendingStageDeploySha = mainTip;
+    stageDeployAt = Date.now() + cfg.deployCooldownSec * 1000;
+    syncStageDeployUi();
+    if (reset) {
+      addNotice(
+        c.dim(
+          `stage deploy: cooldown ${cfg.deployCooldownSec}s for ${mainTip.slice(0, 7)} (${reason})`,
+        ),
+      );
+    }
+  }
+
+  async function executeStageDeploy(reason: string): Promise<void> {
+    if (!localStageDeploy || !pipeline || !stageDeployCmd || stageDeploying) return;
+    const tip = pendingStageDeploySha ?? pipeline.lanes[0]?.tip;
+    if (!tip) return;
+    if (cfg.stageDeployedSha === tip) {
+      pendingStageDeploySha = null;
+      stageDeployAt = null;
+      syncStageDeployUi();
+      return;
+    }
+
+    stageDeploying = true;
+    pendingStageDeploySha = tip;
+    stageDeployAt = null;
+    syncStageDeployUi();
+    ui.status = c.yellow(`deploying stage ${tip.slice(0, 7)} (${reason})…`);
+    paint();
+
+    const mainBranch = pipeline.lanes[0]?.name ?? "main";
+    const stageBranch = pipeline.lanes.find((l) => l.name === "stage")?.name ?? "stage";
+    const res = await runLocalStageDeploy(
+      pipeline.repoPath,
+      pipeline.remote,
+      mainBranch,
+      stageBranch,
+      stageDeployCmd,
+      {
         agent: agentEnabled,
-      });
-      if (res.action === "noop") return;
-      if (res.action === "promoted") {
-        stagePromoteBlockedForTip = null;
-        addNotice(c.green(`✓ ${res.message} (${reason})`));
-        paint();
-        void refresh();
-        return;
-      }
-      if (res.action === "blocked") {
-        stagePromoteBlockedForTip = mainTip;
-        addNotice(c.yellow(`⚠ stage: ${res.message}`));
-        paint();
-        return;
-      }
-      // fixed: eslint commit landed on main — retry promote on next queue pass
+        onProgress: (msg) => {
+          addNotice(c.dim(msg));
+          paint();
+        },
+      },
+    );
+
+    stageDeploying = false;
+    if (res.action === "deployed" && res.sha) {
+      cfg.stageDeployedSha = res.sha;
+      pendingStageDeploySha = null;
+      stageDeployAt = null;
+      stageDeployBlockedForTip = null;
       addNotice(c.green(`✓ ${res.message}`));
-      paint();
-      queueAutoPromoteStage("after eslint fix");
-    };
-    checkQueue = checkQueue.then(run, run);
+      ui.status = c.green(`✓ ${res.message}`);
+      void refresh();
+    } else if (res.action === "fixed") {
+      // eslint landed on main — wait for the new tip, then re-arm cooldown
+      pendingStageDeploySha = null;
+      stageDeployAt = null;
+      addNotice(c.green(`✓ ${res.message}`));
+      void refresh();
+    } else if (res.action === "noop") {
+      if (res.sha) cfg.stageDeployedSha = res.sha;
+      pendingStageDeploySha = null;
+      stageDeployAt = null;
+      addNotice(c.dim(res.message));
+    } else if (res.action === "blocked") {
+      stageDeployBlockedForTip = tip;
+      pendingStageDeploySha = null;
+      stageDeployAt = null;
+      addNotice(c.yellow(`⚠ stage: ${res.message}`));
+      ui.status = c.yellow(`⚠ stage: ${res.message}`);
+    } else {
+      stageDeployBlockedForTip = tip;
+      pendingStageDeploySha = null;
+      stageDeployAt = null;
+      addNotice(c.red(`✗ stage: ${res.message}`));
+      ui.status = c.red(`✗ stage: ${res.message}`);
+    }
+    syncStageDeployUi();
+    paint();
+  }
+
+  /** Tick the countdown; fire deploy when it hits zero. */
+  function tickStageDeployCooldown(): void {
+    if (!localStageDeploy || stageDeploying) return;
+    syncStageDeployUi();
+    if (pendingStageDeploySha && stageDeployAt && Date.now() >= stageDeployAt) {
+      const tip = pendingStageDeploySha;
+      stageDeployAt = null; // consume so we don't re-queue every second
+      checkQueue = checkQueue.then(() => executeStageDeploy(`cooldown ${tip.slice(0, 7)}`));
+    }
   }
 
   let maintaining = false;
@@ -128,10 +273,14 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       const { repoPath, remote, lanes } = pipeline;
       const headBranch = lanes[0].name;
       try {
-        const injected = await reconcileLocalMain(repoPath, remote, headBranch, {
-          agentResolve: agentEnabled,
-        });
+        const injected = await reconcileLocalMain(
+          repoPath,
+          remote,
+          headBranch,
+          injectOpts(pipeline.localCommits[0]?.sha),
+        );
         if (injected.action !== "noop") {
+          noteInjectBlocks(injected);
           addNotice(
             injected.pushed
               ? c.green(`✓ inject: ${injected.message}`)
@@ -164,7 +313,9 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
         }
         addNotice(c.green(`✓ auto-maintain done (${reason})`));
         paint();
-        queueAutoPromoteStage("after auto-maintain");
+        if (pipeline?.lanes[0]?.tip) {
+          armStageDeployCooldown(pipeline.lanes[0].tip, "after auto-maintain");
+        }
         void refresh();
       } catch (e) {
         addNotice(c.red(`✗ auto-maintain: ${e instanceof Error ? e.message : String(e)}`));
@@ -328,13 +479,14 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       }
     }
 
-    queueAutoPromoteStage("after post-commit checks");
+    if (pipeline?.lanes[0]?.tip) {
+      armStageDeployCooldown(pipeline.lanes[0].tip, "after post-commit checks");
+    }
   }
 
   /**
    * If local `main` (head lane) has commits origin lacks, land them via push or
-   * cherry-pick onto main-shadow. Auto-promote to stage is handled separately
-   * (eslint gate + FF) after post-commit checks / poll.
+   * cherry-pick onto main-shadow. Stage deploy cooldown is armed after inject.
    * Serialized on checkQueue so it never races i18n/format/maintain shadow work.
    * Fire-and-forget from refresh — does not block the poll loop.
    */
@@ -347,10 +499,15 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     const run = async (): Promise<void> => {
       try {
         if (!pipeline) return;
-        const res = await reconcileLocalMain(pipeline.repoPath, pipeline.remote, headBranch, {
-          agentResolve: agentEnabled,
-        });
+        const headTip = pipeline.localCommits[0]?.sha ?? null;
+        const res = await reconcileLocalMain(
+          pipeline.repoPath,
+          pipeline.remote,
+          headBranch,
+          injectOpts(headTip),
+        );
         if (res.action === "noop") return;
+        noteInjectBlocks(res);
         if (res.action === "conflict" || res.action === "error" || res.action === "skipped") {
           addNotice(c.yellow(`⚠ ${res.message}`));
         } else {
@@ -358,9 +515,9 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
         }
         paint();
         if (res.pushed) {
-          stagePromoteBlockedForTip = null;
+          stageDeployBlockedForTip = null;
           void refresh();
-          queueAutoPromoteStage("after local inject");
+          // cooldown armed from refresh once main tip is visible
         }
       } finally {
         reconciling = false;
@@ -425,8 +582,15 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       if (ui.selectedGap > p.gaps.length - 1) ui.selectedGap = Math.max(0, p.gaps.length - 1);
       ui.status = error ? c.yellow(`⚠ ${error}`) : ui.status;
       const mainTip = p.lanes[0]?.tip;
-      if (mainTip && stagePromoteBlockedForTip && stagePromoteBlockedForTip !== mainTip) {
-        stagePromoteBlockedForTip = null;
+      if (localStageDeploy) {
+        const stageLane = p.lanes.find((l) => l.name === "stage");
+        if (stageLane?.tip) cfg.stageDeployedSha = stageLane.tip;
+      }
+      if (mainTip && stageDeployBlockedForTip && stageDeployBlockedForTip !== mainTip) {
+        stageDeployBlockedForTip = null;
+      }
+      if (mainTip && localStageDeploy && baseline !== null) {
+        armStageDeployCooldown(mainTip, "pipeline poll");
       }
       paint();
       // CI is slower / best-effort — fill it in and repaint when ready
@@ -443,24 +607,43 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     // Queue a local→origin inject if needed (runs after any in-flight shadow work).
     if (pipeline) {
       maybeReconcileLocalMain();
-      if (cfg.autoPromoteStage && baseline !== null) {
-        queueAutoPromoteStage("pipeline poll");
-      }
     }
   }
 
   async function doPromote(idx: number): Promise<void> {
     if (!pipeline) return;
     const gap = pipeline.gaps[idx];
+    ui.confirm = null;
+
+    // Local stage deploy: [s] confirms an immediate deploy of origin/main (no git push).
+    if (localStageDeploy && gap.to === "stage") {
+      const mainTip = pipeline.lanes[0]?.tip;
+      if (!mainTip) {
+        ui.status = c.red("✗ no main tip to deploy");
+        paint();
+        return;
+      }
+      pendingStageDeploySha = mainTip;
+      stageDeployAt = null; // fire now
+      stageDeployBlockedForTip = null;
+      ui.busy = true;
+      paint();
+      await executeStageDeploy("manual [s]");
+      ui.busy = false;
+      paint();
+      return;
+    }
+
     // The confirm step for a diverged gap is itself the explicit merge consent,
     // so only then do we allow a (non-ff) merge commit.
     const allowMerge = !gap.ff;
     const how = gap.ff ? "fast-forward" : "merge";
-    ui.confirm = null;
     ui.busy = true;
     ui.status = c.yellow(`promoting ${gap.from} → ${gap.to} (${how})…`);
     paint();
-    const err = await promote(pipeline, idx, allowMerge);
+    const err = await promote(pipeline, idx, allowMerge, {
+      autoDeployStage: localStageDeploy,
+    });
     ui.status = err ? c.red(`✗ ${err}`) : c.green(`✓ promoted ${gap.from} → ${gap.to} (${how})`);
     ui.busy = false;
     await refresh();
@@ -482,10 +665,14 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       try {
         // Land any local head-lane commits onto origin first so maintain starts
         // from a tip that already includes them (and origin doesn't go stale).
-        const injected = await reconcileLocalMain(repoPath, remote, headBranch, {
-          agentResolve: agentEnabled,
-        });
+        const injected = await reconcileLocalMain(
+          repoPath,
+          remote,
+          headBranch,
+          injectOpts(pipeline.localCommits[0]?.sha),
+        );
         if (injected.action !== "noop") {
+          noteInjectBlocks(injected);
           ui.maintenance = {
             running: true,
             steps: [
@@ -543,7 +730,9 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     ui.busy = false;
     maintaining = false;
     paint();
-    queueAutoPromoteStage("after maintain");
+    if (pipeline?.lanes[0]?.tip) {
+      armStageDeployCooldown(pipeline.lanes[0].tip, "after maintain");
+    }
   }
 
   // ── teardown plumbing
@@ -554,8 +743,9 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   const clock = setInterval(() => {
     // Avoid repainting while the maintenance screen is open: it prints copy prompts
     // and constant redraws break terminal mouse selection.
+    tickStageDeployCooldown();
     if (!ui.maintenance) paint();
-  }, 1000); // keep "↻ Ns ago" fresh
+  }, 1000); // keep "↻ Ns ago" + stage countdown fresh
   const poll = setInterval(() => void refresh(), intervalMs);
   const autoMaintTimer = cfg.autoMaintain
     ? setInterval(() => {
@@ -605,7 +795,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     }
     const maxGap = pipeline.gaps.length - 1;
 
-    // dedicated promote hotkey per gap (e.g. "s" → main→stage, "p" → stage→prod)
+    // dedicated promote/deploy hotkey per gap (e.g. "s" → stage, "p" → prod)
     const gi = gapHotkeys(pipeline.gaps).indexOf(s);
     if (gi >= 0) {
       const gap = pipeline.gaps[gi];
@@ -613,7 +803,11 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       if (gap.ahead > 0) ui.confirm = gi;
       else {
         ui.confirm = null;
-        ui.status = c.dim(`${gap.from} → ${gap.to}: nothing to promote`);
+        ui.status = c.dim(
+          localStageDeploy && gap.to === "stage"
+            ? `${gap.from} → stage: already deployed`
+            : `${gap.from} → ${gap.to}: nothing to promote`,
+        );
       }
       paint();
       return;
@@ -673,6 +867,28 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
 
   write(ALT_ON);
   paint(true);
+
+  // Seed virtual stage tip from local/S3 marker before first pipeline paint.
+  if (localStageDeploy) {
+    cfg.stageDeployedSha = await resolveDeployedStageSha(cfg.repoPath);
+    if (cfg.stageDeployedSha) {
+      addNotice(
+        c.dim(`stage live @ ${cfg.stageDeployedSha.slice(0, 7)} (local stage branch / S3)`),
+      );
+    } else {
+      addNotice(
+        c.dim("stage deploy: no local stage tip yet — first cooldown will ship origin/main"),
+      );
+    }
+    syncStageDeployUi();
+  } else if (cfg.autoDeployStage && !stageDeployCmd) {
+    addNotice(
+      c.yellow(
+        "⚠ auto stage deploy on, but no scripts/deploy-frontend.sh — pass --stage-deploy-cmd",
+      ),
+    );
+  }
+
   await refresh();
   if (cfg.autoMaintain && pipeline && !startupMaintQueued) {
     startupMaintQueued = true;
@@ -680,15 +896,11 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   }
   if (cfg.agent && !findAgentBin()) {
     addNotice(
-      c.yellow(
-        "⚠ no agent on PATH — install mcpify-agent (mcp-ify/offline-agent) or cursor-agent",
-      ),
+      c.yellow("⚠ no agent on PATH — install mcpify-agent (mcp-ify/offline-agent) or cursor-agent"),
     );
     paint();
   } else if (agentEnabled) {
-    const label = Bun.which("mcpify-agent")
-      ? "mcpify-agent (offline)"
-      : "cursor-agent Auto";
+    const label = Bun.which("mcpify-agent") ? "mcpify-agent (offline)" : "cursor-agent Auto";
     addNotice(c.dim(`agent: ${label} enabled (conflicts + i18n)`));
     paint();
   }

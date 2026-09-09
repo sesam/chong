@@ -21,6 +21,12 @@ export type UIState = {
     steps: string[];
     prompts: { title: string; text: string }[];
   } | null;
+  /** Local stage (app-ci) deploy countdown / status when autoDeployStage is on. */
+  stageDeploy: {
+    kind: "idle" | "countdown" | "deploying" | "live";
+    shaShort: string;
+    secsLeft: number;
+  } | null;
 };
 
 const cols = () => process.stdout.columns || 100;
@@ -61,28 +67,48 @@ function laneRow(lane: Lane): string {
   return `${left}${trunc(subj, Math.max(10, budget))}  ${c.dim(meta)}`;
 }
 
-function gapRows(gap: Gap, key: string, selected: boolean, confirming: boolean): string[] {
-  const how = gap.ff ? "fast-forward" : "merge";
+function gapRows(
+  gap: Gap,
+  key: string,
+  selected: boolean,
+  confirming: boolean,
+  localStageDeploy: boolean,
+): string[] {
+  const stageLocal = localStageDeploy && gap.to === "stage";
+  const how = stageLocal ? "local deploy" : gap.ff ? "fast-forward" : "merge";
   const drift = gap.behind > 0 ? c.red(`  ⚠ ${gap.behind} behind (drift)`) : "";
 
   let body: string;
   if (confirming) {
-    body = gap.ff
-      ? c.bold(
-          c.yellow(
-            `▸ fast-forward ${gap.ahead} commit(s)  ${gap.from} → ${gap.to}?  [y] yes  [n] no`,
-          ),
-        )
-      : c.bold(
-          c.red(
-            `⚠ NOT a fast-forward — ${gap.to} has ${gap.behind} commit(s) ${gap.from} lacks.  Create a MERGE commit?  [y] merge  [n] cancel`,
-          ),
-        );
+    if (stageLocal) {
+      body = c.bold(
+        c.yellow(
+          `▸ deploy ${gap.ahead} commit(s) from ${gap.from} → app-ci (no git push)?  [y] yes  [n] no`,
+        ),
+      );
+    } else {
+      body = gap.ff
+        ? c.bold(
+            c.yellow(
+              `▸ fast-forward ${gap.ahead} commit(s)  ${gap.from} → ${gap.to}?  [y] yes  [n] no`,
+            ),
+          )
+        : c.bold(
+            c.red(
+              `⚠ NOT a fast-forward — ${gap.to} has ${gap.behind} commit(s) ${gap.from} lacks.  Create a MERGE commit?  [y] merge  [n] cancel`,
+            ),
+          );
+    }
   } else if (gap.ahead === 0) {
-    body = c.dim(`✓ ${gap.to} is up to date with ${gap.from}`) + drift;
+    body =
+      c.dim(
+        stageLocal
+          ? `✓ app-ci is up to date with ${gap.from}`
+          : `✓ ${gap.to} is up to date with ${gap.from}`,
+      ) + drift;
   } else {
-    const action = c.cyan(`[${key}] promote`);
-    body = `${c.bold(`${gap.ahead}`)} queued for ${gap.to}   ${action} → ${gap.to} ${c.dim(`(${how})`)}${drift}`;
+    const action = c.cyan(stageLocal ? `[${key}] deploy` : `[${key}] promote`);
+    body = `${c.bold(`${gap.ahead}`)} queued for ${stageLocal ? "app-ci" : gap.to}   ${action} → ${stageLocal ? "app-ci" : gap.to} ${c.dim(`(${how})`)}${drift}`;
   }
 
   const marker = selected ? c.cyan("▼") : c.dim("│");
@@ -190,7 +216,26 @@ export function render(p: Pipeline, ui: UIState): string {
   }
 
   // ── pipeline
-  out.push(rule("PIPELINE  main → stage → prod"));
+  const localStage = !!ui.stageDeploy;
+  out.push(
+    rule(localStage ? "PIPELINE  main → app-ci (local) → prod" : "PIPELINE  main → stage → prod"),
+  );
+  if (ui.stageDeploy) {
+    const sd = ui.stageDeploy;
+    let line: string;
+    if (sd.kind === "countdown") {
+      line = c.yellow(
+        `  ⏳ stage deploy in ${sd.secsLeft}s  (${sd.shaShort}) — quiet window; new main commits reset the timer`,
+      );
+    } else if (sd.kind === "deploying") {
+      line = c.yellow(`  🚀 deploying ${sd.shaShort} → app-ci…`);
+    } else if (sd.kind === "live") {
+      line = c.green(`  ● app-ci live @ ${sd.shaShort}`);
+    } else {
+      line = c.dim("  · stage deploy idle");
+    }
+    out.push(line);
+  }
   out.push("");
   const keys = gapHotkeys(p.gaps);
   for (let i = 0; i < p.lanes.length; i++) {
@@ -198,7 +243,7 @@ export function render(p: Pipeline, ui: UIState): string {
     if (i < p.gaps.length) {
       const selected = ui.selectedGap === i;
       const confirming = ui.confirm === i;
-      out.push(...gapRows(p.gaps[i], keys[i], selected, confirming));
+      out.push(...gapRows(p.gaps[i], keys[i], selected, confirming, localStage));
     }
   }
   out.push("");
@@ -224,7 +269,12 @@ export function render(p: Pipeline, ui: UIState): string {
   // ── status line + footer
   if (ui.status) out.push(`  ${ui.status}`);
   out.push(rule());
-  const promoteKeys = p.gaps.map((g, i) => `[${keys[i]}] →${g.to}`).join("  ");
+  const promoteKeys = p.gaps
+    .map((g, i) => {
+      const label = localStage && g.to === "stage" ? "app-ci" : g.to;
+      return `[${keys[i]}] →${label}`;
+    })
+    .join("  ");
   out.push(
     c.dim(
       `  ${promoteKeys}   [↑/↓] select  [space] details  [m] maintain  [f] fetch  [r] CI  [q] quit`,

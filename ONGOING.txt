@@ -116,6 +116,11 @@ NOT DONE / PLANNED / OPEN DECISIONS  (the actual next-steps list)
    then FF stage. Prod stays manual. `--no-auto-promote-stage` to disable.
    Wired in app.ts queueAutoPromoteStage + checks.ts tryAutoPromoteStage
    (revives promoteFastForward for the FF push).
+   **SUPERSEDED 2026-09-09:** no longer FF-pushes `stage`. Instead local
+   app-ci deploy after 60s quiet on origin/main (`stage-deploy.ts`), S3
+   `deployed-git-sha.txt` marker, Discord via notify-discord. Stage CI gate
+   skips when marker matches HEAD. Flags: `--no-auto-deploy-stage`,
+   `--deploy-cooldown`, `--stage-deploy-cmd`.
 
 10. [BUILT 2026-07-23] Agent-assisted cherry-pick + i18n via cursor-agent Auto
     (default on for `chong watch`; opt out with `--no-agent`).

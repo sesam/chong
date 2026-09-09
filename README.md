@@ -40,18 +40,22 @@ Options:
   --no-i18n-scan               disable scanning commits for hardcoded (untranslated) strings
   --no-agent                   disable mcpify-agent / cursor-agent for conflicts / i18n
   --no-auto-maintain           disable scheduled commit-producing maintain
-  --no-auto-promote-stage      disable auto-promote main→stage (eslint gate + FF)
+  --no-auto-deploy-stage       disable local app-ci deploy cooldown (FRONTEND)
+  --deploy-cooldown <seconds>  quiet window on origin/main before stage deploy (default 60)
+  --stage-deploy-cmd <cmd>     override deploy command (default: FORCE=1 DEPLOY_S3_TOOL=aws ./scripts/deploy-frontend.sh ci)
 ```
 
 ![chong watch TUI](chong-watch-tui-example.webp)
 
-**TUI keys:** `[s]` promote → stage · `[p]` promote → prod · `[↑/↓]` select · `[space]` queued commits · `[m]` maintenance · `[f]` fetch · `[r]` CI · `[q]` quit
+**TUI keys:** `[s]` deploy → app-ci (local) · `[p]` promote → prod · `[↑/↓]` select · `[space]` queued commits · `[m]` maintenance · `[f]` fetch · `[r]` CI · `[q]` quit
 
 **INCOMING** shows your local branch and remote origin/main commits merged by time. Commits that arrived after `chong watch` started are highlighted green.
 
 **Local → origin inject:** when local `main` has commits that aren't on `origin/main` (plain push if linear, or cherry-pick onto the clean `main-shadow` worktree when histories have diverged), watch lands them automatically. On cherry-pick conflict, the coding agent (`mcpify-agent` if on PATH, else `cursor-agent --model auto`) is asked for a `VERDICT: SAFE|UNSAFE`; only SAFE runs get an auto-resolve attempt. Failures stay a yellow warning and leave origin untouched.
 
-**Auto-promote → stage:** when `main` has commits queued for `stage` and the promote is a clean fast-forward, watch lints the changed JS/TS/Vue files the same way CI does (`pnpm exec eslint` on the `stage..main` diff), runs `eslint --fix` when possible, and asks the coding agent for mechanical fixes (e.g. `no-undef` / missing imports). When lint is clean it fast-forwards `stage` to `main`. Prod promote stays manual (`[p]`). Disable with `--no-auto-promote-stage`.
+**Partial cherry-pick guard:** if a diverged cherry-pick applies only *some* hunks (others already on origin) the resulting commit gets a new `git patch-id`, so `git cherry` still lists the local SHA as unique. Watch would otherwise re-inject that SHA on every poll and flood `origin/main` with duplicate hunks. After each cherry-pick, watch requires the new commit's patch-id to match the source; on mismatch (or empty skip) it aborts without pushing and blocks those SHAs until the local tip moves.
+
+**Auto-deploy → app-ci (stage):** when `scripts/deploy-frontend.sh` exists (LynxCraft FRONTEND), watch no longer pushes `origin/stage`. Instead, after origin/main is quiet for **60s** (resets on each new commit), it builds+uploads to the CI S3/CloudFront bucket from `main-shadow`, advances the **local** `stage` branch to that tip (tracking only), writes `deployed-git-sha.txt`, and pings Discord. Manual `[s]` deploys immediately. Prod promote (`[p]`) still pushes git (local stage tip → `prod`) so the full prod CI suite runs. Disable with `--no-auto-deploy-stage`; tune with `--deploy-cooldown <s>` / `--stage-deploy-cmd <cmd>`.
 
 **Offline agents:** install mcp-ify’s `offline-agent` (`bash offline-agent/install.sh`) so `mcpify-agent` is on PATH — then watch runs fully locally via Ollama + mcp-ify with no Cursor cloud dependency.
 
@@ -67,7 +71,7 @@ Dep bumps respect **`minimumReleaseAge`** from the watched repo's `pnpm-workspac
 - Regenerates the lockfile when a commit changed `package.json` but not `pnpm-lock.yaml` (otherwise CI's `--frozen-lockfile` install fails with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`); commits as `FIX: pnpm lockfile` and pushes
 - Runs the format command on the changed files, commits as `FIX: code formatting` and pushes
 - Leftover non-.po files after a successful i18n run: coding agent may fix when SAFE; otherwise pauses i18n auto-fix for 2h
-- **Auto-promote → stage:** after post-commit fixes, lints the `stage..main` diff (CI parity), applies `FIX: eslint` / agent fixes when needed, then fast-forwards `stage` to `main` when clean (prod stays manual)
+- **Auto-deploy → app-ci:** after post-commit fixes, arms a 60s quiet-window on origin/main tip, then runs the local stage deploy (no `stage` branch push). Prod stays a manual git promote (`[p]`).
 
 **Maintenance** (`[m]`) runs a manual pass in the `main-shadow` worktree:
 0. Injects any local `main` commits onto `origin/main` first (same as the watch auto-inject), so maintain starts from a tip that already includes them

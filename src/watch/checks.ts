@@ -326,6 +326,19 @@ export const I18N_PAUSE_MS = 2 * 60 * 60 * 1000; // 2h pause after uncertain i18
 export const AUTO_MAINT_EVERY_COMMITS = 20;
 export const AUTO_MAINT_EVERY_MS = 2 * 60 * 60 * 1000; // 2h
 
+/**
+ * True when a cherry-pick onto a diverged tip preserved the source patch-id.
+ * Partial applies (some hunks already upstream) change the patch-id and must
+ * not be pushed — otherwise `git cherry` still lists the local SHA as unique
+ * and the next poll re-injects forever.
+ */
+export function cherryPickPatchPreserved(
+  sourceId: string | null,
+  headId: string | null,
+): boolean {
+  return !!sourceId && !!headId && sourceId === headId;
+}
+
 /** True when a cherry-pick is still in progress in `cwd`. */
 async function cherryPickInProgress(cwd: string): Promise<boolean> {
   const r = await git(["rev-parse", "--git-path", "CHERRY_PICK_HEAD"], cwd);
@@ -401,11 +414,21 @@ export type ReconcileResult = {
   pushed: boolean;
   /** Short human-readable summary for the TUI notice line. */
   message: string;
+  /** Local branch tip SHA when reconcile ran (for inject blocklist scoping). */
+  localTip?: string;
+  /**
+   * Local SHAs that must not be auto-injected again until the local tip moves.
+   * Set when a cherry-pick would re-apply a *different* patch (partial apply) —
+   * re-trying those forever is what flooded origin/main with duplicate HTML hunks.
+   */
+  blockShas?: string[];
 };
 
 export type ReconcileOpts = {
   /** Try cursor-agent (Auto) on cherry-pick conflicts (default true when bin present). */
   agentResolve?: boolean;
+  /** Local SHAs previously blocked for this local tip (patch-id mismatch / empty). */
+  skipShas?: ReadonlySet<string>;
 };
 
 /**
@@ -416,6 +439,7 @@ export type ReconcileOpts = {
  *  - diverged → reset main-shadow to origin, cherry-pick local-only commits
  *    (skipping patches `git cherry` already sees on origin), push if clean
  *  - conflict → optional agent resolve; else abort, leave origin untouched
+ *  - partial cherry-pick (patch-id changes) → abort + block those SHAs; never push
  *
  * Does not promote to stage/prod — that stays a manual `[s]`/`[p]` action.
  */
@@ -426,15 +450,17 @@ export async function reconcileLocalMain(
   opts: ReconcileOpts = {},
 ): Promise<ReconcileResult> {
   const agentResolve = opts.agentResolve !== false && !!findAgentBin();
-  const noop = (message: string, count = 0): ReconcileResult => ({
-    action: "noop",
-    count,
-    pushed: false,
-    message,
-  });
+  const skipShas = opts.skipShas;
 
   const localSha = await repo.localSha(repoPath, branch);
-  if (!localSha) return noop(`no local ${branch}`);
+  if (!localSha) return { action: "noop", count: 0, pushed: false, message: `no local ${branch}` };
+
+  const tip = (r: Omit<ReconcileResult, "localTip">): ReconcileResult => ({
+    ...r,
+    localTip: localSha,
+  });
+  const noop = (message: string, count = 0): ReconcileResult =>
+    tip({ action: "noop", count, pushed: false, message });
 
   const originRef = `${remote}/${branch}`;
   const originSha = await repo.tip(repoPath, remote, branch);
@@ -442,28 +468,31 @@ export async function reconcileLocalMain(
   if (localSha === originSha) return noop("in sync");
 
   // Only commits whose patches aren't already on origin (handles prior cherry-picks).
-  const unique = await repo.uniqueCommits(repoPath, originRef, branch);
+  let unique = await repo.uniqueCommits(repoPath, originRef, branch);
+  if (skipShas?.size) {
+    unique = unique.filter((sha) => !skipShas.has(sha));
+  }
   if (unique.length === 0) return noop("no unique local commits");
 
   if (unique.length > MAX_INJECT) {
-    return {
+    return tip({
       action: "skipped",
       count: unique.length,
       pushed: false,
       message: `${unique.length} local ${branch} commit(s) exceed auto-inject limit (${MAX_INJECT})`,
-    };
+    });
   }
 
   // Skip merge commits — cherry-pick needs -m and is rarely what we want here.
   const toInject: string[] = [];
   for (const sha of unique) {
     if (await repo.isMergeCommit(repoPath, sha)) {
-      return {
+      return tip({
         action: "skipped",
         count: unique.length,
         pushed: false,
         message: `local ${branch} has merge commit ${sha.slice(0, 7)} — inject manually`,
-      };
+      });
     }
     toInject.push(sha);
   }
@@ -484,45 +513,103 @@ export async function reconcileLocalMain(
     // Diverged: replay local-only commits onto a clean shadow at origin tip.
     const shadow = await ensureShadow(repoPath, originRef);
     if (shadow.error) {
-      return {
+      return tip({
         action: "error",
         count: toInject.length,
         pushed: false,
         message: `shadow: ${shadow.error}`,
-      };
+      });
     }
     if (!(await repo.isClean(shadow.shadowPath))) {
-      return {
+      return tip({
         action: "error",
         count: toInject.length,
         pushed: false,
         message: "main-shadow is dirty after reset — refusing to inject",
-      };
+      });
     }
 
-    for (const sha of toInject) {
-      const err = await repo.cherryPick(shadow.shadowPath, sha);
-      if (!err) continue;
+    const landed: string[] = [];
+    const blockShas: string[] = [];
 
-      // Conflict: optionally ask cursor-agent (Auto) to finish if SAFE.
-      if (agentResolve) {
-        const resolved = await resolveCherryPickWithAgent(shadow.shadowPath, sha);
-        if (resolved.ok) {
-          agentNote = ` · ${resolved.message}`;
-          continue;
-        }
-        agentNote = ` · ${resolved.message}`;
+    for (const sha of toInject) {
+      const sourceId = await repo.patchId(repoPath, sha);
+      const pick = await repo.cherryPick(shadow.shadowPath, sha);
+
+      if (pick.status === "empty") {
+        // Patch already present in a different shape — do not keep retrying.
+        blockShas.push(sha);
+        continue;
       }
 
-      await repo.abortInProgress(shadow.shadowPath);
-      await git(["reset", "--hard", originRef], shadow.shadowPath);
-      await git(["clean", "-fd"], shadow.shadowPath);
-      return {
-        action: "conflict",
+      if (pick.status === "error") {
+        // Conflict: optionally ask cursor-agent (Auto) to finish if SAFE.
+        if (agentResolve) {
+          const resolved = await resolveCherryPickWithAgent(shadow.shadowPath, sha);
+          if (resolved.ok) {
+            // Agent may have composed a different patch — refuse unless patch-id matches.
+            const headId = await repo.patchId(shadow.shadowPath, "HEAD");
+            if (!cherryPickPatchPreserved(sourceId, headId)) {
+              await repo.abortInProgress(shadow.shadowPath);
+              await git(["reset", "--hard", originRef], shadow.shadowPath);
+              await git(["clean", "-fd"], shadow.shadowPath);
+              return tip({
+                action: "skipped",
+                count: toInject.length,
+                pushed: false,
+                message: `cherry-pick ${sha.slice(0, 7)} resolved but patch-id changed — refusing to push (would re-inject forever)`,
+                blockShas: [...toInject],
+              });
+            }
+            agentNote = ` · ${resolved.message}`;
+            landed.push(sha);
+            continue;
+          }
+          agentNote = ` · ${resolved.message}`;
+        }
+
+        await repo.abortInProgress(shadow.shadowPath);
+        await git(["reset", "--hard", originRef], shadow.shadowPath);
+        await git(["clean", "-fd"], shadow.shadowPath);
+        return tip({
+          action: "conflict",
+          count: toInject.length,
+          pushed: false,
+          message: `cherry-pick ${sha.slice(0, 7)} conflicted — left origin/${branch} untouched${agentNote}`,
+        });
+      }
+
+      // Clean apply: patch-id must match the source. A *partial* apply (some hunks
+      // already on origin, remaining hunks still apply — e.g. re-inserting the same
+      // HTML block) produces a new patch-id, so `git cherry` still lists the local
+      // SHA as unique and the next poll would inject again → commit flood.
+      const headId = await repo.patchId(shadow.shadowPath, "HEAD");
+      if (!cherryPickPatchPreserved(sourceId, headId)) {
+        await repo.abortInProgress(shadow.shadowPath);
+        await git(["reset", "--hard", originRef], shadow.shadowPath);
+        await git(["clean", "-fd"], shadow.shadowPath);
+        return tip({
+          action: "skipped",
+          count: toInject.length,
+          pushed: false,
+          message: `cherry-pick ${sha.slice(0, 7)} changed patch-id (partial apply) — refusing to push`,
+          blockShas: [...toInject],
+        });
+      }
+      landed.push(sha);
+    }
+
+    if (landed.length === 0) {
+      return tip({
+        action: "skipped",
         count: toInject.length,
         pushed: false,
-        message: `cherry-pick ${sha.slice(0, 7)} conflicted — left origin/${branch} untouched${agentNote}`,
-      };
+        message:
+          blockShas.length > 0
+            ? `${blockShas.length} local ${branch} commit(s) already on origin in another shape — inject blocked`
+            : `nothing to inject onto ${originRef}`,
+        blockShas: blockShas.length > 0 ? blockShas : undefined,
+      });
     }
 
     const head = await git(["rev-parse", "HEAD"], shadow.shadowPath);
@@ -532,12 +619,12 @@ export async function reconcileLocalMain(
   }
 
   if (pushErr) {
-    return {
+    return tip({
       action: "error",
       count: toInject.length,
       pushed: false,
       message: `push ${branch}: ${pushErr}`,
-    };
+    });
   }
 
   // Point the remote-tracking ref at what we just pushed so the next poll's
@@ -547,13 +634,30 @@ export async function reconcileLocalMain(
   }
   await git(["fetch", "--quiet", remote, branch], repoPath);
 
+  // Backstop: if any injected SHA is still unique after a successful push, block
+  // them — otherwise the next refresh() → reconcile loop floods origin.
+  if (action === "cherry-picked") {
+    const stillUnique = (await repo.uniqueCommits(repoPath, originRef, branch)).filter((sha) =>
+      toInject.includes(sha),
+    );
+    if (stillUnique.length > 0) {
+      return tip({
+        action: "skipped",
+        count: toInject.length,
+        pushed: true,
+        message: `pushed but ${stillUnique.length} commit(s) still unique by patch-id — blocking re-inject`,
+        blockShas: stillUnique,
+      });
+    }
+  }
+
   const how = action === "pushed" ? "pushed" : "cherry-picked onto origin & pushed";
-  return {
+  return tip({
     action,
     count: toInject.length,
     pushed: true,
     message: `${toInject.length} local ${branch} commit(s) ${how}${agentNote}`,
-  };
+  });
 }
 
 /**

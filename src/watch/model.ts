@@ -39,8 +39,21 @@ export type WatchConfig = {
   agent: boolean;
   /** Auto-run commit-producing maintain on start / every N commits / every 2h (default true). */
   autoMaintain: boolean;
-  /** Auto-promote main→stage after eslint passes (default true). Prod stays manual. */
-  autoPromoteStage: boolean;
+  /**
+   * Local stage deploy with cooldown (default true when scripts/deploy-frontend.sh exists).
+   * Does NOT git-push the stage branch — builds+uploads to app-ci from origin/main.
+   */
+  autoDeployStage: boolean;
+  /** Quiet seconds on origin/main before auto stage deploy (default 60). */
+  deployCooldownSec: number;
+  /** Shell command for stage deploy; empty = auto-detect FRONTEND script. */
+  stageDeployCmd: string;
+  /**
+   * Tip shown for the stage lane when autoDeployStage is on — normally the local
+   * `stage` branch (advanced after each successful app-ci deploy, never pushed).
+   * Kept in sync by resolveDeployedStageSha / markLocalStageDeployed.
+   */
+  stageDeployedSha: string | null;
 };
 
 /** Outcome of an auto-fast-forward attempt on one local branch ref. */
@@ -72,6 +85,9 @@ export async function syncLocalBranches(cfg: WatchConfig): Promise<LocalSync[]> 
   const results: LocalSync[] = [];
 
   for (const branch of branches.slice(1)) {
+    // Local `stage` tracks what chong deployed to app-ci — do not rewind it to origin/stage.
+    if (cfg.autoDeployStage && branch === "stage") continue;
+
     const localSha = await repo.localSha(repoPath, branch);
     if (!localSha) continue; // not tracked locally — nothing to fast-forward
 
@@ -133,22 +149,44 @@ export async function computePipeline(
 
   const lanes: Lane[] = [];
   for (const name of present) {
-    const tip = await repo.tip(repoPath, remote, name);
+    let tip = await repo.tip(repoPath, remote, name);
+    // Local stage deploy: lane tip = local `stage` (deploy tracker), not origin/stage.
+    if (cfg.autoDeployStage && name === "stage") {
+      const localTip = (await repo.localSha(repoPath, "stage")) ?? cfg.stageDeployedSha ?? null;
+      if (localTip) tip = localTip;
+    }
+    if (!tip) continue;
     const commit = await repo.commitMeta(repoPath, tip);
     lanes.push({ name, tip, short: tip.slice(0, 7), commit, ci: "unknown" });
   }
 
   const gaps = [];
-  for (let i = 0; i < present.length - 1; i++) {
-    const from = present[i];
-    const to = present[i + 1];
-    const { ahead, behind } = await repo.aheadBehind(repoPath, remote, from, to);
-    const ff = await repo.isFastForward(repoPath, remote, from, to);
-    const queued = ahead > 0 ? await repo.logBetween(repoPath, remote, from, to, QUEUE_LIMIT) : [];
+  for (let i = 0; i < lanes.length - 1; i++) {
+    const fromLane = lanes[i];
+    const toLane = lanes[i + 1];
+    const from = fromLane.name;
+    const to = toLane.name;
+
+    let ahead: number;
+    let behind: number;
+    let ff: boolean;
+    let queued: Awaited<ReturnType<typeof repo.logBetween>>;
+
+    if (cfg.autoDeployStage && (from === "stage" || to === "stage")) {
+      // Gaps involving the virtual stage tip use raw SHAs.
+      ({ ahead, behind } = await repo.aheadBehindShas(repoPath, fromLane.tip, toLane.tip));
+      ff = await repo.isAncestor(repoPath, toLane.tip, fromLane.tip);
+      queued =
+        ahead > 0 ? await repo.logBetweenShas(repoPath, fromLane.tip, toLane.tip, QUEUE_LIMIT) : [];
+    } else {
+      ({ ahead, behind } = await repo.aheadBehind(repoPath, remote, from, to));
+      ff = await repo.isFastForward(repoPath, remote, from, to);
+      queued = ahead > 0 ? await repo.logBetween(repoPath, remote, from, to, QUEUE_LIMIT) : [];
+    }
     gaps.push({ from, to, ahead, behind, ff, queued });
   }
 
-  const incoming = await repo.recentLog(repoPath, remote, present[0], INCOMING_LIMIT);
+  const incoming = await repo.recentLog(repoPath, remote, lanes[0].name, INCOMING_LIMIT);
   const localBranch = await repo.currentBranch(repoPath);
   const localCommits = await repo.localRecentLog(repoPath, localBranch, INCOMING_LIMIT);
 
@@ -186,15 +224,43 @@ export async function enrichCI(pipeline: Pipeline): Promise<void> {
  * diverged a fast-forward is impossible; we only create a merge commit if the
  * caller has explicitly opted in via `allowMerge` (the UI requires a separate,
  * clearly-worded confirmation for that). Returns null on success, else a message.
+ *
+ * When `autoDeployStage` is on, promoting *to stage* is not done here (the watch
+ * loop runs a local deploy instead). Promoting *to prod* pushes the stage lane's
+ * tip SHA (last successful local deploy) onto `prod`, not origin/stage.
  */
 export async function promote(
   pipeline: Pipeline,
   gapIndex: number,
   allowMerge = false,
+  opts: { autoDeployStage?: boolean } = {},
 ): Promise<string | null> {
   const gap = pipeline.gaps[gapIndex];
   if (!gap) return "no such promotion";
   if (gap.ahead === 0) return `${gap.from} → ${gap.to}: nothing to promote`;
+
+  if (opts.autoDeployStage && gap.to === "stage") {
+    return "stage deploy is local — use confirm to run deploy (no git push)";
+  }
+
+  if (opts.autoDeployStage && gap.to === "prod") {
+    // Push the virtual stage tip (last deployed) to prod — same SHA pushFastForward uses.
+    const stageLane = pipeline.lanes.find((l) => l.name === "stage");
+    const sha = stageLane?.tip;
+    if (!sha) return "no stage tip to promote to prod";
+    if (!gap.ff && !allowMerge) {
+      return `${gap.from} → ${gap.to} is not a fast-forward (${gap.to} has ${gap.behind} commit(s) ${gap.from} lacks) — reconcile first, or confirm a merge`;
+    }
+    if (!gap.ff && allowMerge) {
+      // Merge API needs branch names; fall back to pushing main tip if stage tip === main.
+      const mainLane = pipeline.lanes.find((l) => l.name === "main");
+      if (pipeline.ghRepo && mainLane) {
+        return mergeBranches(pipeline.ghRepo, gap.to, "main", pipeline.repoPath);
+      }
+      return "diverged prod promote needs a GitHub remote";
+    }
+    return repo.pushSha(pipeline.repoPath, pipeline.remote, "prod", sha);
+  }
 
   if (gap.ff) {
     return repo.pushFastForward(pipeline.repoPath, pipeline.remote, gap.from, gap.to);

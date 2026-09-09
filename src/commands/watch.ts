@@ -2,6 +2,7 @@ import { c, parseArgs } from "../util";
 import { runWatch } from "../watch/app";
 import type { WatchConfig } from "../watch/model";
 import { repo } from "../watch/repo";
+import { DEFAULT_DEPLOY_COOLDOWN_SEC, hasFrontendStageDeployScript } from "../watch/stage-deploy";
 
 const DEFAULT_BRANCHES = ["main", "stage", "prod"];
 const DEFAULT_INTERVAL_S = 15;
@@ -36,7 +37,23 @@ export async function cmdWatch(argv: string[]): Promise<void> {
   const i18nScan = flags["no-i18n-scan"] !== true;
   const agent = flags["no-agent"] !== true;
   const autoMaintain = flags["no-auto-maintain"] !== true;
-  const autoPromoteStage = flags["no-auto-promote-stage"] !== true;
+
+  // Local stage deploy (default on for FRONTEND). Legacy --no-auto-promote-stage still disables it.
+  const autoDeployStage =
+    flags["no-auto-deploy-stage"] !== true && flags["no-auto-promote-stage"] !== true;
+  const cooldownRaw =
+    typeof flags["deploy-cooldown"] === "string" ? Number(flags["deploy-cooldown"]) : Number.NaN;
+  const deployCooldownSec =
+    Number.isFinite(cooldownRaw) && cooldownRaw >= 0
+      ? Math.floor(cooldownRaw)
+      : DEFAULT_DEPLOY_COOLDOWN_SEC;
+  const stageDeployCmd =
+    typeof flags["stage-deploy-cmd"] === "string" ? flags["stage-deploy-cmd"] : "";
+
+  // Soft default: only auto-arm when the FE deploy script exists unless the user
+  // forced a command. Avoid surprising non-FRONTEND repos.
+  const effectiveAutoDeploy =
+    autoDeployStage && (stageDeployCmd.trim() !== "" || hasFrontendStageDeployScript(repoPath));
 
   const cfg: WatchConfig = {
     repoPath,
@@ -48,7 +65,10 @@ export async function cmdWatch(argv: string[]): Promise<void> {
     i18nScan,
     agent,
     autoMaintain,
-    autoPromoteStage,
+    autoDeployStage: effectiveAutoDeploy,
+    deployCooldownSec,
+    stageDeployCmd,
+    stageDeployedSha: null,
   };
   try {
     await runWatch(cfg, intervalMs);
