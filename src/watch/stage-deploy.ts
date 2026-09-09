@@ -115,6 +115,42 @@ export async function notifyDiscordStage(message: string): Promise<boolean> {
   return false;
 }
 
+/** Cap so the Discord body stays under the 2000-char webhook limit. */
+const DISCORD_COMMIT_LIST_LIMIT = 40;
+
+/**
+ * Build the stage-success Discord body in the same multi-line shape as FE CI:
+ * header + fenced list of `- <short> <subject> (<author>)` lines.
+ */
+export async function formatStageDeployDiscordMessage(
+  repoPath: string,
+  tip: string,
+  previousSha: string | null,
+): Promise<string> {
+  const header =
+    "✅ FE stage (chong local): Deployment completed successfully! Commits in this push:";
+
+  let commits =
+    previousSha && previousSha.toLowerCase() !== tip.toLowerCase()
+      ? await repo.logBetweenShas(repoPath, tip, previousSha, DISCORD_COMMIT_LIST_LIMIT + 1)
+      : [];
+
+  if (commits.length === 0) {
+    const tipMeta = await repo.commitMeta(repoPath, tip);
+    commits = tipMeta ? [tipMeta] : [];
+  }
+
+  const truncated = commits.length > DISCORD_COMMIT_LIST_LIMIT;
+  const shown = truncated ? commits.slice(0, DISCORD_COMMIT_LIST_LIMIT) : commits;
+  const lines =
+    shown.length > 0
+      ? shown.map((c) => `- ${c.short} ${c.subject} (${c.author || "unknown"})`)
+      : ["- no commits in this push"];
+  if (truncated) lines.push(`- … and more (showing ${DISCORD_COMMIT_LIST_LIMIT})`);
+
+  return `${header}\n\`\`\`\n${lines.join("\n")}\n\`\`\``;
+}
+
 /** Upload the SHA marker so GitHub stage CI can skip when already live. */
 export async function writeS3DeployedSha(sha: string): Promise<string | null> {
   const uri = `s3://${STAGE_CI_BUCKET}/${DEPLOYED_SHA_KEY}`;
@@ -417,9 +453,8 @@ export async function runLocalStageDeploy(
     note(`deploy stage: live, but S3 marker failed (${s3Err.slice(0, 120)})`);
   }
 
-  const subject = (await repo.commitMeta(repoPath, tip))?.subject ?? "";
   const discordOk = await notifyDiscordStage(
-    `✅ FE stage (chong local): deployed ${tip.slice(0, 7)} ${subject}\nhttps://app-ci.lynx-craft.com`,
+    await formatStageDeployDiscordMessage(repoPath, tip, already),
   );
   if (!discordOk) note("deploy stage: Discord notify failed");
 
