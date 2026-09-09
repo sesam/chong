@@ -38,6 +38,7 @@ Options:
   --test-cmd <cmd>             unit-test command for maintenance (default: pnpm test)
   --i18n-cmd <cmd>             i18n command for maintenance (default: pnpm i18n)
   --no-i18n-scan               disable scanning commits for hardcoded (untranslated) strings
+  --no-import-scan             disable the unresolved-import gate before stage deploy
   --no-agent                   disable mcpify-agent / cursor-agent for conflicts / i18n
   --no-auto-maintain           disable scheduled commit-producing maintain
   --no-auto-deploy-stage       disable local app-ci deploy cooldown (FRONTEND)
@@ -54,6 +55,8 @@ Options:
 **Local → origin inject:** when local `main` has commits that aren't on `origin/main` (plain push if linear, or cherry-pick onto the clean `main-shadow` worktree when histories have diverged), watch lands them automatically. On cherry-pick conflict, the coding agent (`mcpify-agent` if on PATH, else `cursor-agent --model auto`) is asked for a `VERDICT: SAFE|UNSAFE`; only SAFE runs get an auto-resolve attempt. Failures stay a yellow warning and leave origin untouched.
 
 **Partial cherry-pick guard:** if a diverged cherry-pick applies only *some* hunks (others already on origin) the resulting commit gets a new `git patch-id`, so `git cherry` still lists the local SHA as unique. Watch would otherwise re-inject that SHA on every poll and flood `origin/main` with duplicate hunks. After each cherry-pick, watch requires the new commit's patch-id to match the source; on mismatch (or empty skip) it aborts without pushing and blocks those SHAs until the local tip moves.
+
+**Unresolved-import gate (before every stage deploy):** the shadow worktree is scanned for import specifiers that resolve to no file, and any finding blocks the deploy. This exists because a **lazy** `import()` is only resolved when its chunk is first requested — so `vite build` succeeds and the route renders a blank page on navigation. Neither the build nor the unit tests catch it. Scanning is repo-wide rather than diff-scoped on purpose: the commit that breaks things deletes file A, while the dangling import sits in file B, which the diff never mentions. ~0.5s on a 1,700-file repo. Aliases come from the watched repo's `tsconfig.json`/`jsconfig.json` `paths` (falling back to `@/* -> src/*`); comments are stripped first, so `import('@/…')` written as prose in a doc comment is not a finding. Bare package names, template-hole specifiers and URLs are left alone. No auto-fix and no agent hand-off — the repair is either restoring the deleted file or deleting its importer, and guessing wrong ships the wrong one. Disable with `--no-import-scan`.
 
 **Auto-deploy → app-ci (stage):** when `scripts/deploy-frontend.sh` exists (LynxCraft FRONTEND), watch no longer pushes `origin/stage`. Instead, after origin/main is quiet for **60s** (resets on each new commit), it builds+uploads to the CI S3/CloudFront bucket from `main-shadow`, advances the **local** `stage` branch to that tip (tracking only), writes `deployed-git-sha.txt`, and pings Discord. Manual `[s]` deploys immediately. Prod promote (`[p]`) still pushes git (local stage tip → `prod`) so the full prod CI suite runs. Disable with `--no-auto-deploy-stage`; tune with `--deploy-cooldown <s>` / `--stage-deploy-cmd <cmd>`.
 

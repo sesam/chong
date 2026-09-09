@@ -36,6 +36,7 @@ export async function cmdWatch(argv: string[]): Promise<void> {
   const i18nCmd = typeof flags["i18n-cmd"] === "string" ? flags["i18n-cmd"] : "pnpm i18n";
   const i18nScan = flags["no-i18n-scan"] !== true;
   const agent = flags["no-agent"] !== true;
+  const importScan = flags["no-import-scan"] !== true;
   const autoMaintain = flags["no-auto-maintain"] !== true;
 
   // Local stage deploy (default on for FRONTEND). Legacy --no-auto-promote-stage still disables it.
@@ -68,6 +69,7 @@ export async function cmdWatch(argv: string[]): Promise<void> {
     autoDeployStage: effectiveAutoDeploy,
     deployCooldownSec,
     stageDeployCmd,
+    importScan,
     stageDeployedSha: null,
   };
   try {

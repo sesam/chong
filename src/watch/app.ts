@@ -199,6 +199,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       stageDeployCmd,
       {
         agent: agentEnabled,
+        importScan: cfg.importScan,
         onProgress: (msg) => {
           addNotice(c.dim(msg));
           paint();

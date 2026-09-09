@@ -14,6 +14,7 @@ import path from "node:path";
 import { ensureShadow, runEslintFix, tryAgentLintFix } from "./checks";
 import { formatLintSummary, isAgentableLintFailure, lintableChangedFiles, runEslint } from "./lint";
 import { repo } from "./repo";
+import { formatUnresolvedSummary, scanUnresolvedImports } from "./unresolved-imports";
 
 export const STAGE_CI_BUCKET = "lynx-ci-edge-20251117-4-static-files";
 export const DEPLOYED_SHA_KEY = "deployed-git-sha.txt";
@@ -293,6 +294,45 @@ async function eslintGate(
 }
 
 /**
+ * Block the deploy when any import specifier resolves to no file on disk.
+ *
+ * This catches what neither the build nor the tests can: a **lazy** `import()` is resolved
+ * only when its chunk is first requested, so `vite build` succeeds and ships a route that
+ * renders a blank page on navigation. A deletion or rename sweep is the usual cause — the
+ * dangling import lives in a file the commit never touched.
+ *
+ * Unlike `eslintGate` this does NOT diff against the last deployed SHA. Scoping it to
+ * changed files would skip the importing file, which is exactly the one that matters. The
+ * whole tree costs ~0.5s on a 1,700-file repo, so there is nothing to save.
+ *
+ * No auto-fix and no agent hand-off: the right repair is either restoring the deleted file
+ * or removing its importer, and guessing between those is how a deploy ships the wrong one.
+ */
+async function unresolvedImportGate(
+  shadowPath: string,
+  tip: string,
+): Promise<StageDeployResult | null> {
+  let scan: ReturnType<typeof scanUnresolvedImports>;
+  try {
+    scan = scanUnresolvedImports(shadowPath);
+  } catch (err) {
+    // A gate that cannot run must not silently pass, but it also must not wedge the
+    // pipeline over its own bug — surface it and let the deploy proceed to the other gates.
+    const msg = err instanceof Error ? err.message : String(err);
+    return { action: "blocked", message: `import scan failed: ${msg.slice(0, 160)}`, sha: tip };
+  }
+
+  if (scan.findings.length === 0) return null;
+
+  const preview = formatUnresolvedSummary(scan.findings, 3).replace(/\n/g, " | ");
+  return {
+    action: "blocked",
+    message: `${scan.findings.length} unresolved import(s) block stage deploy: ${preview.slice(0, 260)}`,
+    sha: tip,
+  };
+}
+
+/**
  * Lint (CI parity) then build+upload to the CI bucket from origin/main tip.
  * Does not push the `stage` git branch.
  */
@@ -302,7 +342,7 @@ export async function runLocalStageDeploy(
   mainBranch: string,
   stageBranch: string,
   deployCmd: string,
-  opts: { agent?: boolean; onProgress?: (msg: string) => void } = {},
+  opts: { agent?: boolean; importScan?: boolean; onProgress?: (msg: string) => void } = {},
 ): Promise<StageDeployResult> {
   const tip = await repo.tip(repoPath, remote, mainBranch);
   if (!tip) return { action: "error", message: `could not resolve ${remote}/${mainBranch}` };
@@ -333,6 +373,12 @@ export async function runLocalStageDeploy(
     opts.agent !== false,
   );
   if (gate) return gate;
+
+  if (opts.importScan !== false) {
+    note("deploy stage: unresolved-import scan…");
+    const importGate = await unresolvedImportGate(shadow.shadowPath, tip);
+    if (importGate) return importGate;
+  }
 
   // Copy repo .env into shadow so Vite sees the same secrets as a manual local deploy.
   const envSrc = path.join(repoPath, ".env");

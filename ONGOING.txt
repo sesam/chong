@@ -122,6 +122,24 @@ NOT DONE / PLANNED / OPEN DECISIONS  (the actual next-steps list)
    skips when marker matches HEAD. Flags: `--no-auto-deploy-stage`,
    `--deploy-cooldown`, `--stage-deploy-cmd`.
 
+13. [BUILT 2026-09-09] Unresolved-import gate before every local stage deploy
+   (`unresolved-imports.ts`, wired in `stage-deploy.ts` after the eslint gate).
+   Blocks the deploy when any import specifier resolves to no file on disk.
+   WHY: a lazy `import()` resolves only when its chunk is first requested, so
+   `vite build` succeeds and the route renders a BLANK PAGE on navigation —
+   neither the build nor the unit tests catch it. Real case: a FRONTEND sweep
+   deleted 18 modules; the check had to be run by hand afterwards.
+   Repo-wide, NOT diff-scoped, on purpose: the breaking commit deletes file A
+   while the dangling import sits in untouched file B. ~0.5s / 1,700 files.
+   Aliases from the watched repo's tsconfig/jsconfig `paths` (jsonc-tolerant,
+   falls back to `@/* -> src/*`). Comments are blanked first — doc comments in
+   FRONTEND literally contain `import('@/…')` as prose, which made the first
+   ad-hoc version 2-for-2 false positives. Skips bare packages, `${}` template
+   holes and URLs; strips Vite `?url`/`?raw` suffixes.
+   No auto-fix, no agent hand-off — the repair is either restoring the deleted
+   file or deleting its importer, and guessing wrong ships the wrong one.
+   `--no-import-scan` to disable. 22 tests in `unresolved-imports.test.ts`.
+
 10. [BUILT 2026-07-23] Agent-assisted cherry-pick + i18n via cursor-agent Auto
     (default on for `chong watch`; opt out with `--no-agent`).
     Confidence gate (`VERDICT: SAFE|UNSAFE`) before any `--force` edit.

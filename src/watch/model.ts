@@ -49,6 +49,12 @@ export type WatchConfig = {
   /** Shell command for stage deploy; empty = auto-detect FRONTEND script. */
   stageDeployCmd: string;
   /**
+   * Scan for import specifiers pointing at no file, and block the stage deploy on any
+   * (default true). Catches broken lazy `import()`s, which `vite build` cannot — the chunk
+   * only resolves on navigation, so the bundle builds and the route renders blank.
+   */
+  importScan: boolean;
+  /**
    * Tip shown for the stage lane when autoDeployStage is on — normally the local
    * `stage` branch (advanced after each successful app-ci deploy, never pushed).
    * Kept in sync by resolveDeployedStageSha / markLocalStageDeployed.
