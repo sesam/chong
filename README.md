@@ -58,6 +58,41 @@ Options:
 
 **Unresolved-import gate (before every stage deploy):** the shadow worktree is scanned for import specifiers that resolve to no file, and any finding blocks the deploy. This exists because a **lazy** `import()` is only resolved when its chunk is first requested — so `vite build` succeeds and the route renders a blank page on navigation. Neither the build nor the unit tests catch it. Scanning is repo-wide rather than diff-scoped on purpose: the commit that breaks things deletes file A, while the dangling import sits in file B, which the diff never mentions. ~0.5s on a 1,700-file repo. Aliases come from the watched repo's `tsconfig.json`/`jsconfig.json` `paths` (falling back to `@/* -> src/*`); comments are stripped first, so `import('@/…')` written as prose in a doc comment is not a finding. Bare package names, template-hole specifiers and URLs are left alone. No auto-fix and no agent hand-off — the repair is either restoring the deleted file or deleting its importer, and guessing wrong ships the wrong one. Disable with `--no-import-scan`.
 
+**Per-repo config (`<repo>/.chong/config.json`):** chong keeps its per-repo state in
+`<repo>/.chong/`, and `chong watch` creates that folder and adds `.chong/` to the repo's
+`.gitignore` on attach (idempotent; it never rewrites an existing rule). The rule ignores
+machine-local state but **not** `config.json` — `.chong/` holds both, and a blanket ignore
+would mean every fresh clone silently lost the repo's deploy settings:
+
+```gitignore
+.chong/
+!.chong/config.json
+```
+
+Two keys affect deploys:
+
+```json
+{
+  "stageDeployCmd": "npm run deploy:stage",
+  "stageDeployedShaBucket": "my-ci-static-bucket"
+}
+```
+
+- `stageDeployCmd` — overrides detection. Resolution order is this key, then the watched
+  repo's own `deploy:stage` npm script, then LynxCraft FRONTEND's `scripts/deploy-frontend.sh`.
+  Null when the repo says nothing about deploying: a wrong deploy command is worse than none.
+- `stageDeployedShaBucket` — where to write the `deployed-git-sha.txt` marker. **Omit it and
+  no marker is written.** This used to be a hardcoded LynxCraft bucket written on every
+  successful deploy, so watching a second repo overwrote FRONTEND's marker with the other
+  repo's SHA — and FRONTEND's stage CI reads that marker to decide whether it can no-op, so
+  it would skip a deploy it should have run.
+
+Note that detecting `deploy:stage` enables the manual `[s]` key but does **not** arm
+*auto*-deploy; that still needs `stageDeployCmd`/`--stage-deploy-cmd` or the FRONTEND
+script. Unattended deploys of a backend are a bad default: in a serverless repo whose
+secrets live in CI, a laptop `deploy:stage` can silently replace live environment variables
+with blanks and still report success.
+
 **Auto-deploy → app-ci (stage):** when `scripts/deploy-frontend.sh` exists (LynxCraft FRONTEND), watch no longer pushes `origin/stage`. Instead, after origin/main is quiet for **60s** (resets on each new commit), it builds+uploads to the CI S3/CloudFront bucket from `main-shadow`, advances the **local** `stage` branch to that tip (tracking only), writes `deployed-git-sha.txt`, and pings Discord. Manual `[s]` deploys immediately. Prod promote (`[p]`) still pushes git (local stage tip → `prod`) so the full prod CI suite runs. Disable with `--no-auto-deploy-stage`; tune with `--deploy-cooldown <s>` / `--stage-deploy-cmd <cmd>`.
 
 **Offline agents:** install mcp-ify’s `offline-agent` (`bash offline-agent/install.sh`) so `mcpify-agent` is on PATH — then watch runs fully locally via Ollama + mcp-ify with no Cursor cloud dependency.

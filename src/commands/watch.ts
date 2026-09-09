@@ -2,7 +2,11 @@ import { c, parseArgs } from "../util";
 import { runWatch } from "../watch/app";
 import type { WatchConfig } from "../watch/model";
 import { repo } from "../watch/repo";
-import { DEFAULT_DEPLOY_COOLDOWN_SEC, hasFrontendStageDeployScript } from "../watch/stage-deploy";
+import {
+  DEFAULT_DEPLOY_COOLDOWN_SEC,
+  ensureChongIgnored,
+  hasFrontendStageDeployScript,
+} from "../watch/stage-deploy";
 
 const DEFAULT_BRANCHES = ["main", "stage", "prod"];
 const DEFAULT_INTERVAL_S = 15;
@@ -53,8 +57,23 @@ export async function cmdWatch(argv: string[]): Promise<void> {
 
   // Soft default: only auto-arm when the FE deploy script exists unless the user
   // forced a command. Avoid surprising non-FRONTEND repos.
+  //
+  // Deliberately NOT widened to "any repo with a deploy:stage script", even though
+  // defaultStageDeployCmd now detects one. Detection is for the manual `[s]` key; arming
+  // an unattended deploy off it would be dangerous for a serverless backend, where the
+  // deploy tool commonly defaults absent env vars to the empty string. If the secrets live
+  // in CI and the watcher does not hold them, an automatic deploy can quietly replace live
+  // configuration with blanks — and the deploy still reports success. A deploy that needs
+  // credentials the watcher does not have must be a deliberate keypress, not a 60s
+  // cooldown. Opt in per repo via `stageDeployCmd` in `.chong/config.json`, or
+  // `--stage-deploy-cmd`.
   const effectiveAutoDeploy =
     autoDeployStage && (stageDeployCmd.trim() !== "" || hasFrontendStageDeployScript(repoPath));
+
+  // chong keeps per-repo state in <repo>/.chong — create it and make sure git ignores it
+  // before anything writes there, so it can never be swept into someone else's commit in
+  // a shared working tree.
+  ensureChongIgnored(repoPath);
 
   const cfg: WatchConfig = {
     repoPath,

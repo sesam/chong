@@ -8,7 +8,7 @@
  *   4. an S3 marker (`deployed-git-sha.txt`) so a stray stage-branch CI run can no-op
  *   5. Discord via the notify-discord relay (same channel as FE CI)
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { ensureShadow, runEslintFix, tryAgentLintFix } from "./checks";
@@ -83,12 +83,112 @@ export function hasFrontendStageDeployScript(repoPath: string): boolean {
   return existsSync(path.join(repoPath, "scripts", "deploy-frontend.sh"));
 }
 
+/**
+ * Per-repo settings from `<repo>/.chong/config.json`.
+ *
+ * Everything repo-specific belongs here rather than in a module constant. Before this,
+ * `STAGE_CI_BUCKET` was a hardcoded LynxCraft-FRONTEND bucket and the SHA marker was
+ * written unconditionally on every successful deploy — so pointing `chong watch` at a
+ * second repo would overwrite FRONTEND's `deployed-git-sha.txt` with the other repo's SHA,
+ * and FRONTEND's stage CI (which reads that marker to decide whether it can no-op) would
+ * skip a deploy it should have run. The marker is now opt-in per repo.
+ */
+export type RepoDeployConfig = {
+  /** Deploy command; overrides detection. */
+  stageDeployCmd?: string;
+  /** S3 bucket for the deployed-SHA marker. Omit to skip the marker entirely. */
+  stageDeployedShaBucket?: string;
+};
+
+export function loadRepoDeployConfig(repoPath: string): RepoDeployConfig {
+  const cfgPath = path.join(repoPath, ".chong", "config.json");
+  if (!existsSync(cfgPath)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(cfgPath, "utf8")) as RepoDeployConfig;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    // A malformed config must not stop the TUI: fall back to detection.
+    return {};
+  }
+}
+
+/** The bucket to write the SHA marker to, or null when this repo has none. */
+export function stageDeployedShaBucket(repoPath: string): string | null {
+  const configured = loadRepoDeployConfig(repoPath).stageDeployedShaBucket?.trim();
+  if (configured) return configured;
+  // Legacy: LynxCraft FRONTEND predates the config file and its CI depends on the marker.
+  return hasFrontendStageDeployScript(repoPath) ? STAGE_CI_BUCKET : null;
+}
+
+/** `deploy:stage` from the repo's own package.json, if it has one. */
+function packageJsonStageDeploy(repoPath: string): string | null {
+  const pkgPath = path.join(repoPath, "package.json");
+  if (!existsSync(pkgPath)) return null;
+  try {
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as {
+      scripts?: Record<string, string>;
+    };
+    return pkg?.scripts?.["deploy:stage"] ? "npm run deploy:stage" : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolution order: explicit config, then the repo's own `deploy:stage` script, then the
+ * LynxCraft FRONTEND script. Preferring `deploy:stage` is what makes this work on any repo
+ * without a flag — the repo states how it deploys, in the place a reader looks first.
+ */
 export function defaultStageDeployCmd(repoPath: string): string | null {
-  if (!hasFrontendStageDeployScript(repoPath)) return null;
-  // Prefer aws CLI — s5cmd is often missing on laptops; FORCE skips the tty prompt.
-  // CI=true makes pnpm non-interactive (confirmModulesPurge). DEPLOY_SKIP_INSTALL=1
-  // relies on the main-shadow node_modules symlink — no reinstall in the worktree.
-  return "CI=true FORCE=1 DEPLOY_SKIP_INSTALL=1 DEPLOY_S3_TOOL=aws ./scripts/deploy-frontend.sh ci";
+  const configured = loadRepoDeployConfig(repoPath).stageDeployCmd?.trim();
+  if (configured) return configured;
+
+  if (hasFrontendStageDeployScript(repoPath)) {
+    // Prefer aws CLI — s5cmd is often missing on laptops; FORCE skips the tty prompt.
+    // CI=true makes pnpm non-interactive (confirmModulesPurge). DEPLOY_SKIP_INSTALL=1
+    // relies on the main-shadow node_modules symlink — no reinstall in the worktree.
+    return "CI=true FORCE=1 DEPLOY_SKIP_INSTALL=1 DEPLOY_S3_TOOL=aws ./scripts/deploy-frontend.sh ci";
+  }
+
+  return packageJsonStageDeploy(repoPath);
+}
+
+/**
+ * Create `<repo>/.chong/` and make sure git ignores it.
+ *
+ * chong writes per-repo state there (deployed-SHA backup, config, `new` worktrees), none
+ * of which belongs in the watched repo's history — and committing it by accident in a
+ * shared working tree is exactly the sort of thing that lands in someone else's commit.
+ * Appends to `.gitignore` only when no existing rule already covers it, and never rewrites
+ * what is there.
+ */
+export function ensureChongIgnored(repoPath: string): void {
+  try {
+    mkdirSync(path.join(repoPath, ".chong"), { recursive: true });
+  } catch {
+    return;
+  }
+  const gitignore = path.join(repoPath, ".gitignore");
+  try {
+    const existing = existsSync(gitignore) ? readFileSync(gitignore, "utf8") : "";
+    const covered = existing
+      .split("\n")
+      .map((l) => l.trim())
+      .some((l) => l === ".chong" || l === ".chong/" || l === "/.chong" || l === "/.chong/");
+    if (covered) return;
+    const prefix = existing === "" || existing.endsWith("\n") ? "" : "\n";
+    // `.chong/` holds two different kinds of thing, so the rule cannot be a blanket
+    // ignore: state.json, stage-deployed-sha and wt/ are machine-local and must never be
+    // committed, but config.json is deliberate per-repo configuration — which repo, which
+    // deploy command, which marker bucket — and ignoring it would mean every clone and
+    // every teammate silently loses it. The negation keeps state out and config in.
+    appendFileSync(
+      gitignore,
+      `${prefix}\n# chong: machine-local state ignored, per-repo config committed\n.chong/\n!.chong/config.json\n`,
+    );
+  } catch {
+    // Not fatal — worst case the user sees .chong/ as untracked.
+  }
 }
 
 /** Resolve effective deploy command, or null if this repo can't local-deploy stage. */
@@ -152,8 +252,8 @@ export async function formatStageDeployDiscordMessage(
 }
 
 /** Upload the SHA marker so GitHub stage CI can skip when already live. */
-export async function writeS3DeployedSha(sha: string): Promise<string | null> {
-  const uri = `s3://${STAGE_CI_BUCKET}/${DEPLOYED_SHA_KEY}`;
+export async function writeS3DeployedSha(bucket: string, sha: string): Promise<string | null> {
+  const uri = `s3://${bucket}/${DEPLOYED_SHA_KEY}`;
   const proc = Bun.spawn(
     [
       "aws",
@@ -179,8 +279,8 @@ export async function writeS3DeployedSha(sha: string): Promise<string | null> {
   return code === 0 ? null : err.trim() || `aws s3 cp failed (${code})`;
 }
 
-export async function readS3DeployedSha(): Promise<string | null> {
-  const uri = `s3://${STAGE_CI_BUCKET}/${DEPLOYED_SHA_KEY}`;
+export async function readS3DeployedSha(bucket: string): Promise<string | null> {
+  const uri = `s3://${bucket}/${DEPLOYED_SHA_KEY}`;
   const proc = Bun.spawn(["aws", "s3", "cp", uri, "-", "--quiet"], {
     stdout: "pipe",
     stderr: "pipe",
@@ -212,7 +312,10 @@ export async function resolveDeployedStageSha(
   }
 
   const fileSha = readLocalDeployedSha(repoPath);
-  const s3Sha = fileSha ? null : await readS3DeployedSha();
+  // No bucket configured for this repo means no marker to read — see
+  // stageDeployedShaBucket. The local ref and the .chong backup still apply.
+  const markerBucket = stageDeployedShaBucket(repoPath);
+  const s3Sha = fileSha || !markerBucket ? null : await readS3DeployedSha(markerBucket);
   const recovered = fileSha ?? s3Sha;
   if (!recovered) return null;
 
@@ -448,9 +551,13 @@ export async function runLocalStageDeploy(
     );
   }
 
-  const s3Err = await writeS3DeployedSha(tip);
-  if (s3Err) {
-    note(`deploy stage: live, but S3 marker failed (${s3Err.slice(0, 120)})`);
+  // Only when this repo owns a marker bucket — see stageDeployedShaBucket.
+  const markerBucket = stageDeployedShaBucket(repoPath);
+  if (markerBucket) {
+    const s3Err = await writeS3DeployedSha(markerBucket, tip);
+    if (s3Err) {
+      note(`deploy stage: live, but S3 marker failed (${s3Err.slice(0, 120)})`);
+    }
   }
 
   const discordOk = await notifyDiscordStage(
