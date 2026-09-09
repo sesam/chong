@@ -42,7 +42,7 @@ Options:
   --no-auto-maintain           disable scheduled commit-producing maintain
   --no-auto-deploy-stage       disable local app-ci deploy cooldown (FRONTEND)
   --deploy-cooldown <seconds>  quiet window on origin/main before stage deploy (default 60)
-  --stage-deploy-cmd <cmd>     override deploy command (default: FORCE=1 DEPLOY_S3_TOOL=aws ./scripts/deploy-frontend.sh ci)
+  --stage-deploy-cmd <cmd>     override deploy command (default: CI=true FORCE=1 DEPLOY_SKIP_INSTALL=1 DEPLOY_S3_TOOL=aws ./scripts/deploy-frontend.sh ci)
 ```
 
 ![chong watch TUI](chong-watch-tui-example.webp)

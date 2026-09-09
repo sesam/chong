@@ -85,7 +85,9 @@ export function hasFrontendStageDeployScript(repoPath: string): boolean {
 export function defaultStageDeployCmd(repoPath: string): string | null {
   if (!hasFrontendStageDeployScript(repoPath)) return null;
   // Prefer aws CLI — s5cmd is often missing on laptops; FORCE skips the tty prompt.
-  return "FORCE=1 DEPLOY_S3_TOOL=aws ./scripts/deploy-frontend.sh ci";
+  // CI=true makes pnpm non-interactive (confirmModulesPurge). DEPLOY_SKIP_INSTALL=1
+  // relies on the main-shadow node_modules symlink — no reinstall in the worktree.
+  return "CI=true FORCE=1 DEPLOY_SKIP_INSTALL=1 DEPLOY_S3_TOOL=aws ./scripts/deploy-frontend.sh ci";
 }
 
 /** Resolve effective deploy command, or null if this repo can't local-deploy stage. */
@@ -189,13 +191,17 @@ async function runDeployCommand(
   shadowPath: string,
   cmd: string,
 ): Promise<{ ok: boolean; output: string }> {
-  const proc = Bun.spawn(["bash", "-lc", cmd], {
+  // Use `bash -c` (not `-lc`): a login shell sources sdkman/zsh helpers that break
+  // under macOS /bin/bash 3.2 (`${var^^}` bad substitution) and can hang on prompts.
+  const proc = Bun.spawn(["bash", "-c", cmd], {
     cwd: shadowPath,
     stdout: "pipe",
     stderr: "pipe",
     env: {
       ...process.env,
+      CI: "true",
       FORCE: "1",
+      DEPLOY_SKIP_INSTALL: process.env.DEPLOY_SKIP_INSTALL ?? "1",
       SKIP_SOURCEMAP: process.env.SKIP_SOURCEMAP ?? "1",
       HOME: process.env.HOME ?? homedir(),
     },
