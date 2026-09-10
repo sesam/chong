@@ -5,7 +5,8 @@
  *   1. a debounce countdown after origin/main moves
  *   2. `scripts/deploy-frontend.sh ci` from main-shadow at that tip
  *   3. advancing the **local** `stage` branch to that tip (tracking only — never pushed)
- *   4. an S3 marker (`deployed-git-sha.txt`) so a stray stage-branch CI run can no-op
+ *   4. S3 markers (`deployed-git-sha.txt` + `deployed-tree-sha.txt`) so a stray
+ *      stage-branch CI run can no-op
  *   5. Discord via the notify-discord relay (same channel as FE CI)
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -18,6 +19,7 @@ import { formatUnresolvedSummary, scanUnresolvedImports } from "./unresolved-imp
 
 export const STAGE_CI_BUCKET = "lynx-ci-edge-20251117-4-static-files";
 export const DEPLOYED_SHA_KEY = "deployed-git-sha.txt";
+export const DEPLOYED_TREE_KEY = "deployed-tree-sha.txt";
 export const DEFAULT_DEPLOY_COOLDOWN_SEC = 60;
 export const STAGE_TRACK_BRANCH = "stage";
 
@@ -251,9 +253,8 @@ export async function formatStageDeployDiscordMessage(
   return `${header}\n\`\`\`\n${lines.join("\n")}\n\`\`\``;
 }
 
-/** Upload the SHA marker so GitHub stage CI can skip when already live. */
-export async function writeS3DeployedSha(bucket: string, sha: string): Promise<string | null> {
-  const uri = `s3://${bucket}/${DEPLOYED_SHA_KEY}`;
+async function writeS3Marker(bucket: string, key: string, value: string): Promise<string | null> {
+  const uri = `s3://${bucket}/${key}`;
   const proc = Bun.spawn(
     [
       "aws",
@@ -268,7 +269,7 @@ export async function writeS3DeployedSha(bucket: string, sha: string): Promise<s
       "--quiet",
     ],
     {
-      stdin: new Blob([`${sha}\n`]),
+      stdin: new Blob([`${value}\n`]),
       stdout: "pipe",
       stderr: "pipe",
       env: { ...process.env, AWS_PAGER: "" },
@@ -277,6 +278,24 @@ export async function writeS3DeployedSha(bucket: string, sha: string): Promise<s
   const err = await new Response(proc.stderr).text();
   const code = await proc.exited;
   return code === 0 ? null : err.trim() || `aws s3 cp failed (${code})`;
+}
+
+/** Upload the commit marker. Read back by resolveDeployedStageSha, and by humans. */
+export async function writeS3DeployedSha(bucket: string, sha: string): Promise<string | null> {
+  return writeS3Marker(bucket, DEPLOYED_SHA_KEY, sha);
+}
+
+/**
+ * Upload the tree marker — what the GitHub stage gate compares to decide it can no-op.
+ *
+ * It has to be the tree rather than the commit: `chong watch` promotes main → origin/main
+ * by re-creating commits, so the same content is deployed under one sha from here and a
+ * different sha from a CI run, and a sha comparison never matched. Trees are identical
+ * for identical content, so both routes agree. Mirrors what FRONTEND's
+ * scripts/deploy-frontend.sh writes, so either deploy path leaves the same marker.
+ */
+export async function writeS3DeployedTree(bucket: string, tree: string): Promise<string | null> {
+  return writeS3Marker(bucket, DEPLOYED_TREE_KEY, tree);
 }
 
 export async function readS3DeployedSha(bucket: string): Promise<string | null> {
@@ -296,7 +315,7 @@ export async function readS3DeployedSha(bucket: string): Promise<string | null> 
  * Best-known live stage SHA, in order:
  *   1. local `stage` branch (primary deploy tracker)
  *   2. `.chong/stage-deployed-sha` backup file
- *   3. S3 `deployed-git-sha.txt`
+ *   3. S3 `deployed-git-sha.txt` (the commit marker; the tree marker is write-only here)
  *
  * When the winner isn't already on local `stage`, the ref is advanced to match
  * (so the pipeline lane stays consistent across restarts).
@@ -557,6 +576,18 @@ export async function runLocalStageDeploy(
     const s3Err = await writeS3DeployedSha(markerBucket, tip);
     if (s3Err) {
       note(`deploy stage: live, but S3 marker failed (${s3Err.slice(0, 120)})`);
+    }
+    // The tree marker is the one the stage gate actually compares — see
+    // writeS3DeployedTree. Without it a CI run cannot tell that this deploy already
+    // shipped the same content, and re-deploys it.
+    const treeRes = await git(["rev-parse", `${tip}^{tree}`], repoPath);
+    if (treeRes.ok && treeRes.out) {
+      const treeErr = await writeS3DeployedTree(markerBucket, treeRes.out);
+      if (treeErr) {
+        note(`deploy stage: live, but S3 tree marker failed (${treeErr.slice(0, 120)})`);
+      }
+    } else {
+      note(`deploy stage: live, but could not resolve tree for ${tip.slice(0, 7)}`);
     }
   }
 
