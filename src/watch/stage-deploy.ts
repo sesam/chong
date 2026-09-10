@@ -18,7 +18,6 @@ import { formatLintSummary, isAgentableLintFailure, lintableChangedFiles, runEsl
 import { repo } from "./repo";
 import { formatUnresolvedSummary, scanUnresolvedImports } from "./unresolved-imports";
 
-export const STAGE_CI_BUCKET = "lynx-ci-edge-20251117-4-static-files";
 export const DEPLOYED_SHA_KEY = "deployed-git-sha.txt";
 export const DEPLOYED_TREE_KEY = "deployed-tree-sha.txt";
 export const DEFAULT_DEPLOY_COOLDOWN_SEC = 60;
@@ -90,7 +89,7 @@ export function hasFrontendStageDeployScript(repoPath: string): boolean {
  * Per-repo settings from `<repo>/.chong/config.json`.
  *
  * Everything repo-specific belongs here rather than in a module constant. Before this,
- * `STAGE_CI_BUCKET` was a hardcoded LynxCraft-FRONTEND bucket and the SHA marker was
+ * the bucket was a hardcoded LynxCraft-FRONTEND constant and the SHA marker was
  * written unconditionally on every successful deploy — so pointing `chong watch` at a
  * second repo would overwrite FRONTEND's `deployed-git-sha.txt` with the other repo's SHA,
  * and FRONTEND's stage CI (which reads that marker to decide whether it can no-op) would
@@ -115,12 +114,18 @@ export function loadRepoDeployConfig(repoPath: string): RepoDeployConfig {
   }
 }
 
-/** The bucket to write the SHA marker to, or null when this repo has none. */
+/**
+ * The bucket to write the SHA marker to, or null when this repo has none.
+ *
+ * Config only — no sniffing. This used to fall back to a hardcoded LynxCraft
+ * bucket for any repo containing scripts/deploy-frontend.sh, which meant chong
+ * shipped one project's infrastructure name and would write that project's
+ * marker on behalf of a repo that merely had a similarly-named script. The repo
+ * declares its own bucket in .chong/config.json; a repo that declares none gets
+ * no marker, which is the safe default.
+ */
 export function stageDeployedShaBucket(repoPath: string): string | null {
-  const configured = loadRepoDeployConfig(repoPath).stageDeployedShaBucket?.trim();
-  if (configured) return configured;
-  // Legacy: LynxCraft FRONTEND predates the config file and its CI depends on the marker.
-  return hasFrontendStageDeployScript(repoPath) ? STAGE_CI_BUCKET : null;
+  return loadRepoDeployConfig(repoPath).stageDeployedShaBucket?.trim() || null;
 }
 
 /** `deploy:stage` from the repo's own package.json, if it has one. */
@@ -147,10 +152,14 @@ export function defaultStageDeployCmd(repoPath: string): string | null {
   if (configured) return configured;
 
   if (hasFrontendStageDeployScript(repoPath)) {
-    // Prefer aws CLI — s5cmd is often missing on laptops; FORCE skips the tty prompt.
-    // CI=true makes pnpm non-interactive (confirmModulesPurge). DEPLOY_SKIP_INSTALL=1
-    // relies on the main-shadow node_modules symlink — no reinstall in the worktree.
-    return "CI=true FORCE=1 DEPLOY_SKIP_INSTALL=1 DEPLOY_S3_TOOL=aws ./scripts/deploy-frontend.sh ci";
+    // No DEPLOY_S3_TOOL: the deploy script resolves it itself — s5cmd when installed,
+    // else the aws CLI with a one-line install hint. Forcing aws here (which this did,
+    // because s5cmd is often missing on laptops) pinned every chong deploy to the
+    // slower tool even on machines that had s5cmd.
+    // FORCE skips the tty prompt. CI=true makes pnpm non-interactive
+    // (confirmModulesPurge). DEPLOY_SKIP_INSTALL=1 relies on the main-shadow
+    // node_modules symlink — no reinstall in the worktree.
+    return "CI=true FORCE=1 DEPLOY_SKIP_INSTALL=1 ./scripts/deploy-frontend.sh ci";
   }
 
   return packageJsonStageDeploy(repoPath);
@@ -177,7 +186,9 @@ export function ensureChongIgnored(repoPath: string): void {
     const covered = existing
       .split("\n")
       .map((l) => l.trim())
-      .some((l) => l === ".chong" || l === ".chong/" || l === "/.chong" || l === "/.chong/");
+      .some((l) =>
+        [".chong", ".chong/", ".chong/*", "/.chong", "/.chong/", "/.chong/*"].includes(l),
+      );
     if (covered) return;
     const prefix = existing === "" || existing.endsWith("\n") ? "" : "\n";
     // `.chong/` holds two different kinds of thing, so the rule cannot be a blanket
@@ -187,7 +198,7 @@ export function ensureChongIgnored(repoPath: string): void {
     // every teammate silently loses it. The negation keeps state out and config in.
     appendFileSync(
       gitignore,
-      `${prefix}\n# chong: machine-local state ignored, per-repo config committed\n.chong/\n!.chong/config.json\n`,
+      `${prefix}\n# chong: machine-local state ignored, per-repo config committed.\n# The trailing /* matters: git does not descend into an ignored DIRECTORY, so a\n# negation for a file inside one is unreachable and config.json stays ignored.\n.chong/*\n!.chong/config.json\n`,
     );
   } catch {
     // Not fatal — worst case the user sees .chong/ as untracked.

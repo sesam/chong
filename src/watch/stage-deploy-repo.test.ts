@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -7,7 +7,6 @@ import {
   ensureChongIgnored,
   loadRepoDeployConfig,
   stageDeployedShaBucket,
-  STAGE_CI_BUCKET,
 } from "./stage-deploy";
 
 function repo(): string {
@@ -37,13 +36,18 @@ describe("stageDeployedShaBucket — the cross-repo hazard", () => {
     expect(stageDeployedShaBucket(dir)).toBe("some-other-bucket");
   });
 
-  test("keeps the legacy FRONTEND bucket, whose CI depends on the marker", () => {
+  test("does NOT sniff a bucket from the presence of a deploy script", () => {
+    // Removed 2026-09-10: this used to return a hardcoded LynxCraft bucket for any
+    // repo containing scripts/deploy-frontend.sh. That shipped one project's
+    // infrastructure name inside chong, and would write that project's marker on
+    // behalf of an unrelated repo that merely had a similarly-named script. The
+    // repo declares its own bucket now (FRONTEND does, in .chong/config.json).
     const dir = repo();
     asFrontend(dir);
-    expect(stageDeployedShaBucket(dir)).toBe(STAGE_CI_BUCKET);
+    expect(stageDeployedShaBucket(dir)).toBeNull();
   });
 
-  test("an explicit bucket wins over the legacy sniff", () => {
+  test("a configured bucket is used even for a repo with a deploy script", () => {
     const dir = repo();
     asFrontend(dir);
     withChong(dir, { stageDeployedShaBucket: "explicit" });
@@ -127,7 +131,9 @@ describe("ensureChongIgnored", () => {
     const lines = readFileSync(path.join(dir, ".gitignore"), "utf8")
       .split("\n")
       .map((l) => l.trim());
-    expect(lines.filter((l) => l === ".chong/")).toHaveLength(1);
+    // `.chong/*`, not `.chong/` — see ensureChongIgnored. The "already covered"
+    // check must recognise the exact form it writes, or every run re-appends.
+    expect(lines.filter((l) => l === ".chong/*")).toHaveLength(1);
     expect(lines.filter((l) => l === "!.chong/config.json")).toHaveLength(1);
   });
 
