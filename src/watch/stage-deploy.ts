@@ -279,8 +279,7 @@ export async function formatStageDeployDiscordMessage(
   tip: string,
   previousSha: string | null,
 ): Promise<string> {
-  const header =
-    "✅ FE stage (chong local): Deployment completed successfully! Commits in this push:";
+  const header = "✅ FE stage (chong local) deployed! Included commits:";
 
   let commits =
     previousSha && previousSha.toLowerCase() !== tip.toLowerCase()
@@ -624,7 +623,7 @@ export async function runLocalProdDeploy(
   });
 
   const discordOk = await notifyDiscordStage(
-    `🚀 FE PROD (chong local): deployed ${sha.slice(0, 7)} — local \`${prodBranch}\` advanced, not pushed`,
+    `✅ FE prod (chong local) deployed! ${sha.slice(0, 7)} — local \`${prodBranch}\` advanced, not pushed`,
   );
   if (!discordOk) note("deploy prod: Discord notify failed");
 
