@@ -97,6 +97,19 @@ export type I18nCheck = {
   mismatch: boolean;
 };
 
+/**
+ * True when an added diff line looks like an i18n code change (so a paired
+ * .po/.pot update is expected). Deliberately rejects identifiers that merely
+ * *end* in `t(` — `it('…')`, `import('…')`, `.get("…")`, `split('…')`,
+ * `test('…')`, `format('…')` — which used to light the watch mismatch warning
+ * on every Vitest / dynamic-import commit.
+ *
+ * Matches: bare `t('…')` / `t("…")` / `t(\`…\`)`, `$t('…')`, `useT`, word `i18n`.
+ */
+export function addedLineLooksLikeI18nCode(line: string): boolean {
+  return /\bi18n\b|\buseT\b|(?<![A-Za-z0-9_])t\(['"`]/.test(line);
+}
+
 export async function checkI18n(repoPath: string, sha: string): Promise<I18nCheck> {
   const [files, showR] = await Promise.all([
     commitFiles(repoPath, sha),
@@ -108,7 +121,7 @@ export async function checkI18n(repoPath: string, sha: string): Promise<I18nChec
     showR.out
       .split("\n")
       .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
-      .some((l) => /\bi18n\b|useT\b|t\(['"`]/.test(l));
+      .some((l) => addedLineLooksLikeI18nCode(l));
   return { hasPo, hasI18nCode, mismatch: hasPo !== hasI18nCode };
 }
 
