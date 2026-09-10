@@ -318,6 +318,18 @@ export const repo = {
     };
   },
 
+  /** Tree hash of a commit — stable across the sha rewrites promotion produces. */
+  async treeOf(cwd: string, rev: string): Promise<string | null> {
+    const r = await git(["rev-parse", `${rev}^{tree}`], cwd);
+    return r.ok && r.out ? r.out : null;
+  },
+
+  /** Configured git author name, for attributing a deploy to a person. */
+  async userName(cwd: string): Promise<string | null> {
+    const r = await git(["config", "user.name"], cwd);
+    return r.ok && r.out ? r.out : null;
+  },
+
   /** Push `sha` (or current HEAD if omitted) to `remote:refs/heads/branch`. */
   async pushSha(cwd: string, remote: string, branch: string, sha?: string): Promise<string | null> {
     const spec = sha ? `${sha}:refs/heads/${branch}` : `HEAD:refs/heads/${branch}`;

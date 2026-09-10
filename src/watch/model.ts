@@ -1,6 +1,23 @@
+import { appendDeployHistory } from "./deploy-history";
 import { checkState, mergeBranches, parseGitHubSlug } from "./gh";
 import { repo } from "./repo";
 import type { Gap, Lane, Pipeline } from "./types";
+
+/**
+ * Log the prod push. chong does not deploy prod — it pushes a SHA onto `prod` and GitHub
+ * Actions deploys it — so this records the trigger, not a finished deploy. Build/deploy
+ * timings and size belong to the CI run and are left empty; the deploy-history row for the
+ * completed prod deploy comes from scripts/deploy-frontend.sh when prod is shipped locally.
+ */
+async function recordProdPromote(repoPath: string, sha: string): Promise<void> {
+  const [tree, who] = await Promise.all([repo.treeOf(repoPath, sha), repo.userName(repoPath)]);
+  appendDeployHistory(repoPath, {
+    target: "prod-promote",
+    tree: tree ?? "unknown",
+    commit: sha,
+    who: who ?? process.env.USER ?? "unknown",
+  });
+}
 
 const QUEUE_LIMIT = 50; // max commits to list per gap
 const INCOMING_LIMIT = 15; // recent commits shown for the head lane
@@ -265,7 +282,9 @@ export async function promote(
       }
       return "diverged prod promote needs a GitHub remote";
     }
-    return repo.pushSha(pipeline.repoPath, pipeline.remote, "prod", sha);
+    const pushErr = await repo.pushSha(pipeline.repoPath, pipeline.remote, "prod", sha);
+    if (!pushErr) await recordProdPromote(pipeline.repoPath, sha);
+    return pushErr;
   }
 
   if (gap.ff) {

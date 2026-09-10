@@ -13,6 +13,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { homedir } from "node:os";
 import path from "node:path";
 import { ensureShadow, runEslintFix, tryAgentLintFix } from "./checks";
+import { deployHistoryPath } from "./deploy-history";
 import { formatLintSummary, isAgentableLintFailure, lintableChangedFiles, runEslint } from "./lint";
 import { repo } from "./repo";
 import { formatUnresolvedSummary, scanUnresolvedImports } from "./unresolved-imports";
@@ -349,6 +350,7 @@ export async function resolveDeployedStageSha(
 async function runDeployCommand(
   shadowPath: string,
   cmd: string,
+  historyFile?: string,
 ): Promise<{ ok: boolean; output: string }> {
   // Use `bash -c` (not `-lc`): a login shell sources sdkman/zsh helpers that break
   // under macOS /bin/bash 3.2 (`${var^^}` bad substitution) and can hang on prompts.
@@ -363,6 +365,9 @@ async function runDeployCommand(
       DEPLOY_SKIP_INSTALL: process.env.DEPLOY_SKIP_INSTALL ?? "1",
       SKIP_SOURCEMAP: process.env.SKIP_SOURCEMAP ?? "1",
       HOME: process.env.HOME ?? homedir(),
+      // The deploy script logs one row per deploy. cwd is a throwaway shadow worktree,
+      // so without this the row is written there and discarded with it.
+      ...(historyFile ? { DEPLOY_HISTORY_FILE: historyFile } : {}),
     },
   });
   const [stdout, stderr] = await Promise.all([
@@ -550,7 +555,7 @@ export async function runLocalStageDeploy(
   }
 
   note(`deploy stage: running ${deployCmd}…`);
-  const run = await runDeployCommand(shadow.shadowPath, deployCmd);
+  const run = await runDeployCommand(shadow.shadowPath, deployCmd, deployHistoryPath(repoPath));
   if (!run.ok) {
     const tail = run.output.slice(-1500);
     await notifyDiscordStage(
