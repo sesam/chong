@@ -18,8 +18,10 @@ import {
 import { type WatchConfig, computePipeline, enrichCI, gapHotkeys, promote } from "./model";
 import { type UIState, render } from "./render";
 import {
+  defaultProdDeployCmd,
   resolveDeployedStageSha,
   resolveStageDeployCmd,
+  runLocalProdDeploy,
   runLocalStageDeploy,
 } from "./stage-deploy";
 import type { Pipeline } from "./types";
@@ -48,6 +50,9 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   let stageDeploying = false;
   const stageDeployCmd = resolveStageDeployCmd(cfg.repoPath, cfg.stageDeployCmd);
   const localStageDeploy = cfg.autoDeployStage && !!stageDeployCmd;
+  // Null when this repo has no way to deploy prod locally. The prod prompt then falls back
+  // to the original y/n push-the-branch, rather than offering a choice it cannot honour.
+  const prodDeployCmd = defaultProdDeployCmd(cfg.repoPath);
   /** Local SHAs that must not be re-injected (partial cherry-pick / patch-id mismatch). */
   const injectBlockedShas = new Set<string>();
   /** Local tip when injectBlockedShas was last filled — clear blocks when tip moves. */
@@ -87,6 +92,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     modal: null,
     maintenance: null,
     stageDeploy: null,
+    canDeployProdLocally: !!prodDeployCmd,
   };
 
   const write = (s: string) => process.stdout.write(s);
@@ -611,10 +617,46 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     }
   }
 
-  async function doPromote(idx: number): Promise<void> {
+  /** True when the pending confirmation is a prod gap that can ship locally as well as remotely. */
+  function promptOffersProdRoute(idx: number): boolean {
+    return !!prodDeployCmd && pipeline?.gaps[idx]?.to === "prod";
+  }
+
+  /**
+   * `mode` only matters for prod, which can ship either way:
+   *   "remote" — push the SHA onto `prod` and let GitHub Actions deploy it (the original)
+   *   "local"  — build and upload from here, exactly as stage does
+   * Stage is always local when a deploy command exists, so it ignores this.
+   */
+  async function doPromote(idx: number, mode: "remote" | "local" = "remote"): Promise<void> {
     if (!pipeline) return;
     const gap = pipeline.gaps[idx];
     ui.confirm = null;
+
+    if (mode === "local" && gap.to === "prod" && prodDeployCmd) {
+      // Deploy the stage lane tip — the same commit a remote promote would have pushed,
+      // so local and remote ship identical content.
+      const stageTip = pipeline.lanes.find((l) => l.name === "stage")?.tip;
+      if (!stageTip) {
+        ui.status = c.red("✗ no stage tip to deploy to prod");
+        paint();
+        return;
+      }
+      ui.busy = true;
+      ui.status = c.yellow(`deploying ${stageTip.slice(0, 7)} → PRODUCTION (local)…`);
+      paint();
+      const res = await runLocalProdDeploy(cfg.repoPath, gap.to, stageTip, prodDeployCmd, {
+        onProgress: (m) => {
+          ui.status = c.yellow(m);
+          paint();
+        },
+      });
+      ui.status =
+        res.action === "deployed" ? c.green(`✓ ${res.message}`) : c.red(`✗ ${res.message}`);
+      ui.busy = false;
+      await refresh();
+      return;
+    }
 
     // Local stage deploy: [s] confirms an immediate deploy of origin/main (no git push).
     if (localStageDeploy && gap.to === "stage") {
@@ -834,7 +876,33 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
         break;
       case "y":
         if (ui.confirm !== null) {
+          // A prod gap offering both routes has no sane default — "y" would silently pick
+          // one of two very different actions, so make the operator name it.
+          if (promptOffersProdRoute(ui.confirm)) {
+            ui.status = c.yellow(
+              "prod: press [r] to deploy via GitHub Actions, or [l] to deploy locally",
+            );
+            break;
+          }
           void doPromote(ui.confirm);
+          return;
+        }
+        break;
+      // `r` is the CI-refresh key globally; while a prod prompt is open it means
+      // "remote". Both live in this one case — a second `case "r"` below would be
+      // unreachable and would silently kill CI refresh.
+      case "r":
+        if (ui.confirm !== null && promptOffersProdRoute(ui.confirm)) {
+          void doPromote(ui.confirm, "remote");
+          return;
+        }
+        // `paint` takes an optional `force`, so passing it directly makes the resolved
+        // value the argument — wrap it.
+        if (pipeline) void enrichCI(pipeline).then(() => paint());
+        break;
+      case "l":
+        if (ui.confirm !== null && promptOffersProdRoute(ui.confirm)) {
+          void doPromote(ui.confirm, "local");
           return;
         }
         break;
@@ -848,9 +916,6 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       case "f":
         void refresh();
         return;
-      case "r":
-        if (pipeline) void enrichCI(pipeline).then(paint);
-        break;
     }
     paint();
   }

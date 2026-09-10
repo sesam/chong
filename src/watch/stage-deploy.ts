@@ -13,7 +13,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { homedir } from "node:os";
 import path from "node:path";
 import { ensureShadow, runEslintFix, tryAgentLintFix } from "./checks";
-import { deployHistoryPath } from "./deploy-history";
+import { appendDeployHistory, deployHistoryPath } from "./deploy-history";
 import { formatLintSummary, isAgentableLintFailure, lintableChangedFiles, runEslint } from "./lint";
 import { repo } from "./repo";
 import { formatUnresolvedSummary, scanUnresolvedImports } from "./unresolved-imports";
@@ -100,6 +100,8 @@ export type RepoDeployConfig = {
   stageDeployCmd?: string;
   /** S3 bucket for the deployed-SHA marker. Omit to skip the marker entirely. */
   stageDeployedShaBucket?: string;
+  /** Local prod deploy command; overrides detection. Omit to disable local prod deploys. */
+  prodDeployCmd?: string;
 };
 
 export function loadRepoDeployConfig(repoPath: string): RepoDeployConfig {
@@ -163,6 +165,42 @@ export function defaultStageDeployCmd(repoPath: string): string | null {
   }
 
   return packageJsonStageDeploy(repoPath);
+}
+
+/** `deploy:prod` from the repo's own package.json, if it has one. */
+function packageJsonProdDeploy(repoPath: string): string | null {
+  const pkgPath = path.join(repoPath, "package.json");
+  if (!existsSync(pkgPath)) return null;
+  try {
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as {
+      scripts?: Record<string, string>;
+    };
+    return pkg?.scripts?.["deploy:prod"] ? "npm run deploy:prod" : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Command for a LOCAL prod deploy, or null when this repo has no way to do one.
+ *
+ * Null is meaningful: the TUI falls back to the original push-the-branch-only prompt
+ * when there is nothing to run locally, rather than offering a choice it cannot honour.
+ */
+export function defaultProdDeployCmd(repoPath: string): string | null {
+  const configured = loadRepoDeployConfig(repoPath).prodDeployCmd?.trim();
+  if (configured) return configured;
+
+  const pkg = packageJsonProdDeploy(repoPath);
+  if (pkg) return pkg;
+
+  if (hasFrontendStageDeployScript(repoPath)) {
+    // Same flags as the stage command — FORCE skips the tty prompt, CI makes pnpm
+    // non-interactive. The upload tool is auto-detected by the script.
+    return "CI=true FORCE=1 DEPLOY_SKIP_INSTALL=1 ./scripts/deploy-frontend.sh prod";
+  }
+
+  return null;
 }
 
 /**
@@ -506,6 +544,97 @@ async function unresolvedImportGate(
   };
 }
 
+/** Reset the shadow worktree to `sha` and give the deploy the same .env a manual run sees. */
+async function prepareShadow(
+  repoPath: string,
+  sha: string,
+): Promise<{ shadowPath?: string; error?: string }> {
+  const shadow = await ensureShadow(repoPath, sha);
+  if (shadow.error) return { error: shadow.error };
+
+  // Only `.env` — deliberately NOT `.env.local`. Vite loads .env.local after .env and it
+  // wins, so copying it would let a developer's localhost values into a real deploy.
+  const envSrc = path.join(repoPath, ".env");
+  const envDst = path.join(shadow.shadowPath, ".env");
+  if (existsSync(envSrc)) {
+    try {
+      await Bun.write(envDst, await Bun.file(envSrc).arrayBuffer());
+    } catch {
+      /* deploy script will warn */
+    }
+  }
+  return { shadowPath: shadow.shadowPath };
+}
+
+/**
+ * Build+upload PRODUCTION from a shadow worktree at `sha`, instead of pushing the `prod`
+ * branch and letting GitHub Actions do it.
+ *
+ * `sha` is the stage lane tip — the same commit `promote()` would have pushed — so local
+ * and remote prod deploys ship identical content and differ only in who runs the build.
+ *
+ * No eslint or unresolved-import gate here, unlike the stage path: this exact commit
+ * already passed both on its way to stage, and re-running the agent auto-fix at
+ * prod-promote time could mutate the tree at the worst possible moment.
+ *
+ * Advances the LOCAL `prod` ref only, never pushes it — pushing would trigger the CI prod
+ * job and deploy the same content a second time. The deploy script writes the S3 markers
+ * and the deploy-history row for us.
+ */
+export async function runLocalProdDeploy(
+  repoPath: string,
+  prodBranch: string,
+  sha: string,
+  deployCmd: string,
+  opts: { onProgress?: (msg: string) => void } = {},
+): Promise<StageDeployResult> {
+  const note = opts.onProgress ?? (() => {});
+  note(`deploy prod: resetting shadow to ${sha.slice(0, 7)}…`);
+
+  const shadow = await prepareShadow(repoPath, sha);
+  if (shadow.error || !shadow.shadowPath) {
+    return { action: "blocked", message: `shadow: ${shadow.error}`, sha };
+  }
+
+  note(`deploy prod: running ${deployCmd}…`);
+  const run = await runDeployCommand(shadow.shadowPath, deployCmd, deployHistoryPath(repoPath));
+  if (!run.ok) {
+    const tail = run.output.slice(-1500);
+    await notifyDiscordStage(
+      `🚨 FE PROD (chong local): deploy failed at ${sha.slice(0, 7)}\n\`\`\`\n${tail}\n\`\`\``,
+    );
+    return {
+      action: "error",
+      message: `prod deploy failed: ${tail.split("\n").slice(-3).join(" | ") || "non-zero exit"}`,
+      sha,
+    };
+  }
+
+  const refErr = await repo.setLocalBranch(repoPath, prodBranch, sha);
+  if (refErr) {
+    note(`deploy prod: live, but local ${prodBranch} ref update failed (${refErr.slice(0, 120)})`);
+  }
+
+  const tree = await repo.treeOf(repoPath, sha);
+  appendDeployHistory(repoPath, {
+    target: "prod-local",
+    tree: tree ?? "unknown",
+    commit: sha,
+    who: (await repo.userName(repoPath)) ?? process.env.USER ?? "unknown",
+  });
+
+  const discordOk = await notifyDiscordStage(
+    `🚀 FE PROD (chong local): deployed ${sha.slice(0, 7)} — local \`${prodBranch}\` advanced, not pushed`,
+  );
+  if (!discordOk) note("deploy prod: Discord notify failed");
+
+  return {
+    action: "deployed",
+    message: `deployed ${sha.slice(0, 7)} → production (local ${prodBranch} advanced, not pushed)`,
+    sha,
+  };
+}
+
 /**
  * Lint (CI parity) then build+upload to the CI bucket from origin/main tip.
  * Does not push the `stage` git branch.
@@ -555,6 +684,7 @@ export async function runLocalStageDeploy(
   }
 
   // Copy repo .env into shadow so Vite sees the same secrets as a manual local deploy.
+  // See prepareShadow for why .env.local is deliberately excluded.
   const envSrc = path.join(repoPath, ".env");
   const envDst = path.join(shadow.shadowPath, ".env");
   if (existsSync(envSrc)) {

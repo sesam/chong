@@ -27,6 +27,11 @@ export type UIState = {
     shaShort: string;
     secsLeft: number;
   } | null;
+  /**
+   * This repo can deploy prod locally, so the prod prompt offers [r]emote / [l]ocal
+   * instead of a bare [y]. False falls back to the original push-the-branch prompt.
+   */
+  canDeployProdLocally?: boolean;
 };
 
 const cols = () => process.stdout.columns || 100;
@@ -73,8 +78,10 @@ function gapRows(
   selected: boolean,
   confirming: boolean,
   localStageDeploy: boolean,
+  localProdDeploy = false,
 ): string[] {
   const stageLocal = localStageDeploy && gap.to === "stage";
+  const prodLocalOption = localProdDeploy && gap.to === "prod";
   const how = stageLocal ? "local deploy" : gap.ff ? "fast-forward" : "merge";
   const drift = gap.behind > 0 ? c.red(`  ⚠ ${gap.behind} behind (drift)`) : "";
 
@@ -84,6 +91,15 @@ function gapRows(
       body = c.bold(
         c.yellow(
           `▸ deploy ${gap.ahead} commit(s) from ${gap.from} → app-ci (no git push)?  [y] yes  [n] no`,
+        ),
+      );
+    } else if (prodLocalOption && gap.ff) {
+      // Prod can ship either way, and the two are not interchangeable: [r] hands the
+      // build to GitHub Actions, [l] builds and uploads from this machine. No [y] —
+      // a single "yes" would silently pick one of them.
+      body = c.bold(
+        c.yellow(
+          `▸ ship ${gap.ahead} commit(s) to PRODUCTION?  [r] remote (GitHub Actions)  [l] local deploy  [n] no`,
         ),
       );
     } else {
@@ -243,7 +259,9 @@ export function render(p: Pipeline, ui: UIState): string {
     if (i < p.gaps.length) {
       const selected = ui.selectedGap === i;
       const confirming = ui.confirm === i;
-      out.push(...gapRows(p.gaps[i], keys[i], selected, confirming, localStage));
+      out.push(
+        ...gapRows(p.gaps[i], keys[i], selected, confirming, localStage, !!ui.canDeployProdLocally),
+      );
     }
   }
   out.push("");
