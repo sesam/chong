@@ -401,4 +401,86 @@ describe("startClaimHeartbeat — serializes overlapping ticks", () => {
     stop();
     expect(called).toBe(false);
   });
+
+  test("a throwing heartbeat does not escape as an unhandled rejection", async () => {
+    // Regression for: beat() reaching Bun.spawn(["aws", ...]) with `aws` missing from PATH
+    // used to throw out of `tick`'s try/finally (no catch), and `void tick()` turned that
+    // into an unhandled rejection that killed the whole `chong watch` process.
+    let lostCalls = 0;
+    const notes: string[] = [];
+    const heartbeat = async (): Promise<boolean> => {
+      throw new Error("spawn aws ENOENT");
+    };
+
+    const stop = startClaimHeartbeat(
+      "bucket",
+      claim,
+      () => {
+        lostCalls += 1;
+      },
+      { heartbeat, intervalMs: 5, onProgress: (msg) => notes.push(msg) },
+    );
+
+    // If the throw escaped as an unhandled rejection, bun:test would fail this test (or the
+    // process would exit) well before this wait completes.
+    await wait(60);
+    stop();
+
+    expect(notes.some((n) => n.includes("spawn aws ENOENT"))).toBe(true);
+  });
+
+  test("repeated heartbeat failures eventually count as the claim being lost", async () => {
+    let lostCalls = 0;
+    const heartbeat = async (): Promise<boolean> => {
+      throw new Error("boom");
+    };
+
+    const stop = startClaimHeartbeat(
+      "bucket",
+      claim,
+      () => {
+        lostCalls += 1;
+      },
+      { heartbeat, intervalMs: 5 },
+    );
+
+    await wait(200);
+    stop();
+
+    // Not swallowed forever, and not triggered on the very first flaky tick either.
+    expect(lostCalls).toBe(1);
+  });
+
+  test("a hung heartbeat times out instead of wedging every later tick", async () => {
+    // Regression for the in-flight guard: with no timeout, a stalled `aws s3 cp` (no
+    // AbortSignal / timeout passed to Bun.spawn) left `inFlight` stuck true forever, and
+    // `if (lost || inFlight) return;` skipped every subsequent tick — the exact double-write
+    // the claim exists to prevent.
+    let calls = 0;
+    let lostCalls = 0;
+    const heartbeat = (): Promise<boolean> => {
+      calls += 1;
+      return new Promise(() => {
+        /* never resolves */
+      });
+    };
+
+    const stop = startClaimHeartbeat(
+      "bucket",
+      claim,
+      () => {
+        lostCalls += 1;
+      },
+      { heartbeat, intervalMs: 20, timeoutMs: 10 },
+    );
+
+    // Wait only long enough for the guard to have freed up and let a second attempt start
+    // (well short of HEARTBEAT_FAILURE_LIMIT consecutive timeouts) — the point being proven
+    // here is "the next tick isn't wedged", not "a permanently hung heartbeat never gives up".
+    await wait(35);
+    stop();
+
+    expect(calls).toBeGreaterThan(1);
+    expect(lostCalls).toBe(0);
+  });
 });
