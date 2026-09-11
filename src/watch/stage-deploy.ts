@@ -1010,9 +1010,13 @@ async function unresolvedImportGate(
 async function prepareShadow(
   repoPath: string,
   sha: string,
-  processId?: string,
+  processId: string,
 ): Promise<{ shadowPath?: string; error?: string }> {
-  const shadow = await ensureShadow(repoPath, sha, processId ? { processId } : undefined);
+  // `processId` is required: this resets the shared worktree, so it must hold the claim.
+  // It used to be optional and pass `undefined` through, which silently skipped the claim
+  // check entirely — the fourth such bypass, and the one that only surfaced once
+  // `ensureShadow` made the claim mandatory rather than opt-in.
+  const shadow = await ensureShadow(repoPath, sha, { processId });
   if (shadow.error) return { error: shadow.error };
 
   // Only `.env` — deliberately NOT `.env.local`. Vite loads .env.local after .env and it

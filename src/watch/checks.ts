@@ -16,7 +16,6 @@ import {
 import {
   type EslintError,
   formatLintSummary,
-  isAgentableLintFailure,
   lintableChangedFiles,
   runEslint,
 } from "./lint";
@@ -25,6 +24,7 @@ import { fetchDismissedPackageNames, parseGitHubSlug } from "./gh";
 import {
   acquireWorktreeClaim,
   formatWorktreeHolder,
+  type WorktreeAcquireResult,
 } from "./worktree-claim";
 import {
   type Untranslated,
@@ -38,24 +38,72 @@ import { repo } from "./repo";
 
 type Run = { ok: boolean; out: string; err: string };
 
-async function git(args: string[], cwd: string): Promise<Run> {
-  const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
-  const [out, err, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { ok: code === 0, out: out.trim(), err: err.trim() };
-}
-
-async function sh(cmd: string[], cwd: string): Promise<Run> {
+async function spawnCapture(cmd: string[], cwd: string): Promise<Run> {
   const proc = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "pipe" });
   const [out, err, code] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
-  return { ok: code === 0, out: out.trim(), err: err.trim() };
+  return { ok: code === 0, out, err };
+}
+
+async function git(args: string[], cwd: string): Promise<Run> {
+  const r = await spawnCapture(["git", ...args], cwd);
+  return { ok: r.ok, out: r.out.trim(), err: r.err.trim() };
+}
+
+/**
+ * Like {@link git} but keeps stdout byte-exact. Required for `-z` output: a path may
+ * legitimately begin or end with whitespace, which {@link git}'s `.trim()` would eat
+ * off the first/last NUL-separated field.
+ */
+async function gitZ(args: string[], cwd: string): Promise<Run> {
+  const r = await spawnCapture(["git", ...args], cwd);
+  return { ok: r.ok, out: r.out, err: r.err.trim() };
+}
+
+async function sh(cmd: string[], cwd: string): Promise<Run> {
+  const r = await spawnCapture(cmd, cwd);
+  return { ok: r.ok, out: r.out.trim(), err: r.err.trim() };
+}
+
+/**
+ * Paths from `git status --porcelain -z`.
+ *
+ * `--porcelain` without `-z` *quotes* any path with a space, a quote or a non-ASCII
+ * byte (`"a b.txt"`, `"\304\215.txt"`). Every site below compares those strings
+ * against `git diff-tree` output and then feeds them back to `git checkout --` /
+ * `git add --`, where the quoted spelling matches nothing — so the file was silently
+ * neither reverted nor staged, and a later `git add -A` swept it into an unrelated
+ * auto-fix commit. `-z` emits each path verbatim, NUL-terminated, and never quotes.
+ *
+ * Rename/copy entries (`R…`/`C…`) emit *two* NUL-terminated fields: the destination
+ * (in the entry) followed by the source path on its own. The source is consumed so it
+ * is not mistaken for a further entry.
+ */
+export function parseStatusZ(out: string): string[] {
+  const fields = out.split("\0").filter((f) => f.length > 0);
+  const paths: string[] = [];
+  for (let i = 0; i < fields.length; i++) {
+    const entry = fields[i];
+    const status = entry.slice(0, 2);
+    // "XY PATH" — two status letters, one space, then the path verbatim.
+    paths.push(entry.slice(3));
+    if (/[RC]/.test(status)) i++;
+  }
+  return paths;
+}
+
+/** Changed paths in `cwd`'s working tree + index, unquoted. See {@link parseStatusZ}. */
+async function statusPaths(cwd: string): Promise<string[]> {
+  const r = await gitZ(["status", "--porcelain", "-z"], cwd);
+  return parseStatusZ(r.out);
+}
+
+/** NUL-separated paths (`ls-files -z`, `diff-tree -z`, …), unquoted. */
+export function splitNulPaths(out: string): string[] {
+  return out.split("\0").filter(Boolean);
 }
 
 // Built via RegExp so the ESC control char isn't a literal in a regex (biome rule).
@@ -63,8 +111,10 @@ const ANSI_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
 const stripAnsi = (s: string) => s.replace(ANSI_RE, "");
 
 async function commitFiles(repoPath: string, sha: string): Promise<string[]> {
-  const r = await git(["diff-tree", "--no-commit-id", "-r", "--name-only", sha], repoPath);
-  return r.ok && r.out ? r.out.split("\n").filter(Boolean) : [];
+  // `-z`: `--name-only` otherwise quotes non-ASCII / space-bearing paths, which then
+  // fail to match the (unquoted) `git status` paths these are intersected with.
+  const r = await gitZ(["diff-tree", "--no-commit-id", "-r", "-z", "--name-only", sha], repoPath);
+  return r.ok ? splitNulPaths(r.out) : [];
 }
 
 /**
@@ -168,11 +218,14 @@ export async function scanRepoForUntranslated(
   pathspec?: string,
   includeExcluded = false,
 ): Promise<FileFindings[]> {
-  const ls = await git(pathspec ? ["ls-files", "--", pathspec] : ["ls-files"], repoPath);
+  // `-z` so non-ASCII paths arrive verbatim rather than as `"\304\215.vue"`, which
+  // would then fail to open and be silently skipped from the scan.
+  const lsArgs = pathspec ? ["ls-files", "-z", "--", pathspec] : ["ls-files", "-z"];
+  const ls = await gitZ(lsArgs, repoPath);
   if (!ls.ok) return [];
-  const files = ls.out
-    .split("\n")
-    .filter((f) => f && isScannable(f) && (includeExcluded || !isExcludedPath(f)));
+  const files = splitNulPaths(ls.out).filter(
+    (f) => isScannable(f) && (includeExcluded || !isExcludedPath(f)),
+  );
   const results: FileFindings[] = [];
   for (const file of files) {
     let content: string;
@@ -259,7 +312,43 @@ async function setAutoFixBlocker(
   );
 }
 
-export type ShadowInfo = { shadowPath: string; error: string | null };
+export type ShadowInfo = {
+  shadowPath: string;
+  error: string | null;
+  /**
+   * Outcome of the mandatory claim acquire. Surfaced instead of swallowed so a caller
+   * that holds a long-lived view of ownership (`chong watch`) learns that *this* call
+   * took the claim — otherwise the operator was told "no worktree ownership" while the
+   * process demonstrably held it, and every claim-gated action stayed disabled.
+   */
+  claim: WorktreeAcquireResult;
+  /**
+   * Non-fatal problems worth telling the operator about (e.g. a legacy worktree left
+   * in place because it had local work in it). Callers should de-duplicate: the same
+   * warning recurs on every call until the cause is dealt with by hand.
+   */
+  warnings?: string[];
+};
+
+/**
+ * Who owns the shadow worktree for the duration of this call.
+ *
+ * `processId` is deliberately **required**, and so is this whole options argument.
+ * `ensureShadow` runs `cherry-pick --abort`, `clean -fd` and `reset --hard` on a
+ * worktree several processes share; the claim is the only thing standing between that
+ * and another process's in-flight deploy or agent edit. While the claim was opt-in
+ * (`if (opts.processId)`), merely *forgetting* the argument was a silent, total bypass
+ * — and three callers had forgotten it. Making it mandatory moves that mistake from
+ * "destroys someone's work at runtime" to "does not compile". There is no unclaimed
+ * escape hatch because there is no read-only use of this function: every path below
+ * mutates the worktree.
+ */
+export type ShadowClaimOpts = {
+  /** Stable per-process id; the same one used for deploy claims. */
+  processId: string;
+  /** Operator override: take the claim even from a live foreign holder. */
+  forceWorktree?: boolean;
+};
 
 /**
  * Where chong keeps a repo's main-shadow worktree: under ~/.chong/worktrees/ rather
@@ -273,39 +362,70 @@ export function shadowPathFor(repoPath: string): string {
   return path.join(homedir(), ".chong", "worktrees", `${base}-main-shadow-${hash}`);
 }
 
-/** Ensure the main-shadow worktree exists and is hard-reset to `ref`. */
+/**
+ * Ensure the main-shadow worktree exists and is hard-reset to `ref`.
+ *
+ * Requires a worktree claim — see {@link ShadowClaimOpts} for why that is mandatory
+ * rather than optional.
+ */
 export async function ensureShadow(
   repoPath: string,
   ref: string,
-  opts: { processId?: string; forceWorktree?: boolean } = {},
+  opts: ShadowClaimOpts,
 ): Promise<ShadowInfo> {
   const shadowPath = shadowPathFor(repoPath);
   mkdirSync(path.dirname(shadowPath), { recursive: true });
+  const warnings: string[] = [];
 
-  if (opts.processId) {
-    const acquired = acquireWorktreeClaim(shadowPath, opts.processId, {
-      force: opts.forceWorktree,
-    });
-    if (!acquired.ok) {
-      return {
-        shadowPath,
-        error: `worktree claimed by ${formatWorktreeHolder(acquired.claim)} — wait or force-override`,
-      };
-    }
+  const claim = acquireWorktreeClaim(shadowPath, opts.processId, {
+    force: opts.forceWorktree,
+  });
+  if (!claim.ok) {
+    return {
+      shadowPath,
+      claim,
+      error: `worktree claimed by ${formatWorktreeHolder(claim.claim)} — wait or force-override`,
+    };
   }
+  const done = (error: string | null): ShadowInfo => ({
+    shadowPath,
+    claim,
+    error,
+    ...(warnings.length ? { warnings } : {}),
+  });
 
   // Prune stale worktree entries first
   await git(["worktree", "prune"], repoPath);
 
   // Migrate away from the old sibling location (../main-shadow), if one is still
   // registered, so we don't leave an orphaned worktree behind.
+  //
+  // Only when it is safe to: `worktree remove --force` on a path match alone also
+  // discards modified and untracked files, and `<repo parent>/main-shadow` is a name a
+  // user could plausibly have given a worktree of their own. So require both an empty
+  // `git status` (nothing to lose) and a detached HEAD (the shape *we* create — a
+  // worktree on a real branch is somebody's working copy, not our leftover). Otherwise
+  // warn and leave it alone; an orphaned registration is harmless next to lost work.
   const legacyPath = path.join(path.dirname(repoPath), "main-shadow");
   if (legacyPath !== shadowPath) {
     const reg = await git(["worktree", "list", "--porcelain"], repoPath);
     const legacyLinked = reg.out
       .split("\n")
       .some((l) => l.startsWith("worktree ") && l.slice("worktree ".length).trim() === legacyPath);
-    if (legacyLinked) await git(["worktree", "remove", "--force", legacyPath], repoPath);
+    if (legacyLinked) {
+      const dirty = await statusPaths(legacyPath);
+      const branchR = await git(["symbolic-ref", "--quiet", "HEAD"], legacyPath);
+      const detached = !branchR.ok;
+      if (dirty.length > 0 || !detached) {
+        warnings.push(
+          `legacy worktree ${legacyPath} left in place — ${
+            dirty.length > 0 ? `${dirty.length} uncommitted change(s)` : `on branch ${branchR.out}`
+          }; remove it by hand once you've saved anything you need`,
+        );
+      } else {
+        await git(["worktree", "remove", legacyPath], repoPath);
+      }
+    }
   }
 
   const listR = await git(["worktree", "list", "--porcelain"], repoPath);
@@ -315,7 +435,7 @@ export async function ensureShadow(
 
   if (!linked) {
     const addR = await git(["worktree", "add", "--detach", shadowPath, ref], repoPath);
-    if (!addR.ok) return { shadowPath, error: `worktree add: ${addR.err}` };
+    if (!addR.ok) return done(`worktree add: ${addR.err}`);
   } else {
     // Remove stale index.lock before touching the worktree
     const gitDirR = await git(["rev-parse", "--git-dir"], shadowPath);
@@ -334,7 +454,7 @@ export async function ensureShadow(
     await git(["merge", "--abort"], shadowPath);
     await git(["clean", "-fd"], shadowPath);
     const resetR = await git(["reset", "--hard", ref], shadowPath);
-    if (!resetR.ok) return { shadowPath, error: `reset to ${ref}: ${resetR.err}` };
+    if (!resetR.ok) return done(`reset to ${ref}: ${resetR.err}`);
   }
 
   // Symlink node_modules from the source repo — same lockfile, avoids pnpm hoisting
@@ -351,7 +471,7 @@ export async function ensureShadow(
   }
   symlinkSync(nmSource, nmLink);
 
-  return { shadowPath, error: null };
+  return done(null);
 }
 
 const MAX_INJECT = 30; // refuse runaway cherry-pick batches
@@ -458,6 +578,15 @@ export type ReconcileResult = {
 };
 
 export type ReconcileOpts = {
+  /**
+   * Worktree claim id, required for the same reason {@link ShadowClaimOpts} requires
+   * one: the diverged branch of this function resets main-shadow to the origin tip
+   * before replaying commits onto it. This type used to carry no claim field at all,
+   * so the `ensureShadow` call below ran unclaimed — and `maybeReconcileLocalMain`
+   * fires it on every poll cycle, which meant any watch reset the shared worktree the
+   * moment its local `main` diverged, deploy in flight or not.
+   */
+  processId: string;
   /** Try cursor-agent (Auto) on cherry-pick conflicts (default true when bin present). */
   agentResolve?: boolean;
   /** Local SHAs previously blocked for this local tip (patch-id mismatch / empty). */
@@ -480,7 +609,7 @@ export async function reconcileLocalMain(
   repoPath: string,
   remote: string,
   branch: string,
-  opts: ReconcileOpts = {},
+  opts: ReconcileOpts,
 ): Promise<ReconcileResult> {
   const agentResolve = opts.agentResolve !== false && !!findAgentBin();
   const skipShas = opts.skipShas;
@@ -544,7 +673,7 @@ export async function reconcileLocalMain(
     if (!pushErr) newTip = localSha;
   } else {
     // Diverged: replay local-only commits onto a clean shadow at origin tip.
-    const shadow = await ensureShadow(repoPath, originRef);
+    const shadow = await ensureShadow(repoPath, originRef, { processId: opts.processId });
     if (shadow.error) {
       return tip({
         action: "error",
@@ -693,47 +822,7 @@ export async function reconcileLocalMain(
   });
 }
 
-/**
- * Fast-forward `to` up to `from` on the remote when it's a clean FF with commits
- * queued. Returns null on success / nothing-to-do, else an error string.
- * Used by the manual promote UI (`[s]` / `[p]`), not by auto-inject/maintain.
- */
-export async function promoteFastForward(
-  repoPath: string,
-  remote: string,
-  from: string,
-  to: string,
-): Promise<string | null> {
-  const { ahead } = await repo.aheadBehind(repoPath, remote, from, to);
-  if (ahead === 0) return null;
-  if (!(await repo.isFastForward(repoPath, remote, from, to))) {
-    return `${from} → ${to} is not a fast-forward`;
-  }
-  return repo.pushFastForward(repoPath, remote, from, to);
-}
-
 const ESLINT_FIX_SUBJECT = "FIX: eslint";
-
-export type AutoPromoteResult = {
-  action: "noop" | "promoted" | "fixed" | "blocked";
-  message: string;
-};
-
-/** ESLint errors on the main→stage diff, mirroring CI's changed-files lint step. */
-export async function lintStageDiff(
-  repoPath: string,
-  shadowPath: string,
-  remote: string,
-  from: string,
-  to: string,
-): Promise<{ ok: boolean; files: string[]; errors: EslintError[]; output: string }> {
-  const fromRef = `${remote}/${to}`;
-  const toRef = `${remote}/${from}`;
-  const files = await lintableChangedFiles(git, shadowPath, fromRef, toRef);
-  if (files.length === 0) return { ok: true, files, errors: [], output: "" };
-  const run = await runEslint(shadowPath, files);
-  return { ok: run.ok, files, errors: run.errors, output: run.output };
-}
 
 /**
  * Run eslint --fix in shadow, commit only lintable files from the stage diff, push to main.
@@ -753,8 +842,8 @@ export async function runEslintFix(
 
   await runEslint(shadowPath, scope, true);
 
-  const statusR = await git(["status", "--porcelain"], shadowPath);
-  if (!statusR.out) {
+  const modified = await statusPaths(shadowPath);
+  if (modified.length === 0) {
     const check = await runEslint(shadowPath, scope);
     return {
       committed: false,
@@ -765,10 +854,6 @@ export async function runEslintFix(
     };
   }
 
-  const modified = statusR.out
-    .split("\n")
-    .filter(Boolean)
-    .map((l) => l.slice(3).trim());
   const toCommit = scope.filter((f) => modified.includes(f));
   const leftovers = modified.filter((f) => !scope.includes(f));
   const toRevert = leftovers;
@@ -838,8 +923,7 @@ export async function tryAgentLintFix(
     };
   }
 
-  const statusR = await git(["status", "--porcelain"], shadowPath);
-  if (!statusR.out) {
+  if ((await statusPaths(shadowPath)).length === 0) {
     return { fixed: false, message: "eslint agent: nothing to commit" };
   }
 
@@ -864,85 +948,6 @@ export async function tryAgentLintFix(
     await git(["update-ref", `refs/remotes/${remote}/${branch}`, head.out], repoPath);
   }
   return { fixed: true, message: `eslint agent fixed → pushed to ${branch}` };
-}
-
-/**
- * Lint the main→stage diff (CI parity), auto-fix when trivial, then fast-forward promote.
- * Only acts on the first pipeline gap when it is a clean fast-forward with commits queued.
- */
-export async function tryAutoPromoteStage(
-  repoPath: string,
-  remote: string,
-  from: string,
-  to: string,
-  opts: { agent?: boolean } = {},
-): Promise<AutoPromoteResult> {
-  const { ahead } = await repo.aheadBehind(repoPath, remote, from, to);
-  if (ahead === 0) return { action: "noop", message: "nothing queued" };
-  if (!(await repo.isFastForward(repoPath, remote, from, to))) {
-    return { action: "blocked", message: `${from} → ${to} is not a fast-forward — promote manually` };
-  }
-
-  const shadow = await ensureShadow(repoPath, `${remote}/${from}`);
-  if (shadow.error) {
-    return { action: "blocked", message: `shadow: ${shadow.error}` };
-  }
-
-  let lint = await lintStageDiff(repoPath, shadow.shadowPath, remote, from, to);
-  if (!lint.ok) {
-    const fix = await runEslintFix(repoPath, shadow.shadowPath, remote, from, from, to);
-    if (fix.committed && fix.pushed) {
-      await git(["reset", "--hard", `${remote}/${from}`], shadow.shadowPath);
-      lint = await lintStageDiff(repoPath, shadow.shadowPath, remote, from, to);
-    } else if (fix.committed) {
-      return { action: "blocked", message: fix.error ?? "eslint fix committed but push failed" };
-    }
-
-    if (!lint.ok) {
-      const errors = fix.errors ?? lint.errors;
-      const agentEnabled = opts.agent !== false && !!findAgentBin();
-      if (agentEnabled && isAgentableLintFailure(errors)) {
-        const summary = [
-          "ESLint errors on files in the main→stage promotion diff:",
-          formatLintSummary(errors),
-          "",
-          "Command output:",
-          lint.output.slice(0, 4000),
-        ].join("\n");
-        const agentRes = await tryAgentLintFix(
-          repoPath,
-          shadow.shadowPath,
-          summary,
-          lint.files,
-          remote,
-          from,
-        );
-        if (agentRes.fixed) {
-          await git(["reset", "--hard", `${remote}/${from}`], shadow.shadowPath);
-          lint = await lintStageDiff(repoPath, shadow.shadowPath, remote, from, to);
-          if (!lint.ok) {
-            return {
-              action: "blocked",
-              message: `eslint still failing after agent (${formatLintSummary(lint.errors).slice(0, 200)})`,
-            };
-          }
-        } else {
-          return { action: "blocked", message: agentRes.message };
-        }
-      } else {
-        const preview = formatLintSummary(errors).slice(0, 300);
-        return {
-          action: "blocked",
-          message: `eslint blocks stage deploy${preview ? `: ${preview}` : ""}`,
-        };
-      }
-    }
-  }
-
-  const err = await promoteFastForward(repoPath, remote, from, to);
-  if (err) return { action: "blocked", message: err };
-  await git(["fetch", "--quiet", remote, to], repoPath);
-  return { action: "promoted", message: `promoted ${from} → ${to} (fast-forward)` };
 }
 
 export type FixResult = {
@@ -989,13 +994,9 @@ export async function runI18nFix(
     };
   }
 
-  const statusR = await git(["status", "--porcelain"], shadowPath);
-  if (!statusR.out) return { committed: false, pushed: false, leftovers: [], error: null };
+  const changed = await statusPaths(shadowPath);
+  if (changed.length === 0) return { committed: false, pushed: false, leftovers: [], error: null };
 
-  const changed = statusR.out
-    .split("\n")
-    .filter(Boolean)
-    .map((l) => l.slice(3).trim());
   const poFiles = changed.filter((f) => f.endsWith(".po") || f.endsWith(".pot"));
   const leftovers = changed.filter((f) => !f.endsWith(".po") && !f.endsWith(".pot"));
 
@@ -1048,13 +1049,8 @@ export async function runFormatFix(
   await sh([cmd, ...cmdArgs], shadowPath);
   // Ignore exit code — formatters exit 1 when they modify files
 
-  const statusR = await git(["status", "--porcelain"], shadowPath);
-  if (!statusR.out) return { committed: false, pushed: false, leftovers: [], error: null };
-
-  const modified = statusR.out
-    .split("\n")
-    .filter(Boolean)
-    .map((l) => l.slice(3).trim());
+  const modified = await statusPaths(shadowPath);
+  if (modified.length === 0) return { committed: false, pushed: false, leftovers: [], error: null };
 
   const toCommit = files.filter((f) => modified.includes(f));
   const toRevert = modified.filter((f) => !files.includes(f));
@@ -1133,13 +1129,9 @@ export async function runLockfileFix(
     };
   }
 
-  const statusR = await git(["status", "--porcelain"], shadowPath);
-  if (!statusR.out) return { committed: false, pushed: false, leftovers: [], error: null };
+  const changed = await statusPaths(shadowPath);
+  if (changed.length === 0) return { committed: false, pushed: false, leftovers: [], error: null };
 
-  const changed = statusR.out
-    .split("\n")
-    .filter(Boolean)
-    .map((l) => l.slice(3).trim());
   const lockFiles = changed.filter(isLockfile);
   const leftovers = changed.filter((f) => !isLockfile(f));
 
@@ -1272,8 +1264,8 @@ export async function tryAgentI18nFix(
     return pause(`i18n still failing after agent — pausing auto-fix 2h (${excerpt})`);
   }
 
-  const statusR = await git(["status", "--porcelain"], shadowPath);
-  if (!statusR.out) {
+  const changed = await statusPaths(shadowPath);
+  if (changed.length === 0) {
     return { fixed: false, paused: false, message: "i18n agent: nothing to commit" };
   }
 
@@ -1281,10 +1273,6 @@ export async function tryAgentI18nFix(
     return pause("i18n agent left conflict markers — pausing auto-fix 2h");
   }
 
-  const changed = statusR.out
-    .split("\n")
-    .filter(Boolean)
-    .map((l) => l.slice(3).trim());
   await git(["add", "-A"], shadowPath);
   const commitR = await git(["commit", "-m", "FIX: i18n (agent)", "--no-verify"], shadowPath);
   if (!commitR.ok) {
@@ -1432,11 +1420,7 @@ export async function runMaintenance(
   if (!lock.ok) {
     step(`⚠ lockfile: pnpm install failed (${lock.err || lock.out})`);
   } else {
-    const lockDirty = (await git(["status", "--porcelain"], shadowPath)).out
-      .split("\n")
-      .filter(Boolean)
-      .map((l) => l.slice(3).trim())
-      .filter(isLockfile);
+    const lockDirty = (await statusPaths(shadowPath)).filter(isLockfile);
     if (lockDirty.length === 0) {
       step("✓ lockfile: in sync with package.json");
     } else {
@@ -1526,13 +1510,7 @@ export async function runMaintenance(
   onStep?.("i18n: running…");
   const [icmd, ...iargs] = cmds.i18n.trim().split(/\s+/);
   const i18n = await sh([icmd, ...iargs], shadowPath);
-  const i18nStatus = (await git(["status", "--porcelain"], shadowPath)).out;
-  const changed = i18nStatus
-    ? i18nStatus
-        .split("\n")
-        .filter(Boolean)
-        .map((l) => l.slice(3).trim())
-    : [];
+  const changed = await statusPaths(shadowPath);
   // Only count files with genuine entry changes — ignore .po/.pot files left
   // dirty by auto-regenerated comment churn (which needs no translation work).
   const meaningful: string[] = [];

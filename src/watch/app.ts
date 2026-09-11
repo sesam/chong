@@ -8,6 +8,7 @@ import {
   ensureShadow,
   isAutoFix,
   reconcileLocalMain,
+  type ShadowInfo,
   runFormatFix,
   runI18nFix,
   runLockfileFix,
@@ -62,6 +63,13 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
    * time — the free/stale path never touches this and stays a single keypress.
    */
   let pendingWorktreeOverride: WorktreeClaim | null = null;
+  /**
+   * The holder we last told the operator about when skipping inject/reconcile. Unlike
+   * auto-maintain (queued on a handful of triggers), reconcile is attempted on every
+   * poll, so an unconditional notice would refill the notice list with the same line
+   * every second. One notice per holder — repeated only if ownership changes hands.
+   */
+  let reconcileSkipNoticeFor: string | null = null;
 
   let pipeline: Pipeline | null = null;
   let baseline: Set<string> | null = null; // remote incoming shas at the moment watch started
@@ -108,6 +116,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   }
 
   function injectOpts(localTip: string | null | undefined): {
+    processId: string;
     agentResolve: boolean;
     skipShas: ReadonlySet<string>;
   } {
@@ -115,7 +124,9 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       injectBlockedShas.clear();
       injectBlockedForLocalTip = null;
     }
-    return { agentResolve: agentEnabled, skipShas: injectBlockedShas };
+    // `processId` so reconcile's diverged path resets main-shadow under *our* claim
+    // rather than unclaimed — see ReconcileOpts.
+    return { processId, agentResolve: agentEnabled, skipShas: injectBlockedShas };
   }
 
   const ui: UIState = {
@@ -161,6 +172,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       worktreeOwned = true;
       foreignWorktreeClaim = null;
       lastWorktreeTouchAt = Date.now();
+      reconcileSkipNoticeFor = null;
       if (res.forced && prev && prev.id !== processId) {
         addNotice(c.yellow(`⚒ worktree claim forced — was ${formatWorktreeHolder(prev)}`));
       }
@@ -198,6 +210,39 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
 
   function shadowOpts(forceWorktree = false): { processId: string; forceWorktree?: boolean } {
     return { processId, ...(forceWorktree ? { forceWorktree: true } : {}) };
+  }
+
+  /** Shadow warnings already shown — they recur on every call until dealt with by hand. */
+  const shownShadowWarnings = new Set<string>();
+
+  /**
+   * `ensureShadow` + reconcile our view of ownership with what its (mandatory) claim
+   * acquire actually did.
+   *
+   * The acquire used to be swallowed inside `ensureShadow`, so a claim taken by, say,
+   * the post-commit check pass never reached `worktreeOwned` here: the operator was
+   * told "no worktree ownership" and every claim-gated action stayed off while this
+   * process demonstrably held the claim. Going through this wrapper means the app's
+   * view of ownership is whatever the filesystem last told us, in both directions.
+   */
+  async function ensureOwnedShadow(repoPath: string, ref: string): Promise<ShadowInfo> {
+    const shadow = await ensureShadow(repoPath, ref, shadowOpts());
+    if (shadow.claim.ok) {
+      if (!worktreeOwned) addNotice(c.dim("worktree claim acquired during shadow work"));
+      worktreeOwned = true;
+      foreignWorktreeClaim = null;
+      lastWorktreeTouchAt = Date.now();
+      reconcileSkipNoticeFor = null;
+    } else {
+      worktreeOwned = false;
+      foreignWorktreeClaim = shadow.claim.claim;
+    }
+    for (const w of shadow.warnings ?? []) {
+      if (shownShadowWarnings.has(w)) continue;
+      shownShadowWarnings.add(w);
+      addNotice(c.yellow(`⚠ ${w}`));
+    }
+    return shadow;
   }
 
   function syncStageDeployUi(): void {
@@ -419,7 +464,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
             return;
           }
         }
-        const shadow = await ensureShadow(repoPath, `${remote}/${headBranch}`, shadowOpts());
+        const shadow = await ensureOwnedShadow(repoPath, `${remote}/${headBranch}`);
         if (shadow.error) {
           addNotice(c.red(`✗ auto-maintain shadow: ${shadow.error}`));
           return;
@@ -493,7 +538,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
 
     if (src !== "remote") return;
 
-    const shadow = await ensureShadow(repoPath, `${remote}/${headBranch}`, shadowOpts());
+    const shadow = await ensureOwnedShadow(repoPath, `${remote}/${headBranch}`);
     if (shadow.error) {
       addNotice(c.red(`✗ shadow: ${shadow.error}`));
       paint();
@@ -612,6 +657,19 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     }
   }
 
+  function noteReconcileSkipped(): void {
+    const holderId = foreignWorktreeClaim?.id ?? "none";
+    if (reconcileSkipNoticeFor === holderId) return;
+    reconcileSkipNoticeFor = holderId;
+    addNotice(
+      c.dim(
+        foreignWorktreeClaim
+          ? `inject skipped — worktree owned by ${formatWorktreeHolder(foreignWorktreeClaim)} ([o] override)`
+          : "inject skipped — no worktree ownership",
+      ),
+    );
+  }
+
   /**
    * If local `main` (head lane) has commits origin lacks, land them via push or
    * cherry-pick onto main-shadow. Stage deploy cooldown is armed after inject.
@@ -622,6 +680,14 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     if (!pipeline || reconciling) return;
     const headBranch = pipeline.lanes[0]?.name;
     if (!headBranch) return;
+    // Same gate as queueAutoMaintain, and for the same reason: reconcile's diverged
+    // path resets main-shadow to the origin tip. This runs from refresh() on *every*
+    // poll cycle, so without the gate a watch that does not own the worktree wiped it
+    // the moment its local `main` diverged — mid-deploy or mid-agent-edit included.
+    if (!worktreeOwned) {
+      noteReconcileSkipped();
+      return;
+    }
 
     reconciling = true;
     const run = async (): Promise<void> => {
@@ -930,7 +996,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
           }
         }
 
-        const shadow = await ensureShadow(repoPath, `${remote}/${headBranch}`, shadowOpts());
+        const shadow = await ensureOwnedShadow(repoPath, `${remote}/${headBranch}`);
         if (shadow.error) {
           ui.maintenance = { running: false, steps: [`✗ shadow: ${shadow.error}`], prompts: [] };
           return;

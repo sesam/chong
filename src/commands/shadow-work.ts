@@ -1,6 +1,18 @@
 import { c, parseArgs } from "../util";
-import { checkI18n, ensureShadow, isAutoFix, runFormatFix, runI18nFix } from "../watch/checks";
+import {
+  checkI18n,
+  ensureShadow,
+  isAutoFix,
+  runFormatFix,
+  runI18nFix,
+  shadowPathFor,
+} from "../watch/checks";
 import { repo } from "../watch/repo";
+import {
+  acquireWorktreeClaim,
+  formatWorktreeHolder,
+  releaseWorktreeClaim,
+} from "../watch/worktree-claim";
 
 const log = (s: string) => process.stdout.write(`${s}\n`);
 
@@ -46,14 +58,60 @@ export async function cmdShadowWork(argv: string[]): Promise<void> {
     log(c.yellow("⚠ .po/.pot changed without i18n code changes"));
   }
 
+  // Claim the shared main-shadow worktree before touching it.
+  //
+  // Everything above is read-only against the source repo, so the claim is taken here
+  // rather than up front — no point blocking a `chong watch` while we only print a
+  // diff summary. Below this line we reset the worktree hard, so we must own it: this
+  // command used to proceed unclaimed and could `clean -fd` / `reset --hard` under a
+  // watch's in-flight deploy, then commit and push its own result on top.
+  //
+  // This is a new refusal, and deliberate: `shadow-work` now declines while a watch
+  // owns the worktree instead of silently fighting it.
+  const processId = crypto.randomUUID();
+  const shadowPath = shadowPathFor(repoPath);
+  const claim = acquireWorktreeClaim(shadowPath, processId);
+  if (!claim.ok) {
+    log("");
+    log(c.red(`✗ main-shadow is claimed by ${formatWorktreeHolder(claim.claim)}`));
+    log(
+      c.dim(
+        "  That process (most likely a `chong watch`) may be mid-deploy or mid-agent-edit\n" +
+          "  in the shared worktree. shadow-work will not reset a worktree it does not own.\n" +
+          "  Wait for it to finish, stop it, or use that watch's [o] override.",
+      ),
+    );
+    return;
+  }
+
+  try {
+    await runShadowFixes(repoPath, ref, tip, remote, headBranch, formatCmd, processId);
+  } finally {
+    // Best effort: a Ctrl-C that kills us outright leaves the claim behind, and the
+    // stale window (20m) is what clears it. That is the same bargain `chong watch` makes.
+    releaseWorktreeClaim(shadowPath, processId);
+  }
+}
+
+/** The mutating half of `chong shadow-work`, run under an acquired worktree claim. */
+async function runShadowFixes(
+  repoPath: string,
+  ref: string,
+  tip: string,
+  remote: string,
+  headBranch: string,
+  formatCmd: string,
+  processId: string,
+): Promise<void> {
   // Set up shadow worktree
   process.stdout.write("  shadow setup… ");
-  const shadow = await ensureShadow(repoPath, ref);
+  const shadow = await ensureShadow(repoPath, ref, { processId });
   if (shadow.error) {
     log(c.red(`✗ ${shadow.error}`));
     return;
   }
   log(c.dim(`${shadow.shadowPath}`));
+  for (const w of shadow.warnings ?? []) log(c.yellow(`  ⚠ ${w}`));
 
   // i18n auto-fix
   process.stdout.write("  pnpm i18n… ");
