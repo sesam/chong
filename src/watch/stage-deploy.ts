@@ -13,6 +13,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { c } from "../util";
 import { ensureShadow, runEslintFix, tryAgentLintFix } from "./checks";
 import {
   acquireDeployClaim,
@@ -186,6 +187,65 @@ export function prodDeployedShaBucket(repoPath: string): string | null {
   return loadRepoDeployConfig(repoPath).prodDeployedShaBucket?.trim() || null;
 }
 
+/**
+ * Shell metacharacters refused in a CONFIGURED deploy command.
+ *
+ * `.chong/config.json` is *deliberately committed* to each watched repo (chong's own
+ * `.gitignore` rule is `.chong/*` + `!.chong/config.json` — see {@link ensureChongIgnored}).
+ * Its `stageDeployCmd` / `prodDeployCmd` is executed via `bash -c` with the operator's full
+ * environment, AWS credentials included. So anyone who can land a commit in a watched repo
+ * — or any supply-chain compromise of it — would otherwise get arbitrary code execution on
+ * the operator's laptop. This does not sanitize the string (there is no safe rewrite of
+ * shell syntax we did not ask for); it refuses to run it at all.
+ *
+ * Deliberately narrow: only characters that let repo-supplied text escape "one command,
+ * plain args" and reach the shell itself (command separators/substitution/redirection).
+ * `=` and spaces are untouched — `defaultStageDeployCmd`'s own built-in
+ * `"CI=true FORCE=1 DEPLOY_SKIP_INSTALL=1 ./scripts/deploy-frontend.sh ci"` must keep
+ * working, and it is chong's own trusted string, not repo-supplied.
+ */
+const FORBIDDEN_CMD_CHARS = /[;|&$`()<>\n\r]/;
+
+function describeForbiddenChar(ch: string): string {
+  if (ch === "\n") return "\\n (newline)";
+  if (ch === "\r") return "\\r (carriage return)";
+  return `"${ch}"`;
+}
+
+/**
+ * Validate a deploy command that came from the watched repo's own `.chong/config.json`.
+ *
+ * Returns the command unchanged when it is safe. When it contains a forbidden shell
+ * metacharacter, refuses to run anything and returns null — the same "no deploy command"
+ * state the caller is already in for a repo with none configured — rather than trying to
+ * strip/escape and run a neutered version of what the config asked for. Also prints a
+ * clear, actionable message so the refusal is not silent (this runs at `chong watch`
+ * startup, before the TUI takes the alt screen, so it lands in normal scrollback).
+ *
+ * NOT applied to `packageJsonStageDeploy` / `packageJsonProdDeploy`: those return a fixed
+ * `"npm run deploy:stage"` / `"npm run deploy:prod"` literal — chong's own string, gated
+ * only by whether the script key exists, never repo-supplied text — so there is nothing
+ * for a compromised repo to inject there. Also NOT applied in `resolveStageDeployCmd`'s
+ * `configured` parameter: that value comes from the operator's own `--stage-deploy-cmd`
+ * CLI flag (see `src/commands/watch.ts`), which the operator typed themselves — trusted,
+ * not repo config.
+ */
+function rejectUnsafeConfiguredCmd(
+  repoPath: string,
+  key: "stageDeployCmd" | "prodDeployCmd",
+  cmd: string,
+): string | null {
+  const match = cmd.match(FORBIDDEN_CMD_CHARS);
+  if (!match) return cmd;
+  const target = key === "stageDeployCmd" ? "stage" : "production";
+  console.error(
+    c.red(
+      `chong: refusing .chong/config.json "${key}" (${repoPath}) — contains shell metacharacter ${describeForbiddenChar(match[0])}. A committed repo config must not be able to inject shell syntax into commands run with the operator's environment. Treating this repo as though no local ${target} deploy command were configured.`,
+    ),
+  );
+  return null;
+}
+
 /** `deploy:stage` from the repo's own package.json, if it has one. */
 function packageJsonStageDeploy(repoPath: string): string | null {
   const pkgPath = path.join(repoPath, "package.json");
@@ -207,7 +267,7 @@ function packageJsonStageDeploy(repoPath: string): string | null {
  */
 export function defaultStageDeployCmd(repoPath: string): string | null {
   const configured = loadRepoDeployConfig(repoPath).stageDeployCmd?.trim();
-  if (configured) return configured;
+  if (configured) return rejectUnsafeConfiguredCmd(repoPath, "stageDeployCmd", configured);
 
   if (hasFrontendStageDeployScript(repoPath)) {
     // No DEPLOY_S3_TOOL: the deploy script resolves it itself — s5cmd when installed,
@@ -245,7 +305,7 @@ function packageJsonProdDeploy(repoPath: string): string | null {
  */
 export function defaultProdDeployCmd(repoPath: string): string | null {
   const configured = loadRepoDeployConfig(repoPath).prodDeployCmd?.trim();
-  if (configured) return configured;
+  if (configured) return rejectUnsafeConfiguredCmd(repoPath, "prodDeployCmd", configured);
 
   const pkg = packageJsonProdDeploy(repoPath);
   if (pkg) return pkg;
@@ -447,6 +507,21 @@ async function claimOrDefer(
     };
   }
 
+  if (acquired.reason === "no-bucket") {
+    // Not a write failure: acquireDeployClaim never got as far as writing anything. This
+    // repo's .chong/config.json is missing the marker bucket key for this target — a config
+    // gap, distinct from an S3 write failing.
+    const key = target === "stage" ? "stageDeployedShaBucket" : "prodDeployedShaBucket";
+    return {
+      proceed: false,
+      result: {
+        action: "error",
+        message: `no ${key} configured in .chong/config.json — cannot claim a ${target} deploy marker bucket`,
+        sha,
+      },
+    };
+  }
+
   return {
     proceed: false,
     result: {
@@ -600,6 +675,9 @@ export function liveTipCoversSha(
   return false;
 }
 
+/** Grace period between SIGTERM and SIGKILL when an abort has to reach a process group. */
+const ABORT_KILL_GRACE_MS = 5_000;
+
 async function runDeployCommand(
   shadowPath: string,
   cmd: string,
@@ -611,10 +689,18 @@ async function runDeployCommand(
 ): Promise<{ ok: boolean; output: string; aborted?: boolean }> {
   // Use `bash -c` (not `-lc`): a login shell sources sdkman/zsh helpers that break
   // under macOS /bin/bash 3.2 (`${var^^}` bad substitution) and can hang on prompts.
+  //
+  // `detached: true` makes this shell its own process group leader (POSIX `setsid`), so
+  // an abort below can signal the whole tree instead of just `bash`. Without it, the real
+  // uploaders — `s5cmd` / `aws s3 sync`, spawned as children of the shell — survive a kill
+  // of the `bash` pid alone and keep writing to the deploy bucket after chong has already
+  // reported the deploy aborted, sometimes interleaving with a deploy another watch starts
+  // after taking over the claim.
   const proc = Bun.spawn(["bash", "-c", cmd], {
     cwd: shadowPath,
     stdout: "pipe",
     stderr: "pipe",
+    detached: true,
     env: {
       ...process.env,
       CI: "true",
@@ -628,15 +714,25 @@ async function runDeployCommand(
     },
   });
 
-  let aborted = false;
-  const poll = setInterval(() => {
-    if (!opts.shouldAbort?.()) return;
-    aborted = true;
+  // Negative pid signals the whole process group `detached` created above, not just
+  // `bash`. The group can already be gone by the time this fires (bash and its children
+  // exited on their own between polls) — ESRCH there is expected, not a bug.
+  const killGroup = (signal: "SIGTERM" | "SIGKILL") => {
     try {
-      proc.kill();
+      process.kill(-proc.pid, signal);
     } catch {
-      /* already exited */
+      /* process group already gone */
     }
+  };
+
+  let aborted = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const poll = setInterval(() => {
+    if (aborted || !opts.shouldAbort?.()) return;
+    aborted = true;
+    killGroup("SIGTERM");
+    // Escalate if the tree ignores SIGTERM (e.g. an uploader mid-syscall).
+    killTimer = setTimeout(() => killGroup("SIGKILL"), ABORT_KILL_GRACE_MS);
   }, 2_000);
 
   const [stdout, stderr] = await Promise.all([
@@ -644,6 +740,7 @@ async function runDeployCommand(
     new Response(proc.stderr).text(),
   ]);
   clearInterval(poll);
+  if (killTimer) clearTimeout(killTimer);
   const code = await proc.exited;
   const output = `${stdout}\n${stderr}`.trim();
   if (aborted) {
@@ -656,25 +753,44 @@ async function runDeployCommand(
   return { ok: code === 0, output };
 }
 
-/** Heartbeat the S3 claim while an upload runs; invoke onLost if stolen. */
-function startClaimHeartbeat(
+/**
+ * Heartbeat the S3 claim while an upload runs; invoke onLost if stolen.
+ *
+ * `opts.heartbeat` / `opts.intervalMs` exist only so tests can inject a slow fake and a
+ * short interval without touching real S3 or waiting on the real {@link CLAIM_HEARTBEAT_MS}.
+ */
+export function startClaimHeartbeat(
   bucket: string | null,
   claim: DeployClaim | null,
   onLost: () => void,
+  opts: {
+    heartbeat?: (bucket: string, claim: DeployClaim) => Promise<boolean>;
+    intervalMs?: number;
+  } = {},
 ): () => void {
   if (!bucket || !claim) return () => {};
+  const beat = opts.heartbeat ?? heartbeatDeployClaim;
+  const intervalMs = opts.intervalMs ?? CLAIM_HEARTBEAT_MS;
   let lost = false;
+  // In-flight guard: a slow S3 round-trip must not let the next tick stack on top of it —
+  // overlapping heartbeats can complete out of order and race the claim-release logic.
+  let inFlight = false;
   const tick = async () => {
-    if (lost) return;
-    const ok = await heartbeatDeployClaim(bucket, claim);
-    if (!ok) {
-      lost = true;
-      onLost();
+    if (lost || inFlight) return;
+    inFlight = true;
+    try {
+      const ok = await beat(bucket, claim);
+      if (!ok) {
+        lost = true;
+        onLost();
+      }
+    } finally {
+      inFlight = false;
     }
   };
   const timer = setInterval(() => {
     void tick();
-  }, CLAIM_HEARTBEAT_MS);
+  }, intervalMs);
   void tick();
   return () => clearInterval(timer);
 }
