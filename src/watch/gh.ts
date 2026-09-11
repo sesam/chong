@@ -1,13 +1,28 @@
 import type { CIState } from "./types";
 
+/**
+ * Run `gh`. Every caller here treats a failure as a normal, handled outcome (empty set,
+ * "unknown" state, an error string) — so a missing `gh` binary must land the same way,
+ * not as a crash. `Bun.spawn` throws synchronously (e.g. ENOENT when `gh` isn't on
+ * PATH — frequently the case) rather than only rejecting the resulting promise, and
+ * nothing upstream of this function catches that: it used to escape as an unhandled
+ * exception and kill `chong watch` outright on any GitHub-remote repo, seconds after
+ * start, leaving the terminal stuck in the TUI's alt screen and the worktree claim held
+ * for its full stale window. Wrapping the spawn (and the drain, in case a signal kills
+ * the process mid-read) keeps every failure inside this function's normal return shape.
+ */
 async function gh(args: string[], cwd: string): Promise<{ ok: boolean; out: string; err: string }> {
-  const proc = Bun.spawn(["gh", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
-  const [out, err] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  const code = await proc.exited;
-  return { ok: code === 0, out: out.trim(), err: err.trim() };
+  try {
+    const proc = Bun.spawn(["gh", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+    const [out, err] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const code = await proc.exited;
+    return { ok: code === 0, out: out.trim(), err: err.trim() };
+  } catch (e) {
+    return { ok: false, out: "", err: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 /** Parse "OWNER/REPO" from a GitHub remote URL, or null for non-GitHub remotes. */

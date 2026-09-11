@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { chmod, mkdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { git } from "./git";
 
@@ -28,10 +28,28 @@ export async function readState(): Promise<LocalState> {
   return JSON.parse(await Bun.file(p).text()) as LocalState;
 }
 
+/**
+ * Persist local CL state. As in `src/config.ts`'s `writeAuth`, `Bun.write` leaves the file
+ * at the umask default (commonly 0644, world-readable) with no mode of its own, so the
+ * containing `.chong/` dir and this file are locked down the same way: dir 0700, file
+ * 0600, applied even when either already existed with looser permissions. Best-effort —
+ * a chmod failure is reported, not fatal.
+ */
 export async function writeState(s: LocalState): Promise<void> {
   const p = await statePath();
-  await mkdir(dirname(p), { recursive: true });
+  const dir = dirname(p);
+  await mkdir(dir, { recursive: true });
+  try {
+    await chmod(dir, 0o700);
+  } catch (e) {
+    console.error(`chong: could not chmod ${dir} to 0700 (${e instanceof Error ? e.message : e})`);
+  }
   await Bun.write(p, JSON.stringify(s, null, 2));
+  try {
+    await chmod(p, 0o600);
+  } catch (e) {
+    console.error(`chong: could not chmod ${p} to 0600 (${e instanceof Error ? e.message : e})`);
+  }
 }
 
 export async function findCLByCwd(cwd: string): Promise<string | null> {
