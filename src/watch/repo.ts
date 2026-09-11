@@ -21,13 +21,19 @@ async function git(args: string[], cwd: string, env?: Record<string, string>): P
   return { ok: code === 0, out: out.trim(), err: err.trim(), code };
 }
 
-/** Files touched by a patch, parsed from `git apply --numstat` (last tab field). */
+/**
+ * Files touched by a patch, parsed from `git apply --numstat` (last tab field).
+ * `-z` NUL-terminates records instead of newline-separating them, which also turns off
+ * git's C-style quoting of paths with spaces or non-ASCII bytes (`"a b.txt"`,
+ * `"\304\215.txt"`) — without it those paths come back quoted and don't match a real
+ * file, so the later `git reset -- <paths>` silently resyncs nothing for them.
+ */
 async function pathsInPatch(cwd: string, patchFile?: string): Promise<string[]> {
   if (!patchFile) return [];
-  const r = await git(["apply", "--numstat", "--", patchFile], cwd);
+  const r = await git(["apply", "--numstat", "-z", "--", patchFile], cwd);
   if (!r.ok || !r.out) return [];
   return r.out
-    .split("\n")
+    .split("\0")
     .map((line) => line.split("\t").pop()?.trim() ?? "")
     .filter(Boolean);
 }
@@ -44,19 +50,47 @@ export type CommitInput = {
 
 export type CommitResult = { sha: string | null; error: string | null };
 
-const SEP = "\x1f"; // unit separator — safe field delimiter inside commit metadata
+export const SEP = "\x1f"; // unit separator — safe field delimiter inside commit metadata
 const FORMAT = ["%H", "%an", "%ar", "%aI", "%s"].join(SEP);
 
-function parseCommit(line: string): Commit | null {
+/** Cap applied after sanitizing an untrusted commit-metadata field. */
+const COMMIT_AUTHOR_MAX_LEN = 100;
+const COMMIT_SUBJECT_MAX_LEN = 300;
+
+/**
+ * Neutralize ANSI/OSC escapes, C0/C1 control characters, and zero-width/bidi-override
+ * tricks in text pulled out of `git log` (author name, commit subject), then cap its
+ * length. Landing a single commit — no marker-bucket write access required — is enough
+ * to put arbitrary bytes here, and `render.ts` prints both fields straight through, so
+ * this has to happen at the parse boundary rather than at each render call site.
+ *
+ * Same allowlist approach as the claim-field sanitizer in worktree-claim.ts /
+ * deploy-claim.ts: NFC-normalize, then keep only \p{L}\p{N}\p{P}\p{Zs} (letters, digits,
+ * punctuation, plain spaces). Everything outside that set — C0/C1 controls, raw
+ * ESC/BEL/CSI/OSC bytes, zero-width joiners, bidi override/embedding characters, and
+ * other Unicode format (\p{Cf}) codepoints — is dropped. Unlike the claim sanitizer this
+ * runs on user-facing prose (a commit subject is free text, not an identity string), so
+ * normal punctuation and accented Latin survive intact.
+ *
+ * TODO(unify): when the shared claim-field sanitizer helper lands (it's being extracted
+ * from worktree-claim.ts / deploy-claim.ts concurrently with this change), swap this for
+ * that helper — same allowlist, just needs a shared export to call instead.
+ */
+export function sanitizeCommitText(value: string, maxLen: number): string {
+  const printable = value.normalize("NFC").replace(/[^\p{L}\p{N}\p{P}\p{Zs}]/gu, "");
+  return printable.slice(0, maxLen);
+}
+
+export function parseCommit(line: string): Commit | null {
   const [sha, author, rel, iso, ...subjectParts] = line.split(SEP);
   if (!sha) return null;
   return {
     sha,
     short: sha.slice(0, 7),
-    author: author ?? "",
+    author: sanitizeCommitText(author ?? "", COMMIT_AUTHOR_MAX_LEN),
     rel: shortRel(rel ?? ""),
     iso: iso ?? "",
-    subject: subjectParts.join(SEP),
+    subject: sanitizeCommitText(subjectParts.join(SEP), COMMIT_SUBJECT_MAX_LEN),
   };
 }
 

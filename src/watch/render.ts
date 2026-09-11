@@ -42,9 +42,64 @@ export type UIState = {
 
 const cols = () => process.stdout.columns || 100;
 
+/**
+ * Grapheme clusters of `s` — a base letter plus any combining marks, or a ZWJ/emoji
+ * sequence, counts as one visual unit rather than one per code point. Falls back to
+ * splitting on code points (still better than raw UTF-16 units for astral characters)
+ * when `Intl.Segmenter` isn't available.
+ */
+function graphemes(s: string): string[] {
+  const Seg = (Intl as unknown as { Segmenter?: typeof Intl.Segmenter }).Segmenter;
+  if (!Seg) return Array.from(s);
+  return Array.from(new Seg(undefined, { granularity: "grapheme" }).segment(s), (x) => x.segment);
+}
+
+// Code point ranges rendered double-width by (nearly) every terminal: CJK ideographs,
+// Hangul, kana, fullwidth forms, etc. Not exhaustive, but covers the common wide scripts
+// well enough to keep column layout from drifting on wide input.
+const WIDE_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x1100, 0x115f],
+  [0x2e80, 0x303e],
+  [0x3041, 0x33ff],
+  [0x3400, 0x4dbf],
+  [0x4e00, 0x9fff],
+  [0xa000, 0xa4cf],
+  [0xac00, 0xd7a3],
+  [0xf900, 0xfaff],
+  [0xfe30, 0xfe4f],
+  [0xff00, 0xff60],
+  [0xffe0, 0xffe6],
+  [0x20000, 0x2fffd],
+  [0x30000, 0x3fffd],
+];
+
+function clusterWidth(cluster: string): number {
+  const cp = cluster.codePointAt(0);
+  if (cp === undefined) return 0;
+  for (const [lo, hi] of WIDE_RANGES) if (cp >= lo && cp <= hi) return 2;
+  return 1;
+}
+
+/** Display width of `s`, counting wide (CJK-ish) grapheme clusters as 2 columns. */
+export function stringWidth(s: string): number {
+  let w = 0;
+  for (const g of graphemes(s)) w += clusterWidth(g);
+  return w;
+}
+
+/** Truncate `s` to a display width of `n`, respecting grapheme clusters and wide chars. */
 function trunc(s: string, n: number): string {
   if (n <= 1) return "";
-  return s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+  if (stringWidth(s) <= n) return s;
+  let out = "";
+  let w = 0;
+  for (const g of graphemes(s)) {
+    const gw = clusterWidth(g);
+    if (w + gw > n - 1) break;
+    out += g;
+    w += gw;
+  }
+  return `${out}…`;
 }
 
 function ciBadge(ci: CIState): string {
@@ -73,8 +128,9 @@ function laneRow(lane: Lane): string {
   const subj = lane.commit?.subject ?? "(no commits)";
   const meta = lane.commit ? `${lane.commit.rel} ${lane.commit.author}` : "";
   const left = `  ${mag("●")} ${c.bold(lane.name.padEnd(7))} ${ciBadge(lane.ci)} ${c.yellow(lane.short)}  `;
-  // budget the subject so the meta tail fits on the right
-  const budget = cols() - 2 - 2 - 8 - 6 - 9 - meta.length - 3;
+  // budget the subject so the meta tail fits on the right (author is attacker-influenced
+  // commit metadata, so measure its display width rather than its UTF-16 .length)
+  const budget = cols() - 2 - 2 - 8 - 6 - 9 - stringWidth(meta) - 3;
   return `${left}${trunc(subj, Math.max(10, budget))}  ${c.dim(meta)}`;
 }
 
@@ -223,7 +279,7 @@ export function render(p: Pipeline, ui: UIState): string {
       const isNew = src === "local" ? ui.newLocalShas.has(cm.sha) : ui.newShas.has(cm.sha);
       const srcTag = src === "local" ? c.cyan("local ") : c.dim("remote");
       const meta = c.dim(`${cm.rel} ${cm.author}`);
-      const subj = trunc(cm.subject, W - 30 - cm.author.length);
+      const subj = trunc(cm.subject, W - 30 - stringWidth(cm.author));
       const row = `  ${srcTag}  ${c.yellow(cm.short)}  ${subj}  ${meta}`;
       out.push(isNew ? c.bgNew(row) : row);
     }
@@ -286,7 +342,7 @@ export function render(p: Pipeline, ui: UIState): string {
     } else {
       for (const cm of gap.queued.slice(0, 12)) {
         const isNew = ui.newShas.has(cm.sha);
-        const subj = trunc(cm.subject, W - 24 - cm.author.length);
+        const subj = trunc(cm.subject, W - 24 - stringWidth(cm.author));
         const row = `  ${c.yellow(cm.short)}  ${subj}  ${c.dim(`${cm.rel} ${cm.author}`)}`;
         out.push(isNew ? c.bgNew(row) : row);
       }
