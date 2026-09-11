@@ -30,9 +30,11 @@ const HELP = `chong — ship change-lists to the company git backend
               [--format-cmd <cmd>]      live TUI of commits queueing through the
                                         promotion pipeline; promote between branches.
                                         Default: agent Auto conflicts/i18n, auto-maintain
-                                        on start / every 20 commits / 2h, and (FRONTEND)
+                                        on start / every 20 commits / 2h, auto-inject local
+                                        main commits onto origin (30s grace window before
+                                        push, to allow a commit --amend), and (FRONTEND)
                                         local stage deploy after 60s quiet on origin/main
-                                        (--no-agent, --no-auto-maintain,
+                                        (--no-agent, --no-auto-maintain, --no-auto-inject,
                                          --no-auto-deploy-stage, --deploy-cooldown <s>,
                                          --no-import-scan)
   chong shadow-work [<path>] [--remote <r>] [--format-cmd <cmd>]
@@ -84,6 +86,24 @@ async function main(): Promise<void> {
       process.exit(1);
   }
 }
+
+/**
+ * Generic crash net for commands other than `watch`. `main()`'s own `.catch` below only
+ * sees rejections in its own awaited chain — it misses a truly unhandled rejection from a
+ * fire-and-forget promise, and Bun kills the process on either kind with no handler at
+ * all otherwise. `watch` needs more than this (restore the terminal, release the shared
+ * worktree claim), so `runWatch` in `src/watch/app.ts` replaces these two listeners with
+ * its own before it does any async work — see the comment there.
+ */
+process.on("unhandledRejection", (reason) => {
+  const msg = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+  console.error(c.red(`✗ unhandled rejection: ${msg}`));
+  process.exit(1);
+});
+process.on("uncaughtException", (err) => {
+  console.error(c.red(`✗ uncaught exception: ${err.stack ?? err.message}`));
+  process.exit(1);
+});
 
 main().catch((e: unknown) => {
   const msg = e instanceof Error ? e.message : String(e);

@@ -82,23 +82,68 @@ async function sh(cmd: string[], cwd: string): Promise<Run> {
  * (in the entry) followed by the source path on its own. The source is consumed so it
  * is not mistaken for a further entry.
  */
-export function parseStatusZ(out: string): string[] {
+type StatusEntryZ = { status: string; path: string };
+
+/**
+ * Same NUL-separated parsing {@link parseStatusZ} does, but keeps the 2-letter status
+ * code so callers can tell an untracked ("??") entry from a modified tracked one — needed
+ * to refuse an auto-commit when the tree has untracked files a step did not expect (a
+ * leftover from a previous step, or a scratch file/directory an agent run left behind)
+ * instead of silently sweeping them in with `git add -A`.
+ */
+function parseStatusEntriesZ(out: string): StatusEntryZ[] {
   const fields = out.split("\0").filter((f) => f.length > 0);
-  const paths: string[] = [];
+  const entries: StatusEntryZ[] = [];
   for (let i = 0; i < fields.length; i++) {
     const entry = fields[i];
     const status = entry.slice(0, 2);
     // "XY PATH" — two status letters, one space, then the path verbatim.
-    paths.push(entry.slice(3));
+    entries.push({ status, path: entry.slice(3) });
     if (/[RC]/.test(status)) i++;
   }
-  return paths;
+  return entries;
+}
+
+export function parseStatusZ(out: string): string[] {
+  return parseStatusEntriesZ(out).map((e) => e.path);
 }
 
 /** Changed paths in `cwd`'s working tree + index, unquoted. See {@link parseStatusZ}. */
 async function statusPaths(cwd: string): Promise<string[]> {
   const r = await gitZ(["status", "--porcelain", "-z"], cwd);
   return parseStatusZ(r.out);
+}
+
+/** Untracked ("??") paths only, unquoted. See {@link parseStatusEntriesZ}. */
+async function untrackedStatusPaths(cwd: string): Promise<string[]> {
+  const r = await gitZ(["status", "--porcelain", "-z"], cwd);
+  return parseStatusEntriesZ(r.out)
+    .filter((e) => e.status === "??")
+    .map((e) => e.path);
+}
+
+/**
+ * Untracked ("??") paths in `cwd` that a step did NOT expect — used by every auto-commit
+ * site below to refuse the commit instead of silently sweeping such files in with
+ * `git add -A` (a scratch file/directory an agent run left behind; leftover output from
+ * a previous step). `isExpected` is either an explicit allowlist (eslint's `files`, or a
+ * step's own before/after-diffed touched paths) or a predicate for open-ended scope
+ * (i18n's ".po"/".pot" allowance). Empty result ⇒ safe to stage the expected paths and
+ * commit.
+ */
+export async function unexpectedUntracked(
+  cwd: string,
+  isExpected: ReadonlySet<string> | ReadonlyArray<string> | ((path: string) => boolean),
+): Promise<string[]> {
+  const untracked = await untrackedStatusPaths(cwd);
+  const test =
+    typeof isExpected === "function"
+      ? isExpected
+      : (() => {
+          const set = isExpected instanceof Set ? isExpected : new Set(isExpected);
+          return (p: string) => set.has(p);
+        })();
+  return untracked.filter((p) => !test(p));
 }
 
 /** NUL-separated paths (`ls-files -z`, `diff-tree -z`, …), unquoted. */
@@ -478,6 +523,22 @@ const MAX_INJECT = 30; // refuse runaway cherry-pick batches
 export const I18N_PAUSE_MS = 2 * 60 * 60 * 1000; // 2h pause after uncertain i18n agent verdict
 export const AUTO_MAINT_EVERY_COMMITS = 20;
 export const AUTO_MAINT_EVERY_MS = 2 * 60 * 60 * 1000; // 2h
+/**
+ * A local head-lane commit must be at least this old before `reconcileLocalMain` will
+ * push or cherry-pick it onto origin. Without this, chong can push a commit within one
+ * poll (~15s), and `git commit --amend` / a rebase right after that is unsafe: the
+ * original is already on origin, so `git cherry` sees the amended commit as a new,
+ * unique patch and cherry-picks it on top — a conflict or duplicated content until the
+ * patch-id block-list catches it. This buys a short window to amend before that happens.
+ */
+export const INJECT_GRACE_MS = 30 * 1000; // 30s
+
+/** Milliseconds since `sha` was committed in `cwd`, or null if it can't be read. */
+async function commitAgeMs(cwd: string, sha: string): Promise<number | null> {
+  const r = await git(["log", "-1", "--format=%ct", sha], cwd);
+  const sec = Number.parseInt(r.out, 10);
+  return r.ok && Number.isFinite(sec) ? Date.now() - sec * 1000 : null;
+}
 
 /**
  * True when a cherry-pick onto a diverged tip preserved the source patch-id.
@@ -591,6 +652,13 @@ export type ReconcileOpts = {
   agentResolve?: boolean;
   /** Local SHAs previously blocked for this local tip (patch-id mismatch / empty). */
   skipShas?: ReadonlySet<string>;
+  /**
+   * Master switch for auto-injecting local-only head-lane commits onto origin — both the
+   * fast-forward push and the diverged cherry-pick+push path. Default true (unchanged
+   * behaviour); `--no-auto-inject` sets this false so chong never pushes a commit the
+   * operator hasn't explicitly promoted, e.g. while they still might amend it.
+   */
+  autoInject?: boolean;
 };
 
 /**
@@ -624,6 +692,8 @@ export async function reconcileLocalMain(
   const noop = (message: string, count = 0): ReconcileResult =>
     tip({ action: "noop", count, pushed: false, message });
 
+  if (opts.autoInject === false) return noop("auto-inject disabled (--no-auto-inject)");
+
   const originRef = `${remote}/${branch}`;
   const originSha = await repo.tip(repoPath, remote, branch);
   if (!originSha) return noop(`no ${originRef}`);
@@ -634,7 +704,28 @@ export async function reconcileLocalMain(
   if (skipShas?.size) {
     unique = unique.filter((sha) => !skipShas.has(sha));
   }
-  if (unique.length === 0) return noop("no unique local commits");
+
+  // Hold back commits still inside the grace window (see INJECT_GRACE_MS). `unique` is
+  // oldest-first (git cherry order), so once we hit the first commit that hasn't cleared
+  // the window, it and everything after it (all newer) are withheld together — never
+  // inject "around" a commit that might still get amended.
+  let heldBack = 0;
+  for (let i = 0; i < unique.length; i++) {
+    const age = await commitAgeMs(repoPath, unique[i]);
+    if (age !== null && age < INJECT_GRACE_MS) {
+      heldBack = unique.length - i;
+      unique = unique.slice(0, i);
+      break;
+    }
+  }
+
+  if (unique.length === 0) {
+    return noop(
+      heldBack > 0
+        ? `${heldBack} local ${branch} commit(s) within ${Math.round(INJECT_GRACE_MS / 1000)}s grace window — waiting to inject`
+        : "no unique local commits",
+    );
+  }
 
   if (unique.length > MAX_INJECT) {
     return tip({
@@ -667,10 +758,13 @@ export async function reconcileLocalMain(
   let agentNote = "";
 
   if (originIsAncestor) {
-    // Linear: local tip is a fast-forward of origin — push the local tip directly.
-    pushErr = await repo.pushSha(repoPath, remote, branch, localSha);
+    // Linear: fast-forward of origin. Push only up through the newest commit that has
+    // cleared the grace window above — `toInject`'s last entry, not necessarily
+    // `localSha` itself, when the true tip is still too young to push.
+    const pushTarget = toInject[toInject.length - 1] ?? localSha;
+    pushErr = await repo.pushSha(repoPath, remote, branch, pushTarget);
     action = "pushed";
-    if (!pushErr) newTip = localSha;
+    if (!pushErr) newTip = pushTarget;
   } else {
     // Diverged: replay local-only commits onto a clean shadow at origin tip.
     const shadow = await ensureShadow(repoPath, originRef, { processId: opts.processId });
@@ -923,7 +1017,8 @@ export async function tryAgentLintFix(
     };
   }
 
-  if ((await statusPaths(shadowPath)).length === 0) {
+  const changedAfterAgent = await statusPaths(shadowPath);
+  if (changedAfterAgent.length === 0) {
     return { fixed: false, message: "eslint agent: nothing to commit" };
   }
 
@@ -932,7 +1027,26 @@ export async function tryAgentLintFix(
     return { fixed: false, message: "eslint agent left conflict markers" };
   }
 
-  await git(["add", "-A"], shadowPath);
+  // Stage only the files the agent was asked to fix. Anything else it touched stays
+  // uncommitted here rather than being swept in by `git add -A` — in particular, any
+  // scratch file/directory it left behind shows up as untracked, not in `files`, so the
+  // next `ensureShadow()` reset discards it instead of it landing on `branch`.
+  const unexpectedNew = await unexpectedUntracked(shadowPath, files);
+  if (unexpectedNew.length > 0) {
+    return {
+      fixed: false,
+      message: `eslint agent left untracked file(s) outside the fix scope — not committing (${unexpectedNew
+        .slice(0, 3)
+        .join(", ")}${unexpectedNew.length > 3 ? ", …" : ""})`,
+    };
+  }
+
+  const toCommit = files.filter((f) => changedAfterAgent.includes(f));
+  if (toCommit.length === 0) {
+    return { fixed: false, message: "eslint agent: nothing in scope to commit" };
+  }
+
+  await git(["add", "--", ...toCommit], shadowPath);
   const commitR = await git(["commit", "-m", "FIX: eslint (agent)", "--no-verify"], shadowPath);
   if (!commitR.ok) {
     return { fixed: false, message: `eslint agent commit failed (${commitR.err})` };
@@ -1273,7 +1387,25 @@ export async function tryAgentI18nFix(
     return pause("i18n agent left conflict markers — pausing auto-fix 2h");
   }
 
-  await git(["add", "-A"], shadowPath);
+  // Stage explicitly rather than `git add -A`. i18n work legitimately creates new .po/.pot
+  // files (a fresh feature namespace); anything else untracked is out of scope — most
+  // likely a scratch file/directory the agent left behind — so refuse instead of shipping
+  // it under this commit's name.
+  const unexpectedNew = await unexpectedUntracked(
+    shadowPath,
+    (f) => f.endsWith(".po") || f.endsWith(".pot"),
+  );
+  if (unexpectedNew.length > 0) {
+    return {
+      fixed: false,
+      paused: false,
+      message: `i18n agent left untracked non-i18n file(s) — not committing (${unexpectedNew
+        .slice(0, 3)
+        .join(", ")}${unexpectedNew.length > 3 ? ", …" : ""})`,
+    };
+  }
+
+  await git(["add", "--", ...changed], shadowPath);
   const commitR = await git(["commit", "-m", "FIX: i18n (agent)", "--no-verify"], shadowPath);
   if (!commitR.ok) {
     return pause(`i18n agent commit failed — pausing 2h (${commitR.err})`);
@@ -1395,16 +1527,28 @@ export async function runMaintenance(
         `⚠ deps: skipped ${skipped.length} update(s)${preview ? ` — ${preview}` : ""}`,
       );
     }
-    const dirty = (await git(["status", "--porcelain"], shadowPath)).out;
-    if (updated.length > 0 && dirty) {
-      await git(["add", "-A"], shadowPath);
-      await git(["commit", "-m", "CLEAN: bump minor deps", "--no-verify"], shadowPath);
-      const pr = await push();
-      step(
-        pr.ok
-          ? `✓ deps: updated ${updated.length} package(s) → committed & pushed to ${branch}`
-          : `⚠ deps: committed but push failed (${pr.err})`,
-      );
+    const dirty = await statusPaths(shadowPath);
+    if (updated.length > 0 && dirty.length > 0) {
+      // `pnpm update --lockfile-only` should only ever touch tracked manifests/lockfiles
+      // it already knows about — any untracked path here is unexpected (e.g. leftover
+      // noise from a prior step), so refuse rather than sweep it into this commit.
+      const unexpectedNew = await unexpectedUntracked(shadowPath, []);
+      if (unexpectedNew.length > 0) {
+        step(
+          `⚠ deps: unexpected untracked file(s) — not committing (${unexpectedNew
+            .slice(0, 3)
+            .join(", ")}${unexpectedNew.length > 3 ? ", …" : ""})`,
+        );
+      } else {
+        await git(["add", "--", ...dirty], shadowPath);
+        await git(["commit", "-m", "CLEAN: bump minor deps", "--no-verify"], shadowPath);
+        const pr = await push();
+        step(
+          pr.ok
+            ? `✓ deps: updated ${updated.length} package(s) → committed & pushed to ${branch}`
+            : `⚠ deps: committed but push failed (${pr.err})`,
+        );
+      }
     } else if (updated.length === 0 && skipped.length === 0) {
       step("✓ deps: nothing changed");
     } else if (updated.length === 0) {
@@ -1447,10 +1591,15 @@ export async function runMaintenance(
     step("✓ code style: already clean (last commit was the fix)");
   } else {
     onStep?.("format: running formatter…");
+    // Snapshot before running so we can stage only what the formatter itself touched —
+    // not e.g. leftover dirt the lockfile step above left uncommitted, which `git add -A`
+    // used to sweep in here under the "code style" name.
+    const beforeFormat = new Set(await statusPaths(shadowPath));
     const [fcmd, ...fargs] = cmds.format.trim().split(/\s+/);
     await sh([fcmd, ...fargs], shadowPath); // formatters exit non-zero when they rewrite files
-    const fmtDirty = (await git(["status", "--porcelain"], shadowPath)).out;
-    if (!fmtDirty) {
+    const afterFormat = await statusPaths(shadowPath);
+    const fmtTouched = afterFormat.filter((f) => !beforeFormat.has(f));
+    if (fmtTouched.length === 0) {
       step("✓ code style: already clean");
     } else if (await subjectRepeatsRecently(shadowPath, CODE_STYLE_SUBJECT)) {
       await setAutoFixBlocker(
@@ -1461,8 +1610,10 @@ export async function runMaintenance(
       );
       await resetShadowDirty(shadowPath);
       step(`⚠ code style: loop detected — blocked, see ~/.chong/state/ (${branch})`);
+    } else if ((await unexpectedUntracked(shadowPath, fmtTouched)).length > 0) {
+      step("⚠ code style: unexpected untracked file(s) present — not committing");
     } else {
-      await git(["add", "-A"], shadowPath);
+      await git(["add", "--", ...fmtTouched], shadowPath);
       await git(["commit", "-m", CODE_STYLE_SUBJECT, "--no-verify"], shadowPath);
       const pr = await push();
       step(

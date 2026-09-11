@@ -6,6 +6,7 @@ import {
   AUTO_MAINT_EVERY_MS,
   checkI18n,
   ensureShadow,
+  INJECT_GRACE_MS,
   isAutoFix,
   reconcileLocalMain,
   type ShadowInfo,
@@ -50,10 +51,57 @@ import type { Pipeline } from "./types";
 const ALT_ON = "\x1b[?1049h\x1b[?25l"; // alt screen + hide cursor
 const ALT_OFF = "\x1b[?25h\x1b[?1049l"; // show cursor + leave alt screen
 
-export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<void> {
+/**
+ * `autoInject` — master switch for `reconcileLocalMain` (both the fast-forward push and
+ * the diverged cherry-pick+push path). Default true, matching the pre-existing
+ * behaviour; `--no-auto-inject` (see `src/commands/watch.ts`) sets this false.
+ */
+export async function runWatch(
+  cfg: WatchConfig,
+  intervalMs: number,
+  autoInject = true,
+): Promise<void> {
   /** Stable for this watch process — deploy claims + worktree ownership share it. */
   const processId = crypto.randomUUID();
   const shadowPath = shadowPathFor(cfg.repoPath);
+
+  // Crash net: Bun terminates the process on an unhandled rejection or uncaught
+  // exception, and nothing upstream of this process restores the terminal or releases
+  // the worktree claim for us. Without this, any unguarded rejection anywhere (an agent
+  // call, a stray git failure) leaves the alt screen on — the terminal is unusable until
+  // `reset` — and the claim file live for its full 20-minute stale window, blocking every
+  // other watch on this repo. Installed first, before any async work, and superseding
+  // whatever generic handler `src/index.ts` installed for non-watch commands, so exactly
+  // one handler — this one, which knows how to tear down — runs for the rest of the
+  // process's life.
+  let crashHandled = false;
+  function crashRecover(reason: unknown, source: string): void {
+    if (crashHandled) return; // never double-release / double-restore
+    crashHandled = true;
+    try {
+      releaseWorktreeClaim(shadowPath, processId);
+    } catch {
+      /* best-effort — process is going down regardless */
+    }
+    try {
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    } catch {
+      /* ignore */
+    }
+    try {
+      process.stdout.write(ALT_OFF);
+    } catch {
+      /* ignore */
+    }
+    const msg = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+    console.error(`\nchong watch crashed (${source}): ${msg}`);
+    process.exit(1);
+  }
+  process.removeAllListeners("unhandledRejection");
+  process.removeAllListeners("uncaughtException");
+  process.on("unhandledRejection", (reason) => crashRecover(reason, "unhandledRejection"));
+  process.on("uncaughtException", (err) => crashRecover(err, "uncaughtException"));
+
   let worktreeOwned = false;
   let foreignWorktreeClaim: WorktreeClaim | null = null;
   let lastWorktreeTouchAt = 0;
@@ -119,6 +167,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     processId: string;
     agentResolve: boolean;
     skipShas: ReadonlySet<string>;
+    autoInject: boolean;
   } {
     if (localTip && injectBlockedForLocalTip && injectBlockedForLocalTip !== localTip) {
       injectBlockedShas.clear();
@@ -126,7 +175,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     }
     // `processId` so reconcile's diverged path resets main-shadow under *our* claim
     // rather than unclaimed — see ReconcileOpts.
-    return { processId, agentResolve: agentEnabled, skipShas: injectBlockedShas };
+    return { processId, agentResolve: agentEnabled, skipShas: injectBlockedShas, autoInject };
   }
 
   const ui: UIState = {
@@ -342,65 +391,78 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     ui.status = c.yellow(`deploying stage ${tip.slice(0, 7)} (${reason})…`);
     paint();
 
-    const mainBranch = pipeline.lanes[0]?.name ?? "main";
-    const stageBranch = pipeline.lanes.find((l) => l.name === "stage")?.name ?? "stage";
-    const res = await runLocalStageDeploy(
-      pipeline.repoPath,
-      pipeline.remote,
-      mainBranch,
-      stageBranch,
-      stageDeployCmd,
-      {
-        agent: agentEnabled,
-        importScan: cfg.importScan,
-        processId,
-        onProgress: (msg) => {
-          addNotice(c.dim(msg));
-          paint();
+    // Wrapped so a rejection anywhere in the deploy (agent call, git, upload) becomes a
+    // notice instead of an unhandled rejection that would kill the whole watch process —
+    // see the crash net installed at the top of runWatch.
+    try {
+      const mainBranch = pipeline.lanes[0]?.name ?? "main";
+      const stageBranch = pipeline.lanes.find((l) => l.name === "stage")?.name ?? "stage";
+      const res = await runLocalStageDeploy(
+        pipeline.repoPath,
+        pipeline.remote,
+        mainBranch,
+        stageBranch,
+        stageDeployCmd,
+        {
+          agent: agentEnabled,
+          importScan: cfg.importScan,
+          processId,
+          onProgress: (msg) => {
+            addNotice(c.dim(msg));
+            paint();
+          },
         },
-      },
-    );
+      );
 
-    stageDeploying = false;
-    if (res.action === "deployed" && res.sha) {
-      cfg.stageDeployedSha = res.sha;
-      pendingStageDeploySha = null;
-      stageDeployAt = null;
-      stageDeployBlockedForTip = null;
-      remoteStageClaim = null;
-      addNotice(c.green(`✓ ${res.message}`));
-      ui.status = c.green(`✓ ${res.message}`);
-      void refresh();
-    } else if (res.action === "fixed") {
-      // eslint landed on main — wait for the new tip, then re-arm cooldown
-      pendingStageDeploySha = null;
-      stageDeployAt = null;
-      addNotice(c.green(`✓ ${res.message}`));
-      void refresh();
-    } else if (res.action === "noop") {
-      if (res.sha) cfg.stageDeployedSha = res.sha;
-      pendingStageDeploySha = null;
-      stageDeployAt = null;
-      addNotice(c.dim(res.message));
-    } else if (res.action === "deferred") {
-      // Soft claim held by someone else — retry soon; do NOT permanently block the tip.
-      remoteStageClaim = res.claim ?? remoteStageClaim;
-      pendingStageDeploySha = tip;
-      stageDeployAt = Date.now() + CLAIM_RETRY_SEC * 1000;
-      addNotice(c.yellow(`⏳ ${res.message} — retry in ${CLAIM_RETRY_SEC}s`));
-      ui.status = c.yellow(`⏳ ${res.message}`);
-    } else if (res.action === "blocked") {
+      stageDeploying = false;
+      if (res.action === "deployed" && res.sha) {
+        cfg.stageDeployedSha = res.sha;
+        pendingStageDeploySha = null;
+        stageDeployAt = null;
+        stageDeployBlockedForTip = null;
+        remoteStageClaim = null;
+        addNotice(c.green(`✓ ${res.message}`));
+        ui.status = c.green(`✓ ${res.message}`);
+        void refresh();
+      } else if (res.action === "fixed") {
+        // eslint landed on main — wait for the new tip, then re-arm cooldown
+        pendingStageDeploySha = null;
+        stageDeployAt = null;
+        addNotice(c.green(`✓ ${res.message}`));
+        void refresh();
+      } else if (res.action === "noop") {
+        if (res.sha) cfg.stageDeployedSha = res.sha;
+        pendingStageDeploySha = null;
+        stageDeployAt = null;
+        addNotice(c.dim(res.message));
+      } else if (res.action === "deferred") {
+        // Soft claim held by someone else — retry soon; do NOT permanently block the tip.
+        remoteStageClaim = res.claim ?? remoteStageClaim;
+        pendingStageDeploySha = tip;
+        stageDeployAt = Date.now() + CLAIM_RETRY_SEC * 1000;
+        addNotice(c.yellow(`⏳ ${res.message} — retry in ${CLAIM_RETRY_SEC}s`));
+        ui.status = c.yellow(`⏳ ${res.message}`);
+      } else if (res.action === "blocked") {
+        stageDeployBlockedForTip = tip;
+        pendingStageDeploySha = null;
+        stageDeployAt = null;
+        addNotice(c.yellow(`⚠ stage: ${res.message}`));
+        ui.status = c.yellow(`⚠ stage: ${res.message}`);
+      } else {
+        stageDeployBlockedForTip = tip;
+        pendingStageDeploySha = null;
+        stageDeployAt = null;
+        addNotice(c.red(`✗ stage: ${res.message}`));
+        ui.status = c.red(`✗ stage: ${res.message}`);
+      }
+    } catch (e) {
+      stageDeploying = false;
       stageDeployBlockedForTip = tip;
       pendingStageDeploySha = null;
       stageDeployAt = null;
-      addNotice(c.yellow(`⚠ stage: ${res.message}`));
-      ui.status = c.yellow(`⚠ stage: ${res.message}`);
-    } else {
-      stageDeployBlockedForTip = tip;
-      pendingStageDeploySha = null;
-      stageDeployAt = null;
-      addNotice(c.red(`✗ stage: ${res.message}`));
-      ui.status = c.red(`✗ stage: ${res.message}`);
+      const msg = e instanceof Error ? e.message : String(e);
+      addNotice(c.red(`✗ stage deploy crashed: ${msg}`));
+      ui.status = c.red(`✗ stage deploy crashed: ${msg}`);
     }
     syncStageDeployUi();
     paint();
@@ -413,7 +475,8 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     if (pendingStageDeploySha && stageDeployAt && Date.now() >= stageDeployAt) {
       const tip = pendingStageDeploySha;
       stageDeployAt = null; // consume so we don't re-queue every second
-      checkQueue = checkQueue.then(() => executeStageDeploy(`cooldown ${tip.slice(0, 7)}`));
+      const run = () => executeStageDeploy(`cooldown ${tip.slice(0, 7)}`);
+      checkQueue = checkQueue.then(run, run);
     }
   }
 
@@ -500,6 +563,21 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   }
 
   async function runCommitChecks(sha: string, src: "local" | "remote"): Promise<void> {
+    if (!pipeline) return;
+    // Wrapped so a rejection anywhere below (agent call, shadow git op) becomes a notice
+    // instead of an unhandled rejection that would kill the whole watch process — see the
+    // crash net installed at the top of runWatch.
+    try {
+      await runCommitChecksInner(sha, src);
+    } catch (e) {
+      addNotice(
+        c.red(`✗ ${sha.slice(0, 7)} checks crashed: ${e instanceof Error ? e.message : String(e)}`),
+      );
+      paint();
+    }
+  }
+
+  async function runCommitChecksInner(sha: string, src: "local" | "remote"): Promise<void> {
     if (!pipeline) return;
     if (await isAutoFix(pipeline.repoPath, sha)) return;
 
@@ -808,7 +886,8 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
             if (!checkedShas.has(cm.sha)) {
               checkedShas.add(cm.sha);
               const sha = cm.sha;
-              checkQueue = checkQueue.then(() => runCommitChecks(sha, "remote"));
+              const run = () => runCommitChecks(sha, "remote");
+              checkQueue = checkQueue.then(run, run);
             }
           }
         }
@@ -818,7 +897,8 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
             if (!checkedShas.has(cm.sha)) {
               checkedShas.add(cm.sha);
               const sha = cm.sha;
-              checkQueue = checkQueue.then(() => runCommitChecks(sha, "local"));
+              const run = () => runCommitChecks(sha, "local");
+              checkQueue = checkQueue.then(run, run);
             }
           }
         }
@@ -838,10 +918,15 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
         armStageDeployCooldown(mainTip, "pipeline poll");
       }
       paint();
-      // CI is slower / best-effort — fill it in and repaint when ready
-      enrichCI(p).then(() => {
-        if (pipeline === p) paint();
-      });
+      // CI is slower / best-effort — fill it in and repaint when ready. `.catch` so a
+      // failed CI lookup becomes a notice instead of an unhandled rejection.
+      enrichCI(p)
+        .then(() => {
+          if (pipeline === p) paint();
+        })
+        .catch((e) => {
+          addNotice(c.yellow(`⚠ CI enrich failed: ${e instanceof Error ? e.message : String(e)}`));
+        });
     } else {
       ui.status = c.red(`✗ ${error ?? "could not read pipeline"}`);
     }
@@ -1202,8 +1287,18 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
           return;
         }
         // `paint` takes an optional `force`, so passing it directly makes the resolved
-        // value the argument — wrap it.
-        if (pipeline) void enrichCI(pipeline).then(() => paint());
+        // value the argument — wrap it. `.catch` so a failed CI lookup surfaces as a
+        // notice instead of an unhandled rejection.
+        if (pipeline) {
+          void enrichCI(pipeline)
+            .then(() => paint())
+            .catch((e) => {
+              addNotice(
+                c.yellow(`⚠ CI refresh failed: ${e instanceof Error ? e.message : String(e)}`),
+              );
+              paint();
+            });
+        }
         break;
       case "l":
         if (ui.confirm !== null && promptOffersProdRoute(ui.confirm)) {
@@ -1275,6 +1370,12 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   } else {
     addNotice(c.dim(`worktree claimed (${processId.slice(0, 8)}…)`));
   }
+
+  addNotice(
+    autoInject
+      ? c.dim(`auto-inject: on (${Math.round(INJECT_GRACE_MS / 1000)}s grace before push)`)
+      : c.yellow("⚠ auto-inject off (--no-auto-inject) — local commits are never auto-pushed"),
+  );
 
   // Seed virtual stage / prod tips from live S3 markers (fallback: local branch / file)
   // before the first pipeline paint.

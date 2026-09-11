@@ -42,6 +42,9 @@ export async function cmdWatch(argv: string[]): Promise<void> {
   const agent = flags["no-agent"] !== true;
   const importScan = flags["no-import-scan"] !== true;
   const autoMaintain = flags["no-auto-maintain"] !== true;
+  // Master switch for reconcileLocalMain's auto-push (fast-forward + diverged
+  // cherry-pick paths) — see the doc comment on ReconcileOpts.autoInject in checks.ts.
+  const autoInject = flags["no-auto-inject"] !== true;
 
   // Local stage deploy (default on for FRONTEND). Legacy --no-auto-promote-stage still disables it.
   const autoDeployStage =
@@ -93,7 +96,7 @@ export async function cmdWatch(argv: string[]): Promise<void> {
     prodDeployedSha: null,
   };
   try {
-    await runWatch(cfg, intervalMs);
+    await runWatch(cfg, intervalMs, autoInject);
   } finally {
     // ensure terminal is sane even if the loop threw mid-frame
     process.stdout.write("\x1b[?25h\x1b[?1049l");
