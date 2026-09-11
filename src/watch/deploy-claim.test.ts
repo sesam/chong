@@ -1,21 +1,25 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   CLAIM_STALE_MS,
+  type DeployClaim,
+  acquireDeployClaim,
   formatClaimHolder,
   formatDeployClaim,
   isClaimStale,
   makeDeployClaim,
   parseDeployClaim,
+  readDeployClaim,
+  releaseDeployClaim,
 } from "./deploy-claim";
 import {
+  WORKTREE_CLAIM_STALE_MS,
   acquireWorktreeClaim,
   isWorktreeClaimActive,
   readWorktreeClaim,
   releaseWorktreeClaim,
-  WORKTREE_CLAIM_STALE_MS,
   worktreeOwnerPath,
 } from "./worktree-claim";
 
@@ -56,6 +60,184 @@ describe("deploy-claim parse/format", () => {
     });
     expect(s).toContain("simon@mbp");
     expect(s).toContain("abcdef0");
+  });
+
+  test("parseDeployClaim strips ANSI escapes and control chars from user/host", () => {
+    const dirtyUser = "simon[31m[2Jpwned";
+    const dirtyHost = "mbp]0;evil\r\n";
+    const raw = JSON.stringify({
+      v: 1,
+      id: pid,
+      user: dirtyUser,
+      sha: "abcdef0123456789abcdef0123456789abcdef01",
+      at: "2026-09-10T12:00:00.000Z",
+      host: dirtyHost,
+    });
+    const claim = parseDeployClaim(raw);
+    expect(claim).not.toBeNull();
+    if (!claim) return;
+    // biome-ignore lint: matching control-char detection to the sanitizer's own set
+    const controlOrEscape = /[\x00-\x1f\x7f]/;
+    expect(controlOrEscape.test(claim.user)).toBe(false);
+    expect(controlOrEscape.test(claim.host ?? "")).toBe(false);
+    expect(claim.user).toContain("simon");
+    expect(claim.user).toContain("pwned");
+    expect(claim.host).toContain("mbp");
+    // ownership never keys off these fields — only `id` does.
+    expect(claim.id).toBe(pid);
+  });
+
+  test("parseDeployClaim caps absurdly long user/host fields", () => {
+    const raw = JSON.stringify({
+      v: 1,
+      id: pid,
+      user: "x".repeat(500),
+      sha: "abcdef0123456789abcdef0123456789abcdef01",
+      at: "2026-09-10T12:00:00.000Z",
+      host: "y".repeat(500),
+    });
+    const claim = parseDeployClaim(raw);
+    expect(claim).not.toBeNull();
+    if (!claim) return;
+    expect(claim.user.length).toBeLessThanOrEqual(64);
+    expect((claim.host ?? "").length).toBeLessThanOrEqual(64);
+  });
+});
+
+/**
+ * In-memory stand-in for the marker bucket, keyed by `s3://bucket/key`. Swaps in for
+ * `Bun.spawn` so `acquireDeployClaim` / `readDeployClaim` / `releaseDeployClaim` never
+ * shell out to the real `aws` CLI.
+ */
+function stubAwsS3(store: Map<string, string>) {
+  return spyOn(Bun, "spawn").mockImplementation(((
+    args: string[],
+    opts: Record<string, unknown>,
+  ) => {
+    const [, , action, ...rest] = args;
+    if (action === "cp" && rest[0] === "-") {
+      // write: aws s3 cp - s3://bucket/key ...
+      const uri = rest[1] as string;
+      const exited = (async () => {
+        const body = await new Response(opts.stdin as Blob).text();
+        store.set(uri, body);
+        return 0;
+      })();
+      return { exited, stdout: new Response("").body, stderr: new Response("").body };
+    }
+    if (action === "cp") {
+      // read: aws s3 cp s3://bucket/key - --quiet
+      const uri = rest[0] as string;
+      const val = store.get(uri);
+      return {
+        exited: Promise.resolve(val === undefined ? 1 : 0),
+        stdout: new Response(val ?? "").body,
+        stderr: new Response(val === undefined ? "NoSuchKey" : "").body,
+      };
+    }
+    if (action === "rm") {
+      const uri = rest[0] as string;
+      store.delete(uri);
+      return {
+        exited: Promise.resolve(0),
+        stdout: new Response("").body,
+        stderr: new Response("").body,
+      };
+    }
+    throw new Error(`unstubbed aws invocation: ${JSON.stringify(args)}`);
+  }) as unknown as typeof Bun.spawn);
+}
+
+describe("deploy-claim S3 acquire/release (stubbed S3)", () => {
+  const bucket = "test-marker-bucket";
+  const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+  afterEach(() => {
+    // restore Bun.spawn between tests
+    (Bun.spawn as unknown as { mockRestore?: () => void }).mockRestore?.();
+  });
+
+  /**
+   * Installs a hook that overwrites the stored claim with `rival` immediately after
+   * each write whose 1-indexed sequence number is in `clobberWrites`, simulating a
+   * concurrent writer racing in between our write and our read-back verification.
+   */
+  function injectRivalAfterWrites(
+    store: Map<string, string>,
+    rival: DeployClaim,
+    clobberWrites: number[],
+  ) {
+    const trueSet = Map.prototype.set.bind(store);
+    let writeCount = 0;
+    store.set = (key, value) => {
+      writeCount += 1;
+      const out = trueSet(key, value);
+      if (clobberWrites.includes(writeCount)) {
+        trueSet(key, formatDeployClaim(rival));
+      }
+      return out;
+    };
+  }
+
+  test("force succeeds when it genuinely wins", async () => {
+    const store = new Map<string, string>();
+    stubAwsS3(store);
+    const pid = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+    const rival = makeDeployClaim(sha, "88888888-8888-8888-8888-888888888888");
+
+    // A rival clobbers our first (non-force) write, forcing us into the force branch —
+    // but nobody clobbers the force branch's own write, so it genuinely wins.
+    injectRivalAfterWrites(store, rival, [1]);
+
+    const result = await acquireDeployClaim(bucket, sha, pid, { force: true, waitMs: 0 });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.forced).toBe(true);
+      expect(result.claim.id).toBe(pid);
+    }
+    const stored = await readDeployClaim(bucket);
+    expect(stored?.id).toBe(pid);
+  });
+
+  test("force-path read-back mismatch is now detected and reported as failure", async () => {
+    const store = new Map<string, string>();
+    stubAwsS3(store);
+    const pid = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+    const rival = makeDeployClaim(sha, "99999999-9999-9999-9999-999999999999");
+
+    // A rival clobbers BOTH our normal write and our forced write — the forcer must
+    // detect it lost even its own force attempt, not just proceed optimistically.
+    injectRivalAfterWrites(store, rival, [1, 2]);
+
+    const result = await acquireDeployClaim(bucket, sha, pid, { force: true, waitMs: 0 });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("verify");
+      if (result.reason === "verify") {
+        expect(result.got?.id).toBe(rival.id);
+      }
+    }
+  });
+
+  test("release removes the key", async () => {
+    const store = new Map<string, string>();
+    stubAwsS3(store);
+    const pid = "12121212-1212-1212-1212-121212121212";
+    const claim = makeDeployClaim(sha, pid);
+    const acquired = await acquireDeployClaim(bucket, sha, pid, { waitMs: 0 });
+    expect(acquired.ok).toBe(true);
+    expect(store.size).toBe(1);
+
+    const err = await releaseDeployClaim(bucket, claim);
+    expect(err).toBeNull();
+    expect(store.size).toBe(0);
+    expect(await readDeployClaim(bucket)).toBeNull();
+  });
+
+  test("missing key reads as no-claim", async () => {
+    const store = new Map<string, string>();
+    stubAwsS3(store);
+    expect(await readDeployClaim(bucket)).toBeNull();
   });
 });
 

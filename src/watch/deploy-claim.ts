@@ -69,11 +69,7 @@ export function claimIdentity(): { user: string; host: string } {
 }
 
 /** Build a claim for `sha` owned by this watch process (`processId`). */
-export function makeDeployClaim(
-  sha: string,
-  processId: string,
-  now = new Date(),
-): DeployClaim {
+export function makeDeployClaim(sha: string, processId: string, now = new Date()): DeployClaim {
   const { user, host } = claimIdentity();
   return {
     v: 1,
@@ -89,6 +85,24 @@ export function formatDeployClaim(claim: DeployClaim): string {
   return `${JSON.stringify(claim)}\n`;
 }
 
+/** Max length kept for a display field after sanitizing (longer input is truncated). */
+const CLAIM_FIELD_MAX_LEN = 64;
+
+/**
+ * Strip ANSI escapes and other control/non-printable characters from a claim display
+ * field (`user` / `host`), then cap its length. Anyone with write access to the marker
+ * bucket controls this JSON, so an unsanitized `user`/`host` is a terminal-injection
+ * vector into the watch TUI — sanitizing here (in parse) protects every consumer, not
+ * just {@link formatClaimHolder}.
+ */
+function sanitizeClaimField(value: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: deliberately stripping ANSI/control bytes
+  const withoutCsi = value.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, ""); // CSI sequences (colours, cursor moves, etc.)
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: deliberately stripping ANSI/control bytes
+  const withoutControls = withoutCsi.replace(/[\x00-\x1f\x7f]/g, ""); // remaining control chars (incl. bare ESC, CR/LF)
+  return withoutControls.trim().slice(0, CLAIM_FIELD_MAX_LEN);
+}
+
 export function parseDeployClaim(raw: string): DeployClaim | null {
   const text = raw.trim();
   if (!text) return null;
@@ -99,11 +113,13 @@ export function parseDeployClaim(raw: string): DeployClaim | null {
     if (typeof parsed.user !== "string" || !parsed.user) return null;
     if (typeof parsed.sha !== "string" || !/^[0-9a-f]{7,40}$/i.test(parsed.sha)) return null;
     if (typeof parsed.at !== "string" || !parsed.at) return null;
-    const host = typeof parsed.host === "string" && parsed.host ? parsed.host : undefined;
+    const user = sanitizeClaimField(parsed.user) || "unknown";
+    const hostRaw = typeof parsed.host === "string" ? sanitizeClaimField(parsed.host) : "";
+    const host = hostRaw || undefined;
     return {
       v: 1,
       id: parsed.id,
-      user: parsed.user,
+      user,
       sha: parsed.sha.toLowerCase(),
       at: parsed.at,
       ...(host ? { host } : {}),
@@ -131,16 +147,15 @@ export async function readDeployClaim(bucket: string): Promise<DeployClaim | nul
   return parseDeployClaim(raw);
 }
 
-export async function writeDeployClaim(
-  bucket: string,
-  claim: DeployClaim,
-): Promise<string | null> {
+export async function writeDeployClaim(bucket: string, claim: DeployClaim): Promise<string | null> {
   return writeS3Text(bucket, DEPLOY_CLAIM_KEY, formatDeployClaim(claim));
 }
 
 /**
  * Clear the claim only if we still own it (or it is already gone / stale garbage).
- * Avoids wiping a newer claim another process just took.
+ * Avoids wiping a newer claim another process just took. Runs on shutdown paths, so a
+ * delete that fails (or a key that is already gone) is swallowed rather than thrown —
+ * same tolerance the previous empty-write had.
  */
 export async function releaseDeployClaim(
   bucket: string,
@@ -148,16 +163,13 @@ export async function releaseDeployClaim(
 ): Promise<string | null> {
   const current = await readDeployClaim(bucket);
   if (!current || current.id !== ours.id) return null;
-  return writeS3Text(bucket, DEPLOY_CLAIM_KEY, "");
+  return deleteS3Object(bucket, DEPLOY_CLAIM_KEY);
 }
 
 /**
  * Rewrite `at` for a claim we still own. Returns false if someone else took it.
  */
-export async function heartbeatDeployClaim(
-  bucket: string,
-  ours: DeployClaim,
-): Promise<boolean> {
+export async function heartbeatDeployClaim(bucket: string, ours: DeployClaim): Promise<boolean> {
   const current = await readDeployClaim(bucket);
   if (!current || current.id !== ours.id) return false;
   const next: DeployClaim = { ...ours, at: new Date().toISOString() };
@@ -208,13 +220,30 @@ export async function acquireDeployClaim(
   }
 
   if (force) {
-    note(
-      `deploy claim: FORCE — overwriting ${got ? formatClaimHolder(got) : "(empty)"}`,
-    );
+    note(`deploy claim: FORCE — overwriting ${got ? formatClaimHolder(got) : "(empty)"}`);
     const forced = makeDeployClaim(sha, processId);
     const forceErr = await writeDeployClaim(bucket, forced);
     if (forceErr) return { ok: false, reason: "write", error: forceErr };
-    return { ok: true, claim: forced, forced: true };
+
+    if (waitMs > 0) {
+      note(`deploy claim: waiting ${Math.round(waitMs / 1000)}s for competing writers…`);
+      await sleep(waitMs);
+    }
+
+    const gotAfterForce = await readDeployClaim(bucket);
+    if (gotAfterForce && gotAfterForce.id === forced.id) {
+      return { ok: true, claim: forced, forced: true };
+    }
+
+    return {
+      ok: false,
+      reason: "verify",
+      expected: forced,
+      got: gotAfterForce,
+      error: gotAfterForce
+        ? `claim read-back mismatch (got ${formatClaimHolder(gotAfterForce)})`
+        : "claim read-back empty after write",
+    };
   }
 
   if (got && !isClaimStale(got)) {
@@ -295,6 +324,18 @@ async function writeS3Text(bucket: string, key: string, value: string): Promise<
   const err = await new Response(proc.stderr).text();
   const code = await proc.exited;
   return code === 0 ? null : err.trim() || `aws s3 cp failed (${code})`;
+}
+
+async function deleteS3Object(bucket: string, key: string): Promise<string | null> {
+  const uri = `s3://${bucket}/${key}`;
+  const proc = Bun.spawn(["aws", "s3", "rm", uri, "--quiet"], {
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env, AWS_PAGER: "" },
+  });
+  const err = await new Response(proc.stderr).text();
+  const code = await proc.exited;
+  return code === 0 ? null : err.trim() || `aws s3 rm failed (${code})`;
 }
 
 async function readS3Text(bucket: string, key: string): Promise<string | null> {
