@@ -366,8 +366,29 @@ export function resolveStageDeployCmd(repoPath: string, configured: string): str
   return defaultStageDeployCmd(repoPath);
 }
 
+/**
+ * Caller identity for the notify-discord relay. A literal, not the local
+ * `repoPath` variable used elsewhere in this file: it names the repo that owns
+ * this code, not the repo being deployed.
+ */
+const DISCORD_NOTIFY_REPO_PATH = "sesam/chong";
+
 export async function notifyDiscordStage(message: string): Promise<boolean> {
-  const payload = JSON.stringify({ webhookUrl: DISCORD_CHANNEL, message });
+  const token = process.env.DISCORD_NOTIFY_TOKEN;
+  // Strictly additive: with no token configured we send byte-for-byte the body
+  // we always sent. Never `token: ""` — an empty credential is a failed auth,
+  // not an absent one, and unauthenticated posts still deliver (they just page
+  // the relay owner, which is the noise this is meant to stop).
+  const payload = JSON.stringify(
+    token
+      ? {
+          webhookUrl: DISCORD_CHANNEL,
+          message,
+          repoPath: DISCORD_NOTIFY_REPO_PATH,
+          token,
+        }
+      : { webhookUrl: DISCORD_CHANNEL, message },
+  );
   for (const endpoint of DISCORD_ENDPOINTS) {
     try {
       const res = await fetch(endpoint, {
@@ -735,12 +756,29 @@ async function runDeployCommand(
     killTimer = setTimeout(() => killGroup("SIGKILL"), ABORT_KILL_GRACE_MS);
   }, 2_000);
 
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  clearInterval(poll);
-  if (killTimer) clearTimeout(killTimer);
+  // try/finally: if draining the streams ever rejects, the poll interval and a pending
+  // SIGKILL timer must not leak for the life of the process — they are cleared whether the
+  // drain succeeds or throws.
+  //
+  // Deliberately no bound on the drain itself: a daemonizing grandchild (calls setsid(),
+  // escaping the process group `detached: true` created above) that keeps the inherited
+  // stdout/stderr pipe open could in theory hang this await forever, past the `finally`
+  // above and never reaching the caller's claim-release `finally`. A wall-clock cap on
+  // `new Response(...).text()` would fix that but also silently truncate a normal, slow
+  // deploy's real output — there is no way to tell the two apart from out here. Reaching
+  // for one would need per-chunk read progress (a distinct, larger change) rather than a
+  // single overall timeout, so this is left as a known gap rather than guessed at here.
+  let stdout: string;
+  let stderr: string;
+  try {
+    [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+  } finally {
+    clearInterval(poll);
+    if (killTimer) clearTimeout(killTimer);
+  }
   const code = await proc.exited;
   const output = `${stdout}\n${stderr}`.trim();
   if (aborted) {
@@ -754,10 +792,50 @@ async function runDeployCommand(
 }
 
 /**
+ * Bound on a single heartbeat attempt — comfortably shorter than both
+ * {@link CLAIM_HEARTBEAT_MS} (so a timed-out attempt frees the in-flight guard before the
+ * next tick is due) and {@link CLAIM_STALE_MS} (so a hang here is nowhere near enough to
+ * make another watch consider the claim stale on its own).
+ */
+const HEARTBEAT_ATTEMPT_TIMEOUT_MS = 10_000;
+
+/**
+ * Consecutive heartbeat failures (thrown errors or timeouts) before treating the claim as
+ * lost. A single flaky round-trip — a transient network blip — must not abort a running
+ * upload; a run of them means this watch genuinely cannot maintain the claim, and believing
+ * it still holds one it cannot refresh is worse than giving it up.
+ */
+const HEARTBEAT_FAILURE_LIMIT = 3;
+
+/**
+ * Race `promise` against `ms`, rejecting on timeout. `Promise.race` attaches a reaction to
+ * both promises up front, so if `promise` settles after the timeout already won, that later
+ * settlement is still "handled" — it can never surface as an unhandled rejection.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<T>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
  * Heartbeat the S3 claim while an upload runs; invoke onLost if stolen.
  *
  * `opts.heartbeat` / `opts.intervalMs` exist only so tests can inject a slow fake and a
  * short interval without touching real S3 or waiting on the real {@link CLAIM_HEARTBEAT_MS}.
+ *
+ * Each attempt is bounded by `opts.timeoutMs` (default {@link HEARTBEAT_ATTEMPT_TIMEOUT_MS}):
+ * `beat()` reaches `Bun.spawn(["aws", ...])` with no timeout of its own, and a stalled
+ * `aws s3 cp` (a common S3 CLI failure mode) would otherwise leave the in-flight guard stuck
+ * forever, skipping every later tick — worse than not having the guard at all. A throw from
+ * `beat()` (e.g. `aws` missing from PATH) is caught here rather than left to escape `void
+ * tick()` as an unhandled rejection, which previously took the whole `chong watch` process
+ * down. Failures and timeouts are reported via `opts.onProgress` and counted; after
+ * {@link HEARTBEAT_FAILURE_LIMIT} in a row the claim is treated as lost (same as an explicit
+ * `beat() -> false`) rather than swallowed indefinitely — a `chong watch` that cannot refresh
+ * its claim should stop believing it holds one.
  */
 export function startClaimHeartbeat(
   bucket: string | null,
@@ -766,22 +844,39 @@ export function startClaimHeartbeat(
   opts: {
     heartbeat?: (bucket: string, claim: DeployClaim) => Promise<boolean>;
     intervalMs?: number;
+    timeoutMs?: number;
+    onProgress?: (msg: string) => void;
   } = {},
 ): () => void {
   if (!bucket || !claim) return () => {};
   const beat = opts.heartbeat ?? heartbeatDeployClaim;
   const intervalMs = opts.intervalMs ?? CLAIM_HEARTBEAT_MS;
+  const timeoutMs = opts.timeoutMs ?? HEARTBEAT_ATTEMPT_TIMEOUT_MS;
+  const note = opts.onProgress ?? (() => {});
   let lost = false;
   // In-flight guard: a slow S3 round-trip must not let the next tick stack on top of it —
   // overlapping heartbeats can complete out of order and race the claim-release logic.
   let inFlight = false;
+  let consecutiveFailures = 0;
   const tick = async () => {
     if (lost || inFlight) return;
     inFlight = true;
     try {
-      const ok = await beat(bucket, claim);
+      const ok = await withTimeout(beat(bucket, claim), timeoutMs, "heartbeat timed out");
+      consecutiveFailures = 0;
       if (!ok) {
         lost = true;
+        onLost();
+      }
+    } catch (err) {
+      consecutiveFailures += 1;
+      const msg = err instanceof Error ? err.message : String(err);
+      note(
+        `deploy: heartbeat attempt failed (${consecutiveFailures}/${HEARTBEAT_FAILURE_LIMIT}) — ${msg.slice(0, 160)}`,
+      );
+      if (consecutiveFailures >= HEARTBEAT_FAILURE_LIMIT && !lost) {
+        lost = true;
+        note("deploy: heartbeat failed repeatedly — treating claim as lost");
         onLost();
       }
     } finally {
@@ -992,10 +1087,22 @@ export async function runLocalProdDeploy(
   const heldClaim = gate.claim;
 
   let claimLost = false;
-  const stopHeartbeat = startClaimHeartbeat(markerBucket, heldClaim, () => {
-    claimLost = true;
-    note("deploy prod: lost soft claim mid-upload — aborting");
-  });
+  const stopHeartbeat = startClaimHeartbeat(
+    markerBucket,
+    heldClaim,
+    () => {
+      claimLost = true;
+      // shouldAbort below is `claimLost && !force`, so with force set losing the claim
+      // does not abort anything — say so, rather than telling the operator an upload is
+      // aborting while it keeps running.
+      note(
+        force
+          ? "deploy prod: lost soft claim mid-upload — continuing (forced)"
+          : "deploy prod: lost soft claim mid-upload — aborting",
+      );
+    },
+    { onProgress: note },
+  );
 
   try {
     const lost = await confirmClaimBeforeUpload(markerBucket, heldClaim, sha, "prod", force);
@@ -1115,10 +1222,17 @@ export async function runLocalStageDeploy(
   const heldClaim = gate.claim;
 
   let claimLost = false;
-  const stopHeartbeat = startClaimHeartbeat(markerBucket, heldClaim, () => {
-    claimLost = true;
-    note("deploy stage: lost soft claim mid-upload — aborting");
-  });
+  const stopHeartbeat = startClaimHeartbeat(
+    markerBucket,
+    heldClaim,
+    () => {
+      claimLost = true;
+      // Unlike the prod path, stage has no `force` option — shouldAbort below is a plain
+      // `claimLost`, so losing the claim always aborts here; the message stays accurate.
+      note("deploy stage: lost soft claim mid-upload — aborting");
+    },
+    { onProgress: note },
+  );
 
   try {
     note(`deploy stage: resetting shadow to ${tip.slice(0, 7)}…`);
