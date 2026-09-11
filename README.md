@@ -163,30 +163,50 @@ For each new remote commit, chong creates (or resets) a git worktree called `mai
 
 ### Deploy trust boundary
 
-`chong watch` can deploy stage and prod from your laptop. Two things about that are
-deliberate, and worth knowing before you point chong at a repo you do not control.
+`chong watch` can deploy stage and prod from your laptop, and can run an AI agent that
+commits and pushes. Most of what follows is deliberate, but read it before you point
+chong at a repo whose contributors you do not trust.
 
 **The deploy inherits your whole environment.** The deploy command runs with your full
 `process.env` — AWS credentials included. It has to: the build reads an open-ended set of
 `VITE_*` vars from `.env`, and an allowlist that misses one does not fail loudly, it ships
 a build with a feature silently disabled. The consequence is that any script the deploy
 invokes runs with your credentials, so a compromised build script in a watched worktree
-can exfiltrate them. Treat "chong can deploy this repo" as equivalent to "this repo's
-scripts can act as me".
+can exfiltrate them.
 
-**`.chong/config.json` is committed, and partly executable.** chong's ignore rule is
-`.chong/*` plus `!.chong/config.json`, so the per-repo config is shared — that is the
-point, a colleague running `chong watch` gets the same behaviour with no setup. But it
-means `stageDeployCmd` / `prodDeployCmd` are repo-controlled text that chong runs through
-`bash -c`. Commands coming from config are therefore rejected if they contain shell
-metacharacters (semicolon, pipe, ampersand, `$`, backtick, parentheses, angle brackets,
-newlines); put anything that needs a pipeline into a checked-in script and point the
-config at that instead. Commit access to a watched repo is still a trust relationship — this narrows the blast radius, it does not remove it.
+**Commit access to a watched repo is code execution as you.** Not "could become" —
+is. chong's job is to run the repo's own deploy script, so it runs repo-controlled code
+by design. For a repo containing `scripts/deploy-frontend.sh` that is armed
+automatically on a ~60s cooldown with no keypress, and the script itself is committed
+and unvalidated. `.chong/config.json` is committed too (the ignore rule is `.chong/*`
+plus `!.chong/config.json`, so a colleague gets the same behaviour with no setup), and
+its `stageDeployCmd` / `prodDeployCmd` are passed to `bash -c`.
+
+Commands coming from that config are rejected if they contain a shell metacharacter
+(semicolon, pipe, ampersand, `$`, backtick, parentheses, angle brackets) or a newline.
+Be clear about what that is worth: it stops shell *syntax*, not code execution. `bash
+.ci/deploy.sh` and `BASH_ENV=./tools/x.sh bash -c :` contain no forbidden character and
+both work. It is defence-in-depth against a careless or noisy config, not a boundary —
+and it guards the weaker path, since an attacker would edit the deploy script rather
+than the config.
+
+The thing that actually bounds the damage, if you want it bounded, is a scoped
+credential: run deploys under a dedicated `AWS_PROFILE` with write access only to the
+deploy buckets, instead of inheriting your whole environment. That is not done here.
+Until it is, treat pointing chong at a repo as granting that repo's contributors your
+shell and your credentials, and watch only repos whose commit access you already trust.
 
 **Deploy claims are advisory.** The S3 claim markers that stop two watches deploying at
 once are cooperative, not enforced: there are no conditional writes, so anyone with write
 access to the marker bucket can force or spoof a claim, and CI / `deploy-frontend.sh`
 bypass claims entirely. They prevent accidents between colleagues, not deliberate races.
+
+**The auto-fix agent is fenced, but it still commits.** The i18n/eslint agent is prompted
+with repo-authored text (`.po` msgids, string literals, eslint messages), so that text is
+wrapped as untrusted data and the agent runs with a scrubbed environment — no `AWS_*`, no
+`*_TOKEN` — because unlike the deploy it has no reason to see them. It does still edit the
+shadow worktree and push to `main` unattended, and prompt fencing is mitigation rather
+than proof, so `--no-agent` is the switch if you would rather it did not.
 
 ---
 
