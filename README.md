@@ -161,6 +161,33 @@ For each new remote commit, chong creates (or resets) a git worktree called `mai
 
 `node_modules` is symlinked from the source repo (same lockfile, no reinstall). Auto-fix commits are tagged `FIX:` and skipped on re-check to avoid loops.
 
+### Deploy trust boundary
+
+`chong watch` can deploy stage and prod from your laptop. Two things about that are
+deliberate, and worth knowing before you point chong at a repo you do not control.
+
+**The deploy inherits your whole environment.** The deploy command runs with your full
+`process.env` — AWS credentials included. It has to: the build reads an open-ended set of
+`VITE_*` vars from `.env`, and an allowlist that misses one does not fail loudly, it ships
+a build with a feature silently disabled. The consequence is that any script the deploy
+invokes runs with your credentials, so a compromised build script in a watched worktree
+can exfiltrate them. Treat "chong can deploy this repo" as equivalent to "this repo's
+scripts can act as me".
+
+**`.chong/config.json` is committed, and partly executable.** chong's ignore rule is
+`.chong/*` plus `!.chong/config.json`, so the per-repo config is shared — that is the
+point, a colleague running `chong watch` gets the same behaviour with no setup. But it
+means `stageDeployCmd` / `prodDeployCmd` are repo-controlled text that chong runs through
+`bash -c`. Commands coming from config are therefore rejected if they contain shell
+metacharacters (semicolon, pipe, ampersand, `$`, backtick, parentheses, angle brackets,
+newlines); put anything that needs a pipeline into a checked-in script and point the
+config at that instead. Commit access to a watched repo is still a trust relationship — this narrows the blast radius, it does not remove it.
+
+**Deploy claims are advisory.** The S3 claim markers that stop two watches deploying at
+once are cooperative, not enforced: there are no conditional writes, so anyone with write
+access to the marker bucket can force or spoof a claim, and CI / `deploy-frontend.sh`
+bypass claims entirely. They prevent accidents between colleagues, not deliberate races.
+
 ---
 
 ## Part 2 — additional features with a Harness account
