@@ -433,8 +433,28 @@ export function resolveStageDeployCmd(repoPath: string, configured: string): str
  */
 const DISCORD_NOTIFY_REPO_PATH = "sesam/chong";
 
+/**
+ * Service token for the notify relay: `DISCORD_NOTIFY_TOKEN`, else `~/.chong/notify-token`.
+ *
+ * The file fallback is the one that matters. `chong watch` is a long-running daemon, so it
+ * inherits the environment of whichever shell happened to start it — export the var today
+ * and the watch you started yesterday still posts unauthenticated, which is exactly how
+ * this was first noticed. A machine-local file survives restarts and needs no shell setup.
+ * Outside any repo on purpose: the credential identifies chong itself, not the repo being
+ * watched, and `<repo>/.chong/config.json` is a committed file.
+ */
+function discordNotifyToken(): string {
+  const fromEnv = String(process.env.DISCORD_NOTIFY_TOKEN || "").trim();
+  if (fromEnv) return fromEnv;
+  try {
+    return readFileSync(path.join(homedir(), ".chong", "notify-token"), "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
 export async function notifyDiscordStage(message: string): Promise<boolean> {
-  const token = process.env.DISCORD_NOTIFY_TOKEN;
+  const token = discordNotifyToken();
   // Strictly additive: with no token configured we send byte-for-byte the body
   // we always sent. Never `token: ""` — an empty credential is a failed auth,
   // not an absent one, and unauthenticated posts still deliver (they just page
