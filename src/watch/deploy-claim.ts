@@ -17,7 +17,7 @@
  */
 import { hostname } from "node:os";
 import { userInfo } from "node:os";
-import { sanitizeClaimField } from "./claim-sanitize";
+import { sanitizeDisplayText } from "./sanitize-display";
 
 export const DEPLOY_CLAIM_KEY = "deploy-claim.json";
 
@@ -99,9 +99,9 @@ export function parseDeployClaim(raw: string): DeployClaim | null {
     if (typeof parsed.user !== "string" || !parsed.user) return null;
     if (typeof parsed.sha !== "string" || !/^[0-9a-f]{7,40}$/i.test(parsed.sha)) return null;
     if (typeof parsed.at !== "string" || !parsed.at) return null;
-    const user = sanitizeClaimField(parsed.user, CLAIM_FIELD_MAX_LEN) || "unknown";
+    const user = sanitizeDisplayText(parsed.user, CLAIM_FIELD_MAX_LEN) || "unknown";
     const hostRaw =
-      typeof parsed.host === "string" ? sanitizeClaimField(parsed.host, CLAIM_FIELD_MAX_LEN) : "";
+      typeof parsed.host === "string" ? sanitizeDisplayText(parsed.host, CLAIM_FIELD_MAX_LEN) : "";
     const host = hostRaw || undefined;
     return {
       v: 1,

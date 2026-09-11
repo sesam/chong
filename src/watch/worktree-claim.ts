@@ -23,7 +23,7 @@ import {
 } from "node:fs";
 import { hostname, userInfo } from "node:os";
 import path from "node:path";
-import { sanitizeClaimField } from "./claim-sanitize";
+import { sanitizeDisplayText } from "./sanitize-display";
 
 /** Window with no touch after which another watch may take over the claim. */
 export const WORKTREE_CLAIM_STALE_MS = 20 * 60 * 1_000;
@@ -80,10 +80,10 @@ export function parseWorktreeClaim(raw: string): WorktreeClaim | null {
     if (typeof parsed.id !== "string" || !parsed.id) return null;
     if (typeof parsed.user !== "string" || !parsed.user) return null;
     if (typeof parsed.at !== "string" || !parsed.at) return null;
-    const user = sanitizeClaimField(parsed.user, CLAIM_FIELD_MAX_LEN);
+    const user = sanitizeDisplayText(parsed.user, CLAIM_FIELD_MAX_LEN);
     if (!user) return null;
     const host =
-      typeof parsed.host === "string" ? sanitizeClaimField(parsed.host, CLAIM_FIELD_MAX_LEN) : "";
+      typeof parsed.host === "string" ? sanitizeDisplayText(parsed.host, CLAIM_FIELD_MAX_LEN) : "";
     return {
       v: 1,
       id: parsed.id,

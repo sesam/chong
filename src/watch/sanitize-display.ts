@@ -1,10 +1,15 @@
 /**
- * Shared sanitizer for the untrusted display fields (`user` / `host`) carried in both
- * claim types this module family guards: the worktree owner file (`worktree-claim.ts`,
- * local JSON another process on the machine can write) and the deploy claim
- * (`deploy-claim.ts`, an S3 object anyone with bucket write access can write). Both
- * files parse this JSON off an untrusted store and render it straight into the watch
- * TUI, so an unsanitized field is a terminal-injection and identity-spoofing vector.
+ * Shared sanitizer for every untrusted string this tool prints to the terminal.
+ *
+ * Three sources, all attacker-influenced, all rendered straight into the watch TUI:
+ * the worktree owner file (`worktree-claim.ts`, local JSON another process on the
+ * machine can write), the deploy claim (`deploy-claim.ts`, an S3 object anyone with
+ * bucket write access can write), and git commit metadata (`repo.ts`, author and
+ * subject — which needs only a merged PR, and is therefore the most reachable of the
+ * three). An unsanitized field here is a terminal-injection and identity-spoofing
+ * vector, so all three go through this one function rather than three near-copies:
+ * the first version of this shipped as two divergent denylists that had already
+ * drifted apart on whether they trimmed.
  *
  * This is deliberately an ALLOWLIST, not a denylist: after NFC normalization, keep only
  * Unicode categories L (letter), N (number), P (punctuation) and Zs (space separator),
@@ -20,7 +25,7 @@
  * categories are in the allowlist, so they never survive regardless of what new escape
  * family shows up next. Do not "optimize" this back into a denylist of bytes to reject.
  */
-export function sanitizeClaimField(value: string, maxLen: number): string {
+export function sanitizeDisplayText(value: string, maxLen: number): string {
   const normalized = value.normalize("NFC");
   let out = "";
   for (const ch of normalized) {

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { sanitizeDisplayText } from "./sanitize-display";
 import type { Commit } from "./types";
 
 type Run = { ok: boolean; out: string; err: string; code: number };
@@ -72,13 +73,11 @@ const COMMIT_SUBJECT_MAX_LEN = 300;
  * runs on user-facing prose (a commit subject is free text, not an identity string), so
  * normal punctuation and accented Latin survive intact.
  *
- * TODO(unify): when the shared claim-field sanitizer helper lands (it's being extracted
- * from worktree-claim.ts / deploy-claim.ts concurrently with this change), swap this for
- * that helper — same allowlist, just needs a shared export to call instead.
+ * The allowlist itself lives in `sanitize-display.ts` and is shared with the claim
+ * parsers; this wrapper exists only to name the commit-metadata use and carry its caps.
  */
 export function sanitizeCommitText(value: string, maxLen: number): string {
-  const printable = value.normalize("NFC").replace(/[^\p{L}\p{N}\p{P}\p{Zs}]/gu, "");
-  return printable.slice(0, maxLen);
+  return sanitizeDisplayText(value, maxLen);
 }
 
 export function parseCommit(line: string): Commit | null {
