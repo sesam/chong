@@ -56,8 +56,12 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   let worktreeOwned = false;
   let foreignWorktreeClaim: WorktreeClaim | null = null;
   let lastWorktreeTouchAt = 0;
-  /** True when we have seen incoming commits since the last worktree touch. */
-  let commitsSinceWorktreeTouch = false;
+  /**
+   * Set while `[o]` is waiting on a second keypress to confirm stealing a *live* foreign
+   * worktree claim (names the claim we warned the operator about). Null the rest of the
+   * time — the free/stale path never touches this and stays a single keypress.
+   */
+  let pendingWorktreeOverride: WorktreeClaim | null = null;
 
   let pipeline: Pipeline | null = null;
   let baseline: Set<string> | null = null; // remote incoming shas at the moment watch started
@@ -157,7 +161,6 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       worktreeOwned = true;
       foreignWorktreeClaim = null;
       lastWorktreeTouchAt = Date.now();
-      commitsSinceWorktreeTouch = false;
       if (res.forced && prev && prev.id !== processId) {
         addNotice(c.yellow(`⚒ worktree claim forced — was ${formatWorktreeHolder(prev)}`));
       }
@@ -168,13 +171,24 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     return false;
   }
 
+  /** Shared tail of the `[o]` override — force-take and report, whether armed via a
+   * confirmed prompt or (free/stale case) taken outright on the first keypress. */
+  function finishWorktreeOverride(): void {
+    if (tryTakeWorktree(true)) {
+      addNotice(c.green("✓ worktree override taken — auto-maintain enabled"));
+      ui.worktreeOverride = null;
+      if (cfg.autoMaintain && pipeline) queueAutoMaintain("after worktree override");
+    }
+  }
+
   function maybeTouchWorktreeClaim(): void {
+    // Runs off the 1s clock regardless of repo activity: liveness must not depend on
+    // commits arriving. A quiet `main`, or a long deploy/maintain run with no new
+    // commits, must not let the claim age out from under a process that is still here.
     if (!worktreeOwned) return;
-    if (!commitsSinceWorktreeTouch) return;
     if (Date.now() - lastWorktreeTouchAt < WORKTREE_CLAIM_TOUCH_MS) return;
     if (touchWorktreeClaim(shadowPath, processId)) {
       lastWorktreeTouchAt = Date.now();
-      commitsSinceWorktreeTouch = false;
     } else {
       worktreeOwned = false;
       foreignWorktreeClaim = readWorktreeClaim(shadowPath);
@@ -725,7 +739,6 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
         for (const cm of p.incoming) {
           if (!baseline.has(cm.sha)) {
             ui.newShas.add(cm.sha);
-            commitsSinceWorktreeTouch = true;
             if (!checkedShas.has(cm.sha)) {
               checkedShas.add(cm.sha);
               const sha = cm.sha;
@@ -1022,6 +1035,22 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       if (s === "q" || s === "\x03") quit();
       return;
     }
+
+    // Any key that will not resolve the worktree-override prompt cancels it — it must
+    // never sit there waiting to be accidentally confirmed by an unrelated keypress.
+    // Falls through so that key still does its own normal thing (e.g. `o` re-arms fresh
+    // against current state, `n`/esc is a no-op on top of this).
+    //
+    // `y` only reaches the override when no gap-promote confirm is open: that case is
+    // handled first and returns. So a `y` with `ui.confirm` set promotes the gap and
+    // would otherwise leave this armed but invisible — `ui.status` having been replaced
+    // by the prod-route prompt — and the operator's *next* `y` would silently steal a
+    // live claim they were never re-warned about. Treat that `y` as a cancel too.
+    if (pendingWorktreeOverride && !(s === "y" && ui.confirm === null)) {
+      pendingWorktreeOverride = null;
+      ui.status = "";
+    }
+
     const maxGap = pipeline.gaps.length - 1;
 
     // dedicated promote/deploy hotkey per gap (e.g. "s" → stage, "p" → prod)
@@ -1073,6 +1102,30 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
           void doPromote(ui.confirm);
           return;
         }
+        if (pendingWorktreeOverride) {
+          const armed = pendingWorktreeOverride;
+          pendingWorktreeOverride = null;
+          ui.status = "";
+          if (!isWorktreeClaimActive(shadowPath)) {
+            // Went stale, or was released, while we waited on the confirm — nothing
+            // live left to steal from.
+            finishWorktreeOverride();
+          } else {
+            const current = readWorktreeClaim(shadowPath);
+            if (current && current.id !== armed.id) {
+              // A different process holds it now than when we warned the operator —
+              // don't silently steal from someone we never named; re-arm against them.
+              pendingWorktreeOverride = current;
+              ui.status = c.yellow(
+                `⚠ ${formatWorktreeHolder(current)} now holds the live claim — [y] steal it anyway  [n] cancel`,
+              );
+            } else {
+              finishWorktreeOverride();
+            }
+          }
+          paint();
+          return;
+        }
         break;
       // `r` is the CI-refresh key globally; while a prod prompt is open it means
       // "remote". Both live in this one case — a second `case "r"` below would be
@@ -1109,13 +1162,21 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
         void refresh();
         return;
       case "o":
-        // Override a live foreign worktree claim — only meaningful when we do not own it.
+        // Override a foreign worktree claim — only meaningful when we do not own it.
         if (!worktreeOwned && foreignWorktreeClaim) {
-          if (tryTakeWorktree(true)) {
-            addNotice(c.green("✓ worktree override taken — auto-maintain enabled"));
-            ui.worktreeOverride = null;
-            if (cfg.autoMaintain && pipeline) queueAutoMaintain("after worktree override");
+          if (!isWorktreeClaimActive(shadowPath)) {
+            // Free or stale — no live owner to steal from, so act immediately exactly
+            // as before: no extra keypress in the common case.
+            finishWorktreeOverride();
+            paint();
+            return;
           }
+          // A live claim: don't take it on a single keypress — name whose claim it is
+          // and wait for a confirming [y] (any other key cancels, see above).
+          pendingWorktreeOverride = readWorktreeClaim(shadowPath) ?? foreignWorktreeClaim;
+          ui.status = c.yellow(
+            `⚠ ${formatWorktreeHolder(pendingWorktreeOverride)} has a live worktree claim — [y] steal it anyway  [n] cancel`,
+          );
           paint();
           return;
         }
