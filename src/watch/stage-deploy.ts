@@ -431,7 +431,7 @@ export function resolveStageDeployCmd(repoPath: string, configured: string): str
  * `repoPath` variable used elsewhere in this file: it names the repo that owns
  * this code, not the repo being deployed.
  */
-const DISCORD_NOTIFY_REPO_PATH = "sesam/chong";
+const DISCORD_NOTIFY_REPO_PATH = "https://github.com/sesam/chong";
 
 /**
  * Service token for the notify relay: `DISCORD_NOTIFY_TOKEN`, else `~/.chong/notify-token`.
