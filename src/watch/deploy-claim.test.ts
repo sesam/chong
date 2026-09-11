@@ -239,6 +239,100 @@ describe("deploy-claim S3 acquire/release (stubbed S3)", () => {
     stubAwsS3(store);
     expect(await readDeployClaim(bucket)).toBeNull();
   });
+
+  /**
+   * Wraps the read path so the first `failCount` GETs against the marker key report a
+   * transient failure (non-zero exit, no "NoSuchKey") instead of reflecting `store` —
+   * simulating a network blip on the verifying read-back rather than "the key doesn't
+   * exist" or "someone else's claim is there". Reads past `failCount` behave normally.
+   */
+  function stubAwsS3WithTransientReadFailures(store: Map<string, string>, failCount: number) {
+    let readAttempts = 0;
+    return spyOn(Bun, "spawn").mockImplementation(((
+      args: string[],
+      opts: Record<string, unknown>,
+    ) => {
+      const [, , action, ...rest] = args;
+      if (action === "cp" && rest[0] === "-") {
+        const uri = rest[1] as string;
+        const exited = (async () => {
+          const body = await new Response(opts.stdin as Blob).text();
+          store.set(uri, body);
+          return 0;
+        })();
+        return { exited, stdout: new Response("").body, stderr: new Response("").body };
+      }
+      if (action === "cp") {
+        readAttempts += 1;
+        if (readAttempts <= failCount) {
+          return {
+            exited: Promise.resolve(1),
+            stdout: new Response("").body,
+            stderr: new Response("simulated transient network error").body,
+          };
+        }
+        const uri = rest[0] as string;
+        const val = store.get(uri);
+        return {
+          exited: Promise.resolve(val === undefined ? 1 : 0),
+          stdout: new Response(val ?? "").body,
+          stderr: new Response(val === undefined ? "NoSuchKey" : "").body,
+        };
+      }
+      if (action === "rm") {
+        const uri = rest[0] as string;
+        store.delete(uri);
+        return {
+          exited: Promise.resolve(0),
+          stdout: new Response("").body,
+          stderr: new Response("").body,
+        };
+      }
+      throw new Error(`unstubbed aws invocation: ${JSON.stringify(args)}`);
+    }) as unknown as typeof Bun.spawn);
+  }
+
+  test("a transient read-back blip that clears within the retry budget still succeeds", async () => {
+    const store = new Map<string, string>();
+    // acquireDeployClaim's own pre-write "is it already held" read is attempt #1 (fails
+    // harmlessly — falls back to "no existing claim" and writes anyway); the verify
+    // read-back is attempt #2 (fails); the first retry, attempt #3, sees our own
+    // successful write and succeeds.
+    stubAwsS3WithTransientReadFailures(store, 2);
+    const pid = "13131313-1313-1313-1313-131313131313";
+
+    const result = await acquireDeployClaim(bucket, sha, pid, {
+      waitMs: 0,
+      verifyRetryDelayMs: 1,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.claim.id).toBe(pid);
+    // Our claim must still be the one sitting in the bucket — no orphan cleanup ran.
+    expect((await readDeployClaim(bucket))?.id).toBe(pid);
+  });
+
+  test("a read-back that never recovers releases the claim we wrote instead of orphaning it", async () => {
+    const store = new Map<string, string>();
+    // Every read through the verify sequence fails transiently: the pre-write "is it
+    // already held" read (#1), the initial verify read-back (#2), and both retries (#3,
+    // #4). The 5th read (release's own lookup, after acquireDeployClaim gives up)
+    // succeeds and sees our real write, so release can clean it up.
+    stubAwsS3WithTransientReadFailures(store, 4);
+    const pid = "14141414-1414-1414-1414-141414141414";
+
+    const result = await acquireDeployClaim(bucket, sha, pid, {
+      waitMs: 0,
+      verifyRetryDelayMs: 1,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("verify");
+      if (result.reason === "verify") expect(result.got).toBeNull();
+    }
+    // The acquire must not leave its own successful write behind as an orphaned claim
+    // that the next watch would report as "deploying by <user>" for the stale window.
+    expect(store.size).toBe(0);
+  });
 });
 
 describe("worktree-claim", () => {

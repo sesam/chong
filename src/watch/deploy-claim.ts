@@ -17,6 +17,7 @@
  */
 import { hostname } from "node:os";
 import { userInfo } from "node:os";
+import { sanitizeClaimField } from "./claim-sanitize";
 
 export const DEPLOY_CLAIM_KEY = "deploy-claim.json";
 
@@ -88,21 +89,6 @@ export function formatDeployClaim(claim: DeployClaim): string {
 /** Max length kept for a display field after sanitizing (longer input is truncated). */
 const CLAIM_FIELD_MAX_LEN = 64;
 
-/**
- * Strip ANSI escapes and other control/non-printable characters from a claim display
- * field (`user` / `host`), then cap its length. Anyone with write access to the marker
- * bucket controls this JSON, so an unsanitized `user`/`host` is a terminal-injection
- * vector into the watch TUI — sanitizing here (in parse) protects every consumer, not
- * just {@link formatClaimHolder}.
- */
-function sanitizeClaimField(value: string): string {
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: deliberately stripping ANSI/control bytes
-  const withoutCsi = value.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, ""); // CSI sequences (colours, cursor moves, etc.)
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: deliberately stripping ANSI/control bytes
-  const withoutControls = withoutCsi.replace(/[\x00-\x1f\x7f]/g, ""); // remaining control chars (incl. bare ESC, CR/LF)
-  return withoutControls.trim().slice(0, CLAIM_FIELD_MAX_LEN);
-}
-
 export function parseDeployClaim(raw: string): DeployClaim | null {
   const text = raw.trim();
   if (!text) return null;
@@ -113,8 +99,9 @@ export function parseDeployClaim(raw: string): DeployClaim | null {
     if (typeof parsed.user !== "string" || !parsed.user) return null;
     if (typeof parsed.sha !== "string" || !/^[0-9a-f]{7,40}$/i.test(parsed.sha)) return null;
     if (typeof parsed.at !== "string" || !parsed.at) return null;
-    const user = sanitizeClaimField(parsed.user) || "unknown";
-    const hostRaw = typeof parsed.host === "string" ? sanitizeClaimField(parsed.host) : "";
+    const user = sanitizeClaimField(parsed.user, CLAIM_FIELD_MAX_LEN) || "unknown";
+    const hostRaw =
+      typeof parsed.host === "string" ? sanitizeClaimField(parsed.host, CLAIM_FIELD_MAX_LEN) : "";
     const host = hostRaw || undefined;
     return {
       v: 1,
@@ -167,6 +154,33 @@ export async function releaseDeployClaim(
 }
 
 /**
+ * Bounded retries for the write-then-read-back verification in {@link acquireDeployClaim}.
+ * A transient GET blip immediately after our own successful PUT must not be mistaken for
+ * "another writer's claim won" (there is nothing to fall back to — the bucket really does
+ * hold our claim) nor left unresolved: an acquire that gives up on a single failed read
+ * abandons a live claim in the bucket with nobody left to release it, so the next watch
+ * to read it reports a foreign "deploying by <user>" for up to the full stale window.
+ * Retrying rides out the blip; only once it stays unreadable do we treat it as a real
+ * failure (see the `got === null` handling at each call site, which releases our own
+ * write before returning).
+ */
+const VERIFY_READBACK_RETRIES = 2;
+const VERIFY_READBACK_RETRY_DELAY_MS = 200;
+
+async function readDeployClaimRetrying(
+  bucket: string,
+  retries: number,
+  delayMs: number,
+): Promise<DeployClaim | null> {
+  let got = await readDeployClaim(bucket);
+  for (let attempt = 0; got === null && attempt < retries; attempt++) {
+    await sleep(delayMs);
+    got = await readDeployClaim(bucket);
+  }
+  return got;
+}
+
+/**
  * Rewrite `at` for a claim we still own. Returns false if someone else took it.
  */
 export async function heartbeatDeployClaim(bucket: string, ours: DeployClaim): Promise<boolean> {
@@ -193,11 +207,17 @@ export async function acquireDeployClaim(
     force?: boolean;
     waitMs?: number;
     onProgress?: (msg: string) => void;
+    /** Test hook: override the read-back retry count (default {@link VERIFY_READBACK_RETRIES}). */
+    verifyRetries?: number;
+    /** Test hook: override the read-back retry delay (default {@link VERIFY_READBACK_RETRY_DELAY_MS}). */
+    verifyRetryDelayMs?: number;
   } = {},
 ): Promise<ClaimAcquireResult> {
   const note = opts.onProgress ?? (() => {});
   const waitMs = opts.waitMs ?? CLAIM_PROPAGATION_MS;
   const force = opts.force === true;
+  const verifyRetries = opts.verifyRetries ?? VERIFY_READBACK_RETRIES;
+  const verifyRetryDelayMs = opts.verifyRetryDelayMs ?? VERIFY_READBACK_RETRY_DELAY_MS;
 
   const existing = await readDeployClaim(bucket);
   if (existing && !isClaimStale(existing) && existing.id !== processId && !force) {
@@ -214,7 +234,7 @@ export async function acquireDeployClaim(
     await sleep(waitMs);
   }
 
-  const got = await readDeployClaim(bucket);
+  const got = await readDeployClaimRetrying(bucket, verifyRetries, verifyRetryDelayMs);
   if (got && got.id === claim.id) {
     return { ok: true, claim };
   }
@@ -230,9 +250,17 @@ export async function acquireDeployClaim(
       await sleep(waitMs);
     }
 
-    const gotAfterForce = await readDeployClaim(bucket);
+    const gotAfterForce = await readDeployClaimRetrying(bucket, verifyRetries, verifyRetryDelayMs);
     if (gotAfterForce && gotAfterForce.id === forced.id) {
       return { ok: true, claim: forced, forced: true };
+    }
+
+    if (gotAfterForce === null) {
+      // We know the PUT above succeeded; the verifying read still can't see it even
+      // after retrying. Don't abandon a live claim in the bucket — release the one we
+      // just wrote so the next watch to look doesn't see a foreign claim with nobody
+      // around to clear it.
+      await releaseDeployClaim(bucket, forced);
     }
 
     return {
@@ -242,12 +270,19 @@ export async function acquireDeployClaim(
       got: gotAfterForce,
       error: gotAfterForce
         ? `claim read-back mismatch (got ${formatClaimHolder(gotAfterForce)})`
-        : "claim read-back empty after write",
+        : "claim read-back empty after write, even after retrying — wrote claim released",
     };
   }
 
   if (got && !isClaimStale(got)) {
     return { ok: false, reason: "held", claim: got };
+  }
+
+  if (got === null) {
+    // Same reasoning as the force branch above: our own write succeeded, the read-back
+    // just can't confirm it, so don't leave that claim behind for someone else to trip
+    // over as a phantom "held by <us>".
+    await releaseDeployClaim(bucket, claim);
   }
 
   return {
@@ -257,7 +292,7 @@ export async function acquireDeployClaim(
     got,
     error: got
       ? `claim read-back mismatch (got ${formatClaimHolder(got)})`
-      : "claim read-back empty after write",
+      : "claim read-back empty after write, even after retrying — wrote claim released",
   };
 }
 

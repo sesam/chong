@@ -12,8 +12,18 @@
  * stale window, leaving margin for scheduling jitter or a slow tick. After a full stale
  * window with no touch, another watch may take over (or the operator can force-override).
  */
-import { existsSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { hostname, userInfo } from "node:os";
+import path from "node:path";
+import { sanitizeClaimField } from "./claim-sanitize";
 
 /** Window with no touch after which another watch may take over the claim. */
 export const WORKTREE_CLAIM_STALE_MS = 20 * 60 * 1_000;
@@ -63,18 +73,6 @@ export function formatWorktreeHolder(claim: WorktreeClaim): string {
 /** Cap on `user` / `host` after sanitization — plenty for any real identity string. */
 const CLAIM_FIELD_MAX_LEN = 80;
 
-/**
- * Strip ANSI escapes and other non-printable/control characters from an untrusted claim
- * field, then cap its length. The owner file is JSON parsed from disk (or, upstream, an S3
- * object another process wrote); a malformed or hostile file must not be able to inject
- * terminal escape sequences into the TUI via `formatWorktreeHolder`.
- */
-function sanitizeClaimField(value: string): string {
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: deliberately stripping control chars
-  const stripped = value.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x1f\x7f]/g, "");
-  return stripped.slice(0, CLAIM_FIELD_MAX_LEN);
-}
-
 export function parseWorktreeClaim(raw: string): WorktreeClaim | null {
   try {
     const parsed = JSON.parse(raw.trim()) as Partial<WorktreeClaim>;
@@ -82,9 +80,10 @@ export function parseWorktreeClaim(raw: string): WorktreeClaim | null {
     if (typeof parsed.id !== "string" || !parsed.id) return null;
     if (typeof parsed.user !== "string" || !parsed.user) return null;
     if (typeof parsed.at !== "string" || !parsed.at) return null;
-    const user = sanitizeClaimField(parsed.user);
+    const user = sanitizeClaimField(parsed.user, CLAIM_FIELD_MAX_LEN);
     if (!user) return null;
-    const host = typeof parsed.host === "string" ? sanitizeClaimField(parsed.host) : "";
+    const host =
+      typeof parsed.host === "string" ? sanitizeClaimField(parsed.host, CLAIM_FIELD_MAX_LEN) : "";
     return {
       v: 1,
       id: parsed.id,
@@ -120,9 +119,37 @@ export function isWorktreeClaimActive(shadowPath: string, nowMs = Date.now()): b
   }
 }
 
+/**
+ * Write the owner file by writing a temp file in the same directory and `renameSync`ing
+ * it over the target, rather than `writeFileSync`ing the target path directly.
+ *
+ * `writeFileSync(p, ...)` opens `p` for writing and, if `p` is a symlink, follows it —
+ * so a same-user process that plants a symlink at the owner-file path (pointing at, say,
+ * an operator-owned dotfile) could use a legitimate claim write to overwrite that file's
+ * contents with claim JSON. `renameSync(tmp, p)` never opens or follows whatever
+ * currently sits at `p`: POSIX rename() replaces the directory entry at the destination
+ * atomically, symlink or not, the same way `unlink` doesn't follow a symlink target. This
+ * keeps the replace atomic (the property the stale-takeover/force/touch paths rely on)
+ * without following a planted link. It deliberately does not touch
+ * {@link createWorktreeClaimExclusive}'s `wx` create path — that one must fail on an
+ * existing path rather than ever replace anything, which `O_EXCL` already guarantees.
+ */
 export function writeWorktreeClaim(shadowPath: string, claim: WorktreeClaim): void {
   const p = worktreeOwnerPath(shadowPath);
-  writeFileSync(p, `${JSON.stringify(claim)}\n`, "utf8");
+  const dir = path.dirname(p);
+  const suffix = `${process.pid}-${Math.random().toString(36).slice(2)}`;
+  const tmp = path.join(dir, `.${path.basename(p)}.tmp-${suffix}`);
+  try {
+    writeFileSync(tmp, `${JSON.stringify(claim)}\n`, { encoding: "utf8", flag: "wx" });
+    renameSync(tmp, p);
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* nothing to clean up, or already gone */
+    }
+    throw err;
+  }
 }
 
 /**
@@ -145,11 +172,26 @@ function createWorktreeClaimExclusive(shadowPath: string, claim: WorktreeClaim):
   }
 }
 
-/** Refresh mtime (and `at`) so other watches see we are still alive. */
+/**
+ * Refresh mtime (and `at`) so other watches see we are still alive.
+ *
+ * Uses the same compare-and-swap discipline as {@link acquireWorktreeClaim}'s
+ * stale-takeover path: re-read and recheck `id`+`at` immediately before writing, not
+ * just once up front. Without that recheck, a touch that read the file just before an
+ * operator's legitimate `force` override would still see the pre-override claim in
+ * hand, and its write below would unconditionally restore it — reverting a live,
+ * intentional takeover and leaving both processes believing they own the worktree
+ * (with the new owner potentially already resetting it). Recheck-then-write closes that
+ * window; on a mismatch we've lost ownership, so report that like any other loss.
+ */
 export function touchWorktreeClaim(shadowPath: string, processId: string): boolean {
   const current = readWorktreeClaim(shadowPath);
   if (!current || current.id !== processId) return false;
   const next: WorktreeClaim = { ...current, at: new Date().toISOString() };
+
+  const recheck = readWorktreeClaim(shadowPath);
+  if (!recheck || recheck.id !== processId || recheck.at !== current.at) return false;
+
   writeWorktreeClaim(shadowPath, next);
   try {
     const now = new Date();
