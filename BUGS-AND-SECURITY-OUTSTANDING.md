@@ -11,6 +11,12 @@ Two review passes over `chong watch`'s deploy, claim and shadow-worktree paths.
 `bun test` **243 pass / 0 fail** (was 120), `bunx tsc --noEmit` clean (was 1 error),
 `bun build --compile` succeeds. 10 commits, `db03f05..04af20a`.
 
+⚠ **All of it is local-only.** `origin/main` is ~17 commits behind, and chong has **no CI
+at all** — no `.github/workflows` directory — so nothing here exists for any other machine
+or colleague until someone pushes. The 243 tests also run nowhere but a laptop. Adding a
+workflow that runs `bun test` + `bunx tsc --noEmit` is the single highest-leverage follow-up
+in this file: every regression the second review pass caught would then be caught for free.
+
 **Pass 2 found three defects that pass 1 introduced**, and one critical pre-existing one
 that pass 1 walked straight past. That is the main lesson here: the fixes needed reviewing
 at least as much as the original code did.
@@ -111,6 +117,34 @@ class of bug with a type rather than a convention.
   it used to be unbounded.
 - Worktree and deploy claims are advisory. They prevent accidents between colleagues, not
   deliberate races, and `Ctrl-C` leaves a claim to age out through its stale window.
+
+## Beyond chong: the same day's work in the LynxCraft repos
+
+This file stays chong-scoped. The cross-repo security and cleanup work that followed it
+lives in **`~/lc/FRONTEND/TECH-DEBT.md`** (the canonical S/D/H register) — recorded here
+only so the trail is followable:
+
+- **S2 — `/api/chat_gpt_stream` auth.** The FRONTEND half was already done; the real gap was
+  `parcele-fe`, which has no session and sends no credential, so its chat returned
+  *Unauthorized* (confirmed in a browser, not inferred). Anonymous is now allowed on the
+  API Gateway route, bounded by the payload cap and per-IP brake it had never had
+  (parcele-be `f355207`, deployed to stage and verified by `CodeSha256`). **Still open:** the
+  same change is needed on the CloudFront Function URL handler, which is the path
+  `parcele-fe` actually uses.
+- **Retired routes deleted** — the four 410 chat handlers (`5663c25`) and the whole Pareto
+  chat proxy (`abb02b1`, `9f98b68`), each on per-request traffic evidence.
+- **FRONTEND browser PDF extraction removed** (`a600f383`) — its output was gated on a flag
+  the server hardcodes true, so it was extracted and dropped on every attach.
+- **The `/api/lambda` email-link shim was made permanent** (PHP-BACKEND `fd9728b`) and
+  written into the decommission gate, rather than deleted as an expired TODO.
+- **Two live secrets sit in public client bundles** (`VITE_TOPOMAPS_API_KEY`,
+  `VITE_PARETO_API_TOKEN`) and need vendor-side rotation, not just variable deletion.
+
+One method note that generalises, and cost three wrong readings today: **confirm a log line
+is emitted per request before treating its presence or absence as traffic evidence.**
+`[HPM] Proxy rewrite rule created` fires once per Lambda cold start; `[disabled-route]`
+fires per call. Filtering for the first tells you nothing about traffic, and the retirement
+smoke-test curls in the second look like real callers until you exclude them.
 
 ## Process note
 
