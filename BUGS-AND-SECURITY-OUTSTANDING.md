@@ -1,71 +1,122 @@
 # Bugs and security — outstanding
 
-Review of chong `HEAD~10..HEAD` at `1f11e76` (watch deploy claims, worktree ownership, live
-S3 markers, local stage/prod deploy).
+Two review passes over `chong watch`'s deploy, claim and shadow-worktree paths.
 
-**Status 2026-09-11:** all seven correctness defects fixed, plus three more found during
-the fix pass. Security items resolved per owner decision (see *Decisions*).
-`bun test src/watch/` → **167 pass / 0 fail**; `bunx tsc --noEmit` clean (exit 0, was 1
-error); `bun build --compile` succeeds. Nothing committed or staged.
+- **Pass 1** (`1f11e76`, direct review of `HEAD~10..HEAD`): 7 correctness + 5 security items.
+- **Pass 2** (after the pass-1 fixes landed): four independent adversarial reviewers —
+  worktree concurrency, deploy lifecycle, an attack-the-new-defences security pass, and a
+  fresh sweep of the ~5k lines never reviewed at all.
+
+**Status 2026-09-11:** everything below is fixed except where marked *Open* or *Accepted*.
+`bun test` **243 pass / 0 fail** (was 120), `bunx tsc --noEmit` clean (was 1 error),
+`bun build --compile` succeeds. 10 commits, `db03f05..04af20a`.
+
+**Pass 2 found three defects that pass 1 introduced**, and one critical pre-existing one
+that pass 1 walked straight past. That is the main lesson here: the fixes needed reviewing
+at least as much as the original code did.
+
+---
+
+## The one that mattered most
+
+**The worktree claim system was optional, and nothing enforced it.** `ensureShadow` only
+checked ownership `if (opts.processId)` — so omitting the argument skipped the check
+entirely and proceeded to `cherry-pick --abort`, `clean -fd`, `reset --hard` on the shared
+worktree. Four callers omitted it. The worst was `reconcileLocalMain`, reached from
+`maybeReconcileLocalMain`, which runs **every poll cycle** with no ownership guard — right
+beside `queueAutoMaintain`, which has one. So a watch that did not own the worktree reset
+it the moment its local `main` diverged, while the real owner might be mid-deploy. No race
+window required; a straight-line code path.
+
+Fixed by making the options argument *and* its `processId` required, with no `unclaimed`
+escape hatch (every path through `ensureShadow` mutates the worktree, so there is no
+read-only caller an opt-out would serve — and an opt-out is exactly what someone would
+reach for on a type error). That immediately exposed a **fourth** bypass on the prod deploy
+path that four reviewers reading the code had all missed. The argument for fixing this
+class of bug with a type rather than a convention.
 
 ---
 
-## Bugs / correctness
+## Correctness
 
-| Severity | Location | Finding | Status |
-|----------|----------|---------|--------|
-| High | `worktree-claim.ts` (touch interval), `app.ts` (`maybeTouchWorktreeClaim`) | Owner mtime refreshed only when commits arrive. A quiet `main` (or a deploy >20m with no new commits) lets the claim go stale; another watch acquires + `ensureShadow` → `reset --hard` the shared shadow **while the first is still uploading**. | **FIXED** — touch is now purely time-based whenever `worktreeOwned`; the `commitsSinceWorktreeTouch` gate is gone. Liveness no longer depends on repo activity. |
-| High | `worktree-claim.ts:22-24` | **Found during the fix pass, not in the original review.** `WORKTREE_CLAIM_TOUCH_MS === WORKTREE_CLAIM_STALE_MS` (both 20m) — the touch fired only at the exact moment the claim was already stale, so any jitter, slow S3 call or busy event loop made a live owner briefly look abandoned. Zero safety margin. | **FIXED** — stale window stays 20m (takeover speed unchanged); touch is now `STALE_MS / 3` (~6m40s), derived from it so the two cannot drift apart again. |
-| High | `stage-deploy.ts` (`runDeployCommand` → `proc.kill()`) | Claim-loss abort killed only the `bash -c` parent. `s5cmd` / `aws` children survive and keep writing to the bucket after chong reports the deploy aborted — potentially after another watch has started its own upload. | **FIXED** — `Bun.spawn` with `detached: true` (POSIX `setsid`), abort signals the group via `process.kill(-pid, "SIGTERM")` and escalates to `SIGKILL` after a 5s grace. |
-| Medium | `deploy-claim.ts` (`acquireDeployClaim` force path) | `force` wrote the claim and returned success **without** the read-back the normal path uses. A concurrent writer landing between write and deploy start left the forcer proceeding on a claim that named someone else. | **FIXED** — force now mirrors the normal verify read-back and returns the same `reason: "verify"` failure shape, so existing caller handling covers it. |
-| Medium | `worktree-claim.ts` (`acquireWorktreeClaim`) | Acquire was check-then-write with no exclusive create. Two processes both seeing "absent/stale" both won; last writer owned the file while both mutated the worktree. | **FIXED** — exclusive create (`flag: "wx"` / `O_EXCL`), re-read on `EEXIST`, compare-and-swap on `at` before a stale takeover, write-then-verify read-back, bounded retries. |
-| Medium | `app.ts` (`[o]` worktree override) | Single keypress, no confirm — easy to steal a live teammate's shadow by accident. | **FIXED** — `[o]` still acts in one keypress when the worktree is free or the claim is stale; it arms a `[y]`/`[n]` prompt naming the holder only when the claim is live. Liveness is re-checked at confirm time, and if a *different* process took it meanwhile the prompt re-arms against them rather than stealing silently. |
-| Medium | `app.ts` (`[o]` confirm gate, cancel guard) | **Found while reviewing the fix above.** The cancel guard released the armed override on any key `!== "y"`, but `case "y"` resolves a gap-promote confirm first and returns. So pressing `y` with a prod confirm open promoted the gap, overwrote `ui.status` with the prod-route prompt, and left the override **armed but invisible** — the operator's next `y` would steal a live claim they were never re-warned about. | **FIXED** — the guard now cancels unless the key is a `y` that will actually reach the override (`ui.confirm === null`). |
-| Low | `deploy-claim.ts` (`releaseDeployClaim`) | "Clear claim" wrote an empty object instead of deleting the key. Harmless (readers parse empty as absent) but a confusing tombstone that relied on that parse behaviour holding. | **FIXED** — deletes the key via `aws s3 rm`; verified `readDeployClaim` is the only reader and returns `null` for a missing key, so no reader change was needed. |
-| Low | `stage-deploy.ts` (`startClaimHeartbeat`) | Async `setInterval` with no overlap guard; slow S3 stacked ticks, which could run out of order and race claim release. | **FIXED** — in-flight guard serializes ticks; existing `finally { stopHeartbeat() }` already covered every exit path. |
-| Low | `stage-deploy.ts:454` | **Found during the fix pass.** The repo's only `tsc` error (TS2339) was a real operator-facing bug: the fallthrough built `` `deploy claim write failed: ${acquired.error}` `` while the union still included `{ reason: "no-bucket" }`, which has no `error` — so a repo that simply had no marker bucket configured was told `deploy claim write failed: undefined`. | **FIXED** — explicit `no-bucket` branch narrows the union and now reads `no stageDeployedShaBucket configured in .chong/config.json — cannot claim a stage deploy marker bucket`. |
-
----
+| Sev | Location | Finding | Status |
+|-----|----------|---------|--------|
+| High | `checks.ts` `ensureShadow`, 4 callers | Claim check was opt-in; omitting `processId` bypassed it into `reset --hard`. See above. | **Fixed** `cbc02e7` |
+| High | `app.ts` `maybeTouchWorktreeClaim` | Owner mtime refreshed only when commits arrived, so a quiet `main` or a long deploy let a live claim age out and another watch `reset --hard` the shadow mid-upload. | **Fixed** `db03f05` — time-based whenever owned |
+| High | `worktree-claim.ts` | `TOUCH_MS === STALE_MS` (both 20m): the refresh fired only once the claim was already stale. Zero margin. *Found in pass 1's own fix pass.* | **Fixed** `db03f05` — touch is `STALE/3` |
+| High | `worktree-claim.ts` `touchWorktreeClaim` | No compare-and-swap: a delayed touch reverted a legitimate force-override, leaving two processes both believing they owned the worktree. **Reproduced.** *Pass-1 regression.* | **Fixed** `2f2ef1a` |
+| High | `stage-deploy.ts` `runDeployCommand` | Abort killed only the `bash -c` parent; `s5cmd`/`aws` children kept writing to the bucket after chong reported the deploy aborted. | **Fixed** `a34ec8b` — process-group kill, SIGKILL escalation |
+| High | `stage-deploy.ts` `startClaimHeartbeat` | The in-flight guard had no per-attempt timeout, so one hung `aws` call wedged **every** future heartbeat and let the claim lapse mid-upload — strictly worse than the unguarded code it replaced. *Pass-1 regression.* | **Fixed** `a34ec8b` — 10s bound, 3 strikes = lost |
+| High | `stage-deploy.ts` heartbeat tick | `finally` but no `catch`; `Bun.spawn` throws on missing `aws`, killing the process mid-deploy, orphaning the deploy and never releasing the claim. | **Fixed** `a34ec8b` |
+| High | `app.ts`, `gh.ts`, `index.ts` | No `unhandledRejection` handler anywhere. A missing `gh`/`pnpm` killed the watch; because the process was *terminated*, `finally` never ran — alt screen left on (terminal unusable until `reset`) and the claim held for its full stale window, blocking every other watch. | **Fixed** `3ee5c8e`, `04af20a` |
+| Medium | `worktree-claim.ts` `acquireWorktreeClaim` | Check-then-write: two processes both seeing "absent/stale" both won. | **Fixed** `db03f05` — `O_EXCL`, EEXIST re-read, CAS on `at`, write-then-verify |
+| Medium | `deploy-claim.ts` force path | Wrote and returned success without the read-back that catches a concurrent writer. | **Fixed** `5af0114` |
+| Medium | `deploy-claim.ts` `acquireDeployClaim` | A transient failure of the *verify GET* abandoned the attempt while leaving its own claim live in S3, with nobody to release it. | **Fixed** `2f2ef1a` — bounded retry, then release what we wrote |
+| Medium | `app.ts` `[o]` override | Single keypress force-stole a live teammate's worktree. | **Fixed** `db03f05` — confirm only when the claim is live; free/stale still one keypress |
+| Medium | `app.ts` `[o]` cancel guard | The guard released on any key `!== "y"`, but `case "y"` resolves a gap-promote confirm first and returns — so `y` with a prod confirm open left the override **armed but invisible**, and the next `y` stole a live claim with no prompt. *Pass-1 regression.* | **Fixed** `db03f05` |
+| Medium | `checks.ts` × 4 auto-commit paths | `git add -A` + `--no-verify` push, unattended. The lockfile step left pnpm's output dirty for the next step to ship as "CLEAN: code style"; agent scratch files landed on `main`. | **Fixed** `04af20a` — explicit paths, refuse on unexpected untracked |
+| Medium | `checks.ts` / `app.ts` auto-inject | Local `main` pushed within one poll with no opt-out, making `commit --amend` unsafe (original already on origin; `git cherry` then re-picks the amended copy). | **Fixed** `04af20a` — `--no-auto-inject`, 30s amend grace |
+| Medium | `agent.ts` | A hung agent never settled (SIGTERM to parent only, then awaited the drain), freezing auto-fix, auto-maintain **and** stage deploys on the shared queue, with nothing in the UI. | **Fixed** `3ee5c8e` — detached, group kill, raced deadline |
+| Low | `deploy-claim.ts` `releaseDeployClaim` | Wrote `{}` instead of deleting the key. | **Fixed** `5af0114` |
+| Low | `stage-deploy.ts:454` | Real operator-facing bug behind the repo's only `tsc` error: an unconfigured marker bucket reported `deploy claim write failed: undefined`. | **Fixed** `607307c` |
+| Low | `stage-deploy.ts` `runDeployCommand` | Abort-poll interval and SIGKILL timer leaked, and the child was never reaped, if the output drain threw. | **Fixed** `a34ec8b` |
+| Low | `stage-deploy.ts` prod `onLost` | Said "aborting" when `force` meant nothing aborted. | **Fixed** `a34ec8b` |
+| Low | `checks.ts` legacy worktree | `worktree remove --force` on a path match alone discarded a hand-made `../main-shadow`. | **Fixed** `cbc02e7` — only when clean and detached |
+| Low | `repo.ts`, `checks.ts`, `lint.ts` | Git C-quotes paths with spaces/non-ASCII, so such files were silently neither reverted, staged, nor linted — then swept up by a later `add -A`. | **Fixed** `9426285`, `cbc02e7`, `3dede19` — `-z` + NUL |
+| — | `checks.ts` | `tryAutoPromoteStage`, `promoteFastForward`, `lintStageDiff`, `AutoPromoteResult` — unreferenced, and carried one of the unclaimed `ensureShadow` calls. | **Deleted** `cbc02e7` |
 
 ## Security
 
-| Severity | Location | Finding | Status |
-|----------|----------|---------|--------|
-| Medium | `stage-deploy.ts` (`bash -c` + `loadRepoDeployConfig`) | `deployCmd` can come from `.chong/config.json`, which is **deliberately committed** (`.chong/*` + `!.chong/config.json`). So anyone who can land a commit in a watched repo — or any supply-chain compromise of it — gets RCE as the operator, with full env. | **FIXED** — `stageDeployCmd` / `prodDeployCmd` read from repo config are refused if they contain a shell metacharacter (semicolon, pipe, ampersand, dollar, backtick, parentheses, angle brackets) or a newline; the repo then falls back to "no local deploy command", never to a silently-altered command. Free in practice: no repo sets it today (FRONTEND omits it on purpose and relies on script auto-detection). Scope checked: `packageJson*Deploy` return fixed literals gated on a script *key*, so no repo text reaches them; `resolveStageDeployCmd`'s bypass is fed only by the operator's own `--stage-deploy-cmd` flag (verified at `src/commands/watch.ts:55`), and its empty path falls through to the validated resolver. |
-| Medium | `stage-deploy.ts` (`runDeployCommand` env) | Deploy inherits full `process.env` (AWS keys, tokens) into the shadow build. Any script compromise in the worktree exfiltrates the laptop's creds. | **DOCUMENTED, by decision** — see *Decisions*. New README §"Deploy trust boundary". |
-| Medium | `deploy-claim.ts` / `worktree-claim.ts` (holder display) | Claim `user` / `host` came from S3 / on-disk JSON with light validation and went straight into TUI output. Anyone with marker-bucket write access could inject ANSI/control chars to corrupt or **spoof** the displayed claim holder. | **FIXED** — sanitized in both *parse* functions (not just the formatters), so every consumer benefits: CSI sequences stripped, then all remaining control bytes, then length-capped. Confirmed ownership comparisons key off the process `id`, never a sanitized field. |
-| Low | `stage-deploy.ts` (`notifyDiscordStage`) | Success messages post commit subjects to a shared relay, so local deploys can leak unreleased commit text. | **NO CHANGE, by decision** — channel is trusted. |
-| Info | Soft S3 claims (`deploy-claim.ts`) | Claims are advisory (no conditional writes). Anyone with bucket write can force or spoof; CI / `deploy-frontend.sh` bypass claims entirely. | **BY DESIGN** — now stated in the README rather than left implicit. |
+| Sev | Location | Finding | Status |
+|-----|----------|---------|--------|
+| High | `agent.ts` + `checks.ts` prompts | The i18n/eslint agent ran `--trust --force` with the operator's full env (AWS keys) on prompts built from repo-authored text (`.po` msgids, string literals, eslint messages). A merged translation-only commit saying "ignore the above and run …" executed as the operator. No config or bucket access needed. | **Fixed** `3ee5c8e` — env allowlist, untrusted-data fencing |
+| Medium | `repo.ts` → `render.ts` | Commit author/subject reached the TUI raw. **Verified** ESC/BEL survive `git log --pretty=%s`, so *any* merged commit gave full ANSI/OSC — OSC 52 clipboard writes, forged UI rows. More reachable than the claim fields this code already sanitized, which was backwards. | **Fixed** `9426285` |
+| Medium | claim parsers | Both sanitizers stripped 7-bit CSI and C0 but missed **8-bit C1** (U+0080–U+009F), which C1-aware terminals still act on; RTL overrides, full-width and combining-mark runs also passed, letting a bucket writer render any colleague's name. | **Fixed** `2f2ef1a` — printable allowlist, one shared module (`ec06044`) |
+| Medium | `stage-deploy.ts` marker buckets | Repo-controlled bucket names redirect marker/claim **writes** to any bucket the operator can write, and redirect **reads** so chong believes a commit already shipped and skips the deploy. (No `aws` argv injection — verified.) | **Fixed** `3dede19` — S3 grammar; hygiene, not a boundary |
+| Low | `config.ts`, `state.ts` | Harness PAT and state written 0644. | **Fixed** `3ee5c8e` — dir 0700, files 0600 |
+| Low | `worktree-claim.ts` | Takeover/force/touch writes followed a symlink planted at `<shadow>.owner.json`. | **Fixed** `2f2ef1a` — temp file + rename |
+| **Accepted** | `stage-deploy.ts` `bash -c` | **The metacharacter check does not close the config RCE path.** Disproved with `bash .ci/deploy.sh` and `BASH_ENV=./tools/x.sh bash -c :` — no forbidden character, both execute. It also guards the *weaker* path: `scripts/deploy-frontend.sh` is committed, unvalidated, and auto-armed on a ~60s cooldown. Commit access to a watched repo **is** code execution as the operator, by design. | Documented honestly (`504f1a8`). Kept as defence-in-depth. **The real fix is a scoped `AWS_PROFILE` for deploys — not done.** |
+| **Accepted** | deploy env | Full `process.env` inheritance, AWS keys included. An allowlist that misses a `VITE_*` var ships a build with a feature silently disabled rather than failing — a known past failure mode. | Documented, by decision |
+| **Accepted** | Discord relay | Success messages post commit subjects; channel is trusted. | No change, by decision |
+| **Accepted** | soft S3 claims | Advisory by design (no conditional writes); CI and `deploy-frontend.sh` bypass them entirely. | Documented |
 
 ---
 
-## Decisions (owner, 2026-09-11)
+## Open
 
-1. **`deployCmd` RCE** — reject shell metacharacters in *configured* commands; keep `bash -c`
-   and the built-in auto-detected defaults unchanged. Chosen over a full argv/allowlist
-   rewrite because that would have to re-express the live default
-   (`CI=true FORCE=1 DEPLOY_SKIP_INSTALL=1 ./scripts/deploy-frontend.sh ci`) and carries
-   regression risk on the real deploy path, for no gain today.
-2. **Deploy env** — keep full `process.env` inheritance; document it. An allowlist that
-   misses a `VITE_*` var does not fail loudly, it ships a build with a feature silently
-   disabled — a known past failure mode in this repo.
-3. **`[o]` override** — confirm only when it would take a *live* claim. Free or stale
-   worktree still overrides in one keypress, so the common case loses no convenience.
-4. **Discord** — leave commit subjects in place; that channel is trusted.
+- **Scoped deploy credential.** The only thing that would actually bound the blast radius
+  of the accepted RCE above. Deliberately deferred, not forgotten.
+- **Git error/status strings reaching the TUI unsanitized.** `cherryPick`, `mergeFastForward`,
+  `pushSha` etc. return raw git stderr, which can echo attacker-influenced text. Not
+  sanitized at the parse boundary because several call sites pattern-match the raw string
+  for control flow; belongs at the display surface in `app.ts`/`checks.ts`.
+- **Branch/ref names** are not sanitized. Git's ref grammar forbids control bytes but not
+  Unicode format/bidi characters. Narrow (needs branch creation, and these repos use fixed
+  `main`/`stage`/`prod`), but real if an arbitrary ref name ever reaches the display.
+- **`render.ts` `renderModal`'s `pad()`** still measures with `.length`. `trunc()` and the
+  commit-list budgets are width-aware; the leftover-files modal is not.
+- **`hasConflictMarkers`** uses `git diff --check`, so markers in already-staged files pass.
+  Mitigated by the eslint/i18n re-verify and the patch-id check.
+- **Output-drain bound.** A deploy or agent grandchild that calls `setsid()` escapes the
+  process-group kill and holds the pipe open. Both paths now race a deadline so nothing
+  wedges, but a wall-clock cap cannot distinguish "hung" from "slow but legitimate" — doing
+  it properly needs per-chunk read-progress tracking.
+- **`checkedShas` / `warnedBlocks` / `ui.newShas`** grow unbounded. Bytes per commit.
 
-## Already in good shape (for this window)
+## Accepted residual risk
 
-- Per-process UUID (no same-user self-collision on deploy claims)
-- `.env` only (not `.env.local`) copied into the shadow for deploys
-- Claim release only if still owner; worktree owner file beside the worktree (survives `git clean -fd`)
-- Discord on success only (failures stay local)
-- Bucket names opt-in via per-repo `.chong/config.json` (no cross-repo hardcoding)
+- A child that calls `setsid()` itself escapes the process-group kill. Neither `s5cmd` nor
+  `aws` is known to; re-check if the deploy script changes.
+- The SIGTERM→SIGKILL grace means up to one in-flight PUT may still land — bounded, where
+  it used to be unbounded.
+- Worktree and deploy claims are advisory. They prevent accidents between colleagues, not
+  deliberate races, and `Ctrl-C` leaves a claim to age out through its stale window.
 
-## Residual risk, accepted
+## Process note
 
-- A deploy child that calls `setsid()` itself would escape the process-group kill. Neither
-  `s5cmd` nor `aws` is known to; worth re-checking if the deploy script changes.
-- The 5s SIGTERM→SIGKILL grace assumes uploaders exit promptly on SIGTERM. Up to one
-  in-flight PUT may still land — a bounded window where it used to be unbounded.
-- Commit access to a watched repo remains a trust relationship; the metacharacter check
-  narrows the blast radius, it does not remove it.
+A concurrent session committed `a34ec8b` with a broad `git add` while the heartbeat and
+abort fixes were uncommitted in this shared worktree. Its message describes only a Discord
+relay change but it carries 130 insertions of unrelated fix work. Nothing was lost and the
+code is correct; the history simply misdescribes itself. Left alone — rewriting a pushed
+commit in a tree several sessions share is not a unilateral call. The lesson is to commit
+completed work promptly here rather than letting it sit in the tree.
