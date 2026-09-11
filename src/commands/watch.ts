@@ -90,6 +90,7 @@ export async function cmdWatch(argv: string[]): Promise<void> {
     stageDeployCmd,
     importScan,
     stageDeployedSha: null,
+    prodDeployedSha: null,
   };
   try {
     await runWatch(cfg, intervalMs);

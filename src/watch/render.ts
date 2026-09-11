@@ -23,15 +23,21 @@ export type UIState = {
   } | null;
   /** Local stage (app-ci) deploy countdown / status when autoDeployStage is on. */
   stageDeploy: {
-    kind: "idle" | "countdown" | "deploying" | "live";
+    kind: "idle" | "countdown" | "deploying" | "live" | "remote-deploying";
     shaShort: string;
     secsLeft: number;
+    /** Who holds the soft claim when kind is remote-deploying / deploying. */
+    by?: string;
   } | null;
   /**
    * This repo can deploy prod locally, so the prod prompt offers [r]emote / [l]ocal
    * instead of a bare [y]. False falls back to the original push-the-branch prompt.
    */
   canDeployProdLocally?: boolean;
+  /**
+   * When set, another watch owns the shared main-shadow worktree — show [o] override.
+   */
+  worktreeOverride?: string | null;
 };
 
 const cols = () => process.stdout.columns || 100;
@@ -99,7 +105,7 @@ function gapRows(
       // a single "yes" would silently pick one of them.
       body = c.bold(
         c.yellow(
-          `▸ ship ${gap.ahead} commit(s) to PRODUCTION?  [r] remote (GitHub Actions)  [l] local deploy  [n] no`,
+          `▸ ship ${gap.ahead} commit(s) to PRODUCTION?  [r] remote (GHA)  [l] local  [f] force local  [n] no`,
         ),
       );
     } else {
@@ -244,7 +250,12 @@ export function render(p: Pipeline, ui: UIState): string {
         `  ⏳ stage deploy in ${sd.secsLeft}s  (${sd.shaShort}) — quiet window; new main commits reset the timer`,
       );
     } else if (sd.kind === "deploying") {
-      line = c.yellow(`  🚀 deploying ${sd.shaShort} → app-ci…`);
+      const by = sd.by ? ` (${sd.by})` : "";
+      line = c.yellow(`  🚀 deploying ${sd.shaShort} → app-ci…${by}`);
+    } else if (sd.kind === "remote-deploying") {
+      line = c.yellow(
+        `  🚀 app-ci deploy in progress by ${sd.by ?? "someone"} (${sd.shaShort}) — waiting`,
+      );
     } else if (sd.kind === "live") {
       line = c.green(`  ● app-ci live @ ${sd.shaShort}`);
     } else {
@@ -295,7 +306,8 @@ export function render(p: Pipeline, ui: UIState): string {
     .join("  ");
   out.push(
     c.dim(
-      `  ${promoteKeys}   [↑/↓] select  [space] details  [m] maintain  [f] fetch  [r] CI  [q] quit`,
+      `  ${promoteKeys}   [↑/↓] select  [space] details  [m] maintain  [f] fetch  [r] CI  [q] quit` +
+        (ui.worktreeOverride ? `  [o] take worktree (${ui.worktreeOverride})` : ""),
     ),
   );
 

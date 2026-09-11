@@ -5,7 +5,10 @@ import path from "node:path";
 import {
   defaultStageDeployCmd,
   ensureChongIgnored,
+  liveTipCoversSha,
   loadRepoDeployConfig,
+  prodDeployedShaBucket,
+  selectLiveDeployTip,
   stageDeployedShaBucket,
 } from "./stage-deploy";
 
@@ -52,6 +55,94 @@ describe("stageDeployedShaBucket — the cross-repo hazard", () => {
     asFrontend(dir);
     withChong(dir, { stageDeployedShaBucket: "explicit" });
     expect(stageDeployedShaBucket(dir)).toBe("explicit");
+  });
+});
+
+describe("prodDeployedShaBucket", () => {
+  test("is null unless configured", () => {
+    expect(prodDeployedShaBucket(repo())).toBeNull();
+  });
+
+  test("reads the configured production marker bucket", () => {
+    const dir = repo();
+    withChong(dir, { prodDeployedShaBucket: "prod-bucket" });
+    expect(prodDeployedShaBucket(dir)).toBe("prod-bucket");
+  });
+});
+
+describe("selectLiveDeployTip — prefer live S3 markers", () => {
+  const s3 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const branch = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const file = "cccccccccccccccccccccccccccccccccccccccc";
+  const tree = "dddddddddddddddddddddddddddddddddddddddd";
+
+  test("S3 commit wins over a newer-looking local branch", () => {
+    const live = selectLiveDeployTip({
+      s3Commit: s3,
+      s3Tree: tree,
+      branchSha: branch,
+      fileSha: file,
+    });
+    expect(live).toEqual({ commit: s3, tree, source: "s3" });
+  });
+
+  test("S3 tree alone is enough to prefer the marker (commit may be absent)", () => {
+    const live = selectLiveDeployTip({
+      s3Commit: null,
+      s3Tree: tree,
+      branchSha: branch,
+      fileSha: file,
+    });
+    expect(live.source).toBe("s3");
+    expect(live.tree).toBe(tree);
+    expect(live.commit).toBeNull();
+  });
+
+  test("falls back to local branch when S3 is empty", () => {
+    const live = selectLiveDeployTip({
+      s3Commit: null,
+      s3Tree: null,
+      branchSha: branch,
+      fileSha: file,
+    });
+    expect(live).toEqual({ commit: branch, tree: null, source: "local-branch" });
+  });
+
+  test("falls back to the .chong file when branch is missing too", () => {
+    const live = selectLiveDeployTip({
+      s3Commit: null,
+      s3Tree: null,
+      branchSha: null,
+      fileSha: file,
+    });
+    expect(live).toEqual({ commit: file, tree: null, source: "local-file" });
+  });
+
+  test("normalises SHAs to lowercase", () => {
+    const live = selectLiveDeployTip({
+      s3Commit: s3.toUpperCase(),
+      s3Tree: tree.toUpperCase(),
+      branchSha: null,
+      fileSha: null,
+    });
+    expect(live.commit).toBe(s3);
+    expect(live.tree).toBe(tree);
+  });
+});
+
+describe("liveTipCoversSha", () => {
+  test("matches on commit or on tree", () => {
+    const tip = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const tree = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    expect(liveTipCoversSha({ commit: tip, tree: null, source: "s3" }, tip, null)).toBe(true);
+    expect(
+      liveTipCoversSha(
+        { commit: "cccccccccccccccccccccccccccccccccccccccc", tree, source: "s3" },
+        tip,
+        tree,
+      ),
+    ).toBe(true);
+    expect(liveTipCoversSha({ commit: null, tree: null, source: "none" }, tip, tree)).toBe(false);
   });
 });
 

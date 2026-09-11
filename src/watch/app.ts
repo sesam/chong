@@ -13,23 +13,52 @@ import {
   runLockfileFix,
   runMaintenance,
   scanCommitForUntranslated,
+  shadowPathFor,
   tryAgentI18nFix,
 } from "./checks";
+import {
+  formatClaimHolder,
+  isClaimStale,
+  readDeployClaim,
+  type DeployClaim,
+} from "./deploy-claim";
 import { type WatchConfig, computePipeline, enrichCI, gapHotkeys, promote } from "./model";
 import { type UIState, render } from "./render";
 import {
   defaultProdDeployCmd,
-  resolveDeployedStageSha,
+  prodDeployedShaBucket,
+  resolveLiveProdTip,
+  resolveLiveStageTip,
   resolveStageDeployCmd,
   runLocalProdDeploy,
   runLocalStageDeploy,
+  stageDeployedShaBucket,
 } from "./stage-deploy";
+import {
+  acquireWorktreeClaim,
+  formatWorktreeHolder,
+  isWorktreeClaimActive,
+  readWorktreeClaim,
+  releaseWorktreeClaim,
+  touchWorktreeClaim,
+  WORKTREE_CLAIM_TOUCH_MS,
+  type WorktreeClaim,
+} from "./worktree-claim";
 import type { Pipeline } from "./types";
 
 const ALT_ON = "\x1b[?1049h\x1b[?25l"; // alt screen + hide cursor
 const ALT_OFF = "\x1b[?25h\x1b[?1049l"; // show cursor + leave alt screen
 
 export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<void> {
+  /** Stable for this watch process — deploy claims + worktree ownership share it. */
+  const processId = crypto.randomUUID();
+  const shadowPath = shadowPathFor(cfg.repoPath);
+  let worktreeOwned = false;
+  let foreignWorktreeClaim: WorktreeClaim | null = null;
+  let lastWorktreeTouchAt = 0;
+  /** True when we have seen incoming commits since the last worktree touch. */
+  let commitsSinceWorktreeTouch = false;
+
   let pipeline: Pipeline | null = null;
   let baseline: Set<string> | null = null; // remote incoming shas at the moment watch started
   let localBaseline: Set<string> | null = null; // local branch shas at the moment watch started
@@ -48,6 +77,11 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   let pendingStageDeploySha: string | null = null;
   let stageDeployAt: number | null = null; // epoch ms
   let stageDeploying = false;
+  /** Soft claim held by another watch (polled from S3); pauses our auto-deploy. */
+  let remoteStageClaim: DeployClaim | null = null;
+  let remoteProdClaim: DeployClaim | null = null;
+  /** Seconds to wait before retrying after we lost a soft claim race. */
+  const CLAIM_RETRY_SEC = 30;
   const stageDeployCmd = resolveStageDeployCmd(cfg.repoPath, cfg.stageDeployCmd);
   const localStageDeploy = cfg.autoDeployStage && !!stageDeployCmd;
   // Null when this repo has no way to deploy prod locally. The prod prompt then falls back
@@ -93,6 +127,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     maintenance: null,
     stageDeploy: null,
     canDeployProdLocally: !!prodDeployCmd,
+    worktreeOverride: null,
   };
 
   const write = (s: string) => process.stdout.write(s);
@@ -115,6 +150,42 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     ui.notices = [msg, ...ui.notices].slice(0, 5);
   }
 
+  function tryTakeWorktree(force = false): boolean {
+    const prev = readWorktreeClaim(shadowPath);
+    const res = acquireWorktreeClaim(shadowPath, processId, { force });
+    if (res.ok) {
+      worktreeOwned = true;
+      foreignWorktreeClaim = null;
+      lastWorktreeTouchAt = Date.now();
+      commitsSinceWorktreeTouch = false;
+      if (res.forced && prev && prev.id !== processId) {
+        addNotice(c.yellow(`⚒ worktree claim forced — was ${formatWorktreeHolder(prev)}`));
+      }
+      return true;
+    }
+    worktreeOwned = false;
+    foreignWorktreeClaim = res.claim;
+    return false;
+  }
+
+  function maybeTouchWorktreeClaim(): void {
+    if (!worktreeOwned) return;
+    if (!commitsSinceWorktreeTouch) return;
+    if (Date.now() - lastWorktreeTouchAt < WORKTREE_CLAIM_TOUCH_MS) return;
+    if (touchWorktreeClaim(shadowPath, processId)) {
+      lastWorktreeTouchAt = Date.now();
+      commitsSinceWorktreeTouch = false;
+    } else {
+      worktreeOwned = false;
+      foreignWorktreeClaim = readWorktreeClaim(shadowPath);
+      addNotice(c.yellow("⚠ lost worktree ownership — auto-maintain paused"));
+    }
+  }
+
+  function shadowOpts(forceWorktree = false): { processId: string; forceWorktree?: boolean } {
+    return { processId, ...(forceWorktree ? { forceWorktree: true } : {}) };
+  }
+
   function syncStageDeployUi(): void {
     if (!localStageDeploy) {
       ui.stageDeploy = null;
@@ -125,6 +196,16 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
         kind: "deploying",
         shaShort: (pendingStageDeploySha ?? cfg.stageDeployedSha ?? "").slice(0, 7),
         secsLeft: 0,
+        by: process.env.USER || "local",
+      };
+      return;
+    }
+    if (remoteStageClaim && !isClaimStale(remoteStageClaim)) {
+      ui.stageDeploy = {
+        kind: "remote-deploying",
+        shaShort: remoteStageClaim.sha.slice(0, 7),
+        secsLeft: 0,
+        by: formatClaimHolder(remoteStageClaim),
       };
       return;
     }
@@ -163,6 +244,13 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     }
     if (stageDeployBlockedForTip === mainTip) return;
     if (stageDeploying) return;
+    // Another watch is mid-deploy — wait; refresh will re-arm when the claim clears.
+    if (remoteStageClaim && !isClaimStale(remoteStageClaim)) {
+      pendingStageDeploySha = null;
+      stageDeployAt = null;
+      syncStageDeployUi();
+      return;
+    }
 
     const reset = pendingStageDeploySha !== mainTip;
     pendingStageDeploySha = mainTip;
@@ -206,6 +294,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       {
         agent: agentEnabled,
         importScan: cfg.importScan,
+        processId,
         onProgress: (msg) => {
           addNotice(c.dim(msg));
           paint();
@@ -219,6 +308,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       pendingStageDeploySha = null;
       stageDeployAt = null;
       stageDeployBlockedForTip = null;
+      remoteStageClaim = null;
       addNotice(c.green(`✓ ${res.message}`));
       ui.status = c.green(`✓ ${res.message}`);
       void refresh();
@@ -233,6 +323,13 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
       pendingStageDeploySha = null;
       stageDeployAt = null;
       addNotice(c.dim(res.message));
+    } else if (res.action === "deferred") {
+      // Soft claim held by someone else — retry soon; do NOT permanently block the tip.
+      remoteStageClaim = res.claim ?? remoteStageClaim;
+      pendingStageDeploySha = tip;
+      stageDeployAt = Date.now() + CLAIM_RETRY_SEC * 1000;
+      addNotice(c.yellow(`⏳ ${res.message} — retry in ${CLAIM_RETRY_SEC}s`));
+      ui.status = c.yellow(`⏳ ${res.message}`);
     } else if (res.action === "blocked") {
       stageDeployBlockedForTip = tip;
       pendingStageDeploySha = null;
@@ -269,6 +366,16 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
    */
   function queueAutoMaintain(reason: string): void {
     if (!cfg.autoMaintain || !pipeline || maintaining) return;
+    if (!worktreeOwned) {
+      addNotice(
+        c.dim(
+          foreignWorktreeClaim
+            ? `maintain skipped — worktree owned by ${formatWorktreeHolder(foreignWorktreeClaim)} ([o] override)`
+            : "maintain skipped — no worktree ownership",
+        ),
+      );
+      return;
+    }
     maintaining = true;
     remoteCommitsSinceMaint = 0;
     lastAutoMaintAt = Date.now();
@@ -298,7 +405,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
             return;
           }
         }
-        const shadow = await ensureShadow(repoPath, `${remote}/${headBranch}`);
+        const shadow = await ensureShadow(repoPath, `${remote}/${headBranch}`, shadowOpts());
         if (shadow.error) {
           addNotice(c.red(`✗ auto-maintain shadow: ${shadow.error}`));
           return;
@@ -372,7 +479,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
 
     if (src !== "remote") return;
 
-    const shadow = await ensureShadow(repoPath, `${remote}/${headBranch}`);
+    const shadow = await ensureShadow(repoPath, `${remote}/${headBranch}`, shadowOpts());
     if (shadow.error) {
       addNotice(c.red(`✗ shadow: ${shadow.error}`));
       paint();
@@ -538,6 +645,57 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     refreshing = true;
     ui.busy = true;
     paint();
+
+    // Prefer live S3 markers for lane tips when configured. Skip while a local stage
+    // deploy is in flight so we do not rewind the tracker to a still-stale marker.
+    if (localStageDeploy && !stageDeploying) {
+      const live = await resolveLiveStageTip(cfg.repoPath);
+      if (live.commit) cfg.stageDeployedSha = live.commit;
+    }
+    if (!stageDeploying) {
+      const prodLive = await resolveLiveProdTip(cfg.repoPath);
+      cfg.prodDeployedSha = prodLive.commit;
+    }
+
+    // Soft deploy claims — who (if anyone) is mid-upload on each bucket.
+    const stageBucket = stageDeployedShaBucket(cfg.repoPath);
+    const prodBucket = prodDeployedShaBucket(cfg.repoPath);
+    const [stageClaim, prodClaim] = await Promise.all([
+      stageBucket && !stageDeploying ? readDeployClaim(stageBucket) : Promise.resolve(null),
+      prodBucket ? readDeployClaim(prodBucket) : Promise.resolve(null),
+    ]);
+    remoteStageClaim =
+      stageClaim && !isClaimStale(stageClaim) && stageClaim.sha ? stageClaim : null;
+    remoteProdClaim = prodClaim && !isClaimStale(prodClaim) && prodClaim.sha ? prodClaim : null;
+
+    // If a foreign worktree claim went stale, try to take over quietly.
+    if (!worktreeOwned) {
+      const foreign = readWorktreeClaim(shadowPath);
+      if (!foreign || !isWorktreeClaimActive(shadowPath)) {
+        if (tryTakeWorktree(false)) {
+          addNotice(c.green("✓ worktree claim acquired (previous owner stale)"));
+        }
+      } else {
+        foreignWorktreeClaim = foreign;
+      }
+    }
+    ui.worktreeOverride =
+      !worktreeOwned && foreignWorktreeClaim
+        ? formatWorktreeHolder(foreignWorktreeClaim)
+        : null;
+
+    if (remoteProdClaim) {
+      // Surface once per claim id so the status line is not spammy every poll.
+      const key = `prod-claim:${remoteProdClaim.id}`;
+      if (!warnedBlocks.has(key)) {
+        warnedBlocks.add(key);
+        addNotice(
+          c.yellow(`⏳ prod deploy in progress by ${formatClaimHolder(remoteProdClaim)}`),
+        );
+      }
+    }
+    syncStageDeployUi();
+
     const { pipeline: p, error, synced } = await computePipeline(cfg);
 
     // Report auto-fast-forwarded local refs. Successes are self-clearing (the ref
@@ -567,6 +725,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
         for (const cm of p.incoming) {
           if (!baseline.has(cm.sha)) {
             ui.newShas.add(cm.sha);
+            commitsSinceWorktreeTouch = true;
             if (!checkedShas.has(cm.sha)) {
               checkedShas.add(cm.sha);
               const sha = cm.sha;
@@ -626,14 +785,18 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
    * `mode` only matters for prod, which can ship either way:
    *   "remote" — push the SHA onto `prod` and let GitHub Actions deploy it (the original)
    *   "local"  — build and upload from here, exactly as stage does
+   *   "force"  — local deploy that overwrites another watch's soft claim
    * Stage is always local when a deploy command exists, so it ignores this.
    */
-  async function doPromote(idx: number, mode: "remote" | "local" = "remote"): Promise<void> {
+  async function doPromote(
+    idx: number,
+    mode: "remote" | "local" | "force" = "remote",
+  ): Promise<void> {
     if (!pipeline) return;
     const gap = pipeline.gaps[idx];
     ui.confirm = null;
 
-    if (mode === "local" && gap.to === "prod" && prodDeployCmd) {
+    if ((mode === "local" || mode === "force") && gap.to === "prod" && prodDeployCmd) {
       // Deploy the stage lane tip — the same commit a remote promote would have pushed,
       // so local and remote ship identical content.
       const stageTip = pipeline.lanes.find((l) => l.name === "stage")?.tip;
@@ -642,17 +805,37 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
         paint();
         return;
       }
+      if (remoteProdClaim && !isClaimStale(remoteProdClaim) && mode !== "force") {
+        ui.status = c.yellow(
+          `⏳ prod deploy already in progress by ${formatClaimHolder(remoteProdClaim)} — [f] to force`,
+        );
+        paint();
+        return;
+      }
       ui.busy = true;
-      ui.status = c.yellow(`deploying ${stageTip.slice(0, 7)} → PRODUCTION (local)…`);
+      ui.status = c.yellow(
+        `deploying ${stageTip.slice(0, 7)} → PRODUCTION (local${mode === "force" ? ", forced" : ""})…`,
+      );
       paint();
       const res = await runLocalProdDeploy(cfg.repoPath, gap.to, stageTip, prodDeployCmd, {
+        force: mode === "force",
+        processId,
         onProgress: (m) => {
           ui.status = c.yellow(m);
           paint();
         },
       });
-      ui.status =
-        res.action === "deployed" ? c.green(`✓ ${res.message}`) : c.red(`✗ ${res.message}`);
+      if (res.action === "deferred" && res.claim) {
+        remoteProdClaim = res.claim;
+        ui.status = c.yellow(`⏳ ${res.message} — [f] to force`);
+      } else if (res.action === "deployed") {
+        remoteProdClaim = null;
+        ui.status = c.green(`✓ ${res.message}`);
+      } else if (res.action === "noop") {
+        ui.status = c.dim(res.message);
+      } else {
+        ui.status = c.red(`✗ ${res.message}`);
+      }
       ui.busy = false;
       await refresh();
       return;
@@ -734,7 +917,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
           }
         }
 
-        const shadow = await ensureShadow(repoPath, `${remote}/${headBranch}`);
+        const shadow = await ensureShadow(repoPath, `${remote}/${headBranch}`, shadowOpts());
         if (shadow.error) {
           ui.maintenance = { running: false, steps: [`✗ shadow: ${shadow.error}`], prompts: [] };
           return;
@@ -787,6 +970,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     // Avoid repainting while the maintenance screen is open: it prints copy prompts
     // and constant redraws break terminal mouse selection.
     tickStageDeployCooldown();
+    maybeTouchWorktreeClaim();
     if (!ui.maintenance) paint();
   }, 1000); // keep "↻ Ns ago" + stage countdown fresh
   const poll = setInterval(() => void refresh(), intervalMs);
@@ -799,6 +983,8 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     : null;
 
   function quit(): void {
+    // Release worktree ownership first so another watch can take over immediately.
+    releaseWorktreeClaim(shadowPath, processId);
     clearInterval(clock);
     clearInterval(poll);
     if (autoMaintTimer) clearInterval(autoMaintTimer);
@@ -880,7 +1066,7 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
           // one of two very different actions, so make the operator name it.
           if (promptOffersProdRoute(ui.confirm)) {
             ui.status = c.yellow(
-              "prod: press [r] to deploy via GitHub Actions, or [l] to deploy locally",
+              "prod: [r] remote (GHA)  [l] local  [f] force local (override soft claim)",
             );
             break;
           }
@@ -914,8 +1100,26 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
         void doMaintenance();
         return;
       case "f":
+        // During a prod confirm, [f] force-deploys locally past a soft claim.
+        // Otherwise [f] refreshes the pipeline (historical binding).
+        if (ui.confirm !== null && promptOffersProdRoute(ui.confirm)) {
+          void doPromote(ui.confirm, "force");
+          return;
+        }
         void refresh();
         return;
+      case "o":
+        // Override a live foreign worktree claim — only meaningful when we do not own it.
+        if (!worktreeOwned && foreignWorktreeClaim) {
+          if (tryTakeWorktree(true)) {
+            addNotice(c.green("✓ worktree override taken — auto-maintain enabled"));
+            ui.worktreeOverride = null;
+            if (cfg.autoMaintain && pipeline) queueAutoMaintain("after worktree override");
+          }
+          paint();
+          return;
+        }
+        break;
     }
     paint();
   }
@@ -934,13 +1138,30 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
   write(ALT_ON);
   paint(true);
 
-  // Seed virtual stage tip from local/S3 marker before first pipeline paint.
+  // Claim the shared main-shadow worktree before any shadow work / auto-maintain.
+  if (!tryTakeWorktree(false)) {
+    addNotice(
+      c.yellow(
+        `⚠ worktree in use by ${formatWorktreeHolder(foreignWorktreeClaim!)} — auto-maintain off  [o] override`,
+      ),
+    );
+  } else {
+    addNotice(c.dim(`worktree claimed (${processId.slice(0, 8)}…)`));
+  }
+
+  // Seed virtual stage / prod tips from live S3 markers (fallback: local branch / file)
+  // before the first pipeline paint.
   if (localStageDeploy) {
-    cfg.stageDeployedSha = await resolveDeployedStageSha(cfg.repoPath);
+    const live = await resolveLiveStageTip(cfg.repoPath);
+    cfg.stageDeployedSha = live.commit;
     if (cfg.stageDeployedSha) {
-      addNotice(
-        c.dim(`stage live @ ${cfg.stageDeployedSha.slice(0, 7)} (local stage branch / S3)`),
-      );
+      const via =
+        live.source === "s3"
+          ? "live S3 marker"
+          : live.source === "local-branch"
+            ? "local stage branch"
+            : "local backup file";
+      addNotice(c.dim(`stage live @ ${cfg.stageDeployedSha.slice(0, 7)} (${via})`));
     } else {
       addNotice(
         c.dim("stage deploy: no local stage tip yet — first cooldown will ship origin/main"),
@@ -955,8 +1176,16 @@ export async function runWatch(cfg: WatchConfig, intervalMs: number): Promise<vo
     );
   }
 
+  {
+    const prodLive = await resolveLiveProdTip(cfg.repoPath);
+    cfg.prodDeployedSha = prodLive.commit;
+    if (cfg.prodDeployedSha) {
+      addNotice(c.dim(`prod live @ ${cfg.prodDeployedSha.slice(0, 7)} (live S3 marker)`));
+    }
+  }
+
   await refresh();
-  if (cfg.autoMaintain && pipeline && !startupMaintQueued) {
+  if (cfg.autoMaintain && pipeline && !startupMaintQueued && worktreeOwned) {
     startupMaintQueued = true;
     queueAutoMaintain("on start");
   }

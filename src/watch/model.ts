@@ -72,11 +72,16 @@ export type WatchConfig = {
    */
   importScan: boolean;
   /**
-   * Tip shown for the stage lane when autoDeployStage is on — normally the local
-   * `stage` branch (advanced after each successful app-ci deploy, never pushed).
-   * Kept in sync by resolveDeployedStageSha / markLocalStageDeployed.
+   * Tip shown for the stage lane when autoDeployStage is on — normally the live
+   * S3 marker (preferred) or the local `stage` branch. Kept in sync by
+   * resolveLiveStageTip / markLocalStageDeployed.
    */
   stageDeployedSha: string | null;
+  /**
+   * Tip shown for the prod lane when a prod S3 marker bucket is configured and
+   * reachable. Null ⇒ fall back to `origin/prod` (branch-based comparison).
+   */
+  prodDeployedSha: string | null;
 };
 
 /** Outcome of an auto-fast-forward attempt on one local branch ref. */
@@ -173,10 +178,15 @@ export async function computePipeline(
   const lanes: Lane[] = [];
   for (const name of present) {
     let tip = await repo.tip(repoPath, remote, name);
-    // Local stage deploy: lane tip = local `stage` (deploy tracker), not origin/stage.
+    // Local stage deploy: lane tip prefers the live marker / local tracker, not origin/stage.
     if (cfg.autoDeployStage && name === "stage") {
-      const localTip = (await repo.localSha(repoPath, "stage")) ?? cfg.stageDeployedSha ?? null;
+      const localTip = cfg.stageDeployedSha ?? (await repo.localSha(repoPath, "stage")) ?? null;
       if (localTip) tip = localTip;
+    }
+    // Live prod marker (S3) beats a stale origin/prod when a local/chong deploy shipped
+    // without pushing the git ref.
+    if (name === "prod" && cfg.prodDeployedSha) {
+      tip = cfg.prodDeployedSha;
     }
     if (!tip) continue;
     const commit = await repo.commitMeta(repoPath, tip);
@@ -197,6 +207,12 @@ export async function computePipeline(
 
     if (cfg.autoDeployStage && (from === "stage" || to === "stage")) {
       // Gaps involving the virtual stage tip use raw SHAs.
+      ({ ahead, behind } = await repo.aheadBehindShas(repoPath, fromLane.tip, toLane.tip));
+      ff = await repo.isAncestor(repoPath, toLane.tip, fromLane.tip);
+      queued =
+        ahead > 0 ? await repo.logBetweenShas(repoPath, fromLane.tip, toLane.tip, QUEUE_LIMIT) : [];
+    } else if (cfg.prodDeployedSha && (from === "prod" || to === "prod")) {
+      // Live prod marker tip is a raw SHA, not necessarily origin/prod.
       ({ ahead, behind } = await repo.aheadBehindShas(repoPath, fromLane.tip, toLane.tip));
       ff = await repo.isAncestor(repoPath, toLane.tip, fromLane.tip);
       queued =

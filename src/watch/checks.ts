@@ -23,6 +23,10 @@ import {
 import { filterDepsByReleasePolicy, readDepsPolicy } from "./deps-policy";
 import { fetchDismissedPackageNames, parseGitHubSlug } from "./gh";
 import {
+  acquireWorktreeClaim,
+  formatWorktreeHolder,
+} from "./worktree-claim";
+import {
   type Untranslated,
   addedLineNumbers,
   findUntranslated,
@@ -270,9 +274,25 @@ export function shadowPathFor(repoPath: string): string {
 }
 
 /** Ensure the main-shadow worktree exists and is hard-reset to `ref`. */
-export async function ensureShadow(repoPath: string, ref: string): Promise<ShadowInfo> {
+export async function ensureShadow(
+  repoPath: string,
+  ref: string,
+  opts: { processId?: string; forceWorktree?: boolean } = {},
+): Promise<ShadowInfo> {
   const shadowPath = shadowPathFor(repoPath);
   mkdirSync(path.dirname(shadowPath), { recursive: true });
+
+  if (opts.processId) {
+    const acquired = acquireWorktreeClaim(shadowPath, opts.processId, {
+      force: opts.forceWorktree,
+    });
+    if (!acquired.ok) {
+      return {
+        shadowPath,
+        error: `worktree claimed by ${formatWorktreeHolder(acquired.claim)} — wait or force-override`,
+      };
+    }
+  }
 
   // Prune stale worktree entries first
   await git(["worktree", "prune"], repoPath);
