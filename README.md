@@ -56,7 +56,7 @@ Options:
 
 **Partial cherry-pick guard:** if a diverged cherry-pick applies only *some* hunks (others already on origin) the resulting commit gets a new `git patch-id`, so `git cherry` still lists the local SHA as unique. Watch would otherwise re-inject that SHA on every poll and flood `origin/main` with duplicate hunks. After each cherry-pick, watch requires the new commit's patch-id to match the source; on mismatch (or empty skip) it aborts without pushing and blocks those SHAs until the local tip moves.
 
-**Unresolved-import gate (before every stage deploy):** the shadow worktree is scanned for import specifiers that resolve to no file, and any finding blocks the deploy. This exists because a **lazy** `import()` is only resolved when its chunk is first requested — so `vite build` succeeds and the route renders a blank page on navigation. Neither the build nor the unit tests catch it. Scanning is repo-wide rather than diff-scoped on purpose: the commit that breaks things deletes file A, while the dangling import sits in file B, which the diff never mentions. ~0.5s on a 1,700-file repo. Aliases come from the watched repo's `tsconfig.json`/`jsconfig.json` `paths` (falling back to `@/* -> src/*`); comments are stripped first, so `import('@/…')` written as prose in a doc comment is not a finding. Bare package names, template-hole specifiers and URLs are left alone. No auto-fix and no agent hand-off — the repair is either restoring the deleted file or deleting its importer, and guessing wrong ships the wrong one. Disable with `--no-import-scan`.
+**Unresolved-import gate (before every stage deploy):** the stage-deploy shadow is scanned for import specifiers that resolve to no file, and any finding blocks the deploy. This exists because a **lazy** `import()` is only resolved when its chunk is first requested — so `vite build` succeeds and the route renders a blank page on navigation. Neither the build nor the unit tests catch it. Scanning is repo-wide rather than diff-scoped on purpose: the commit that breaks things deletes file A, while the dangling import sits in file B, which the diff never mentions. ~0.5s on a 1,700-file repo. Aliases come from the watched repo's `tsconfig.json`/`jsconfig.json` `paths` (falling back to `@/* -> src/*`); comments are stripped first, so `import('@/…')` written as prose in a doc comment is not a finding. Bare package names, template-hole specifiers and URLs are left alone. No auto-fix and no agent hand-off — the repair is either restoring the deleted file or deleting its importer, and guessing wrong ships the wrong one. Disable with `--no-import-scan`.
 
 **Per-repo config (`<repo>/.chong/config.json`):** chong keeps its per-repo state in
 `<repo>/.chong/`, and `chong watch` creates that folder and adds `.chong/` to the repo's
@@ -93,7 +93,7 @@ script. Unattended deploys of a backend are a bad default: in a serverless repo 
 secrets live in CI, a laptop `deploy:stage` can silently replace live environment variables
 with blanks and still report success.
 
-**Auto-deploy → app-ci (stage):** when `scripts/deploy-frontend.sh` exists (LynxCraft FRONTEND), watch no longer pushes `origin/stage`. Instead, after origin/main is quiet for **60s** (resets on each new commit), it builds+uploads to the CI S3/CloudFront bucket from `main-shadow`, advances the **local** `stage` branch to that tip (tracking only), writes `deployed-git-sha.txt`, and pings Discord. Manual `[s]` deploys immediately. Prod promote (`[p]`) still pushes git (local stage tip → `prod`) so the full prod CI suite runs. Disable with `--no-auto-deploy-stage`; tune with `--deploy-cooldown <s>` / `--stage-deploy-cmd <cmd>`.
+**Auto-deploy → app-ci (stage):** when `scripts/deploy-frontend.sh` exists (LynxCraft FRONTEND), watch no longer pushes `origin/stage`. Instead, after origin/main is quiet for **60s** (resets on each new commit), it builds+uploads to the CI S3/CloudFront bucket from the `stage-deploy` shadow, advances the **local** `stage` branch to that tip (tracking only), writes `deployed-git-sha.txt`, and pings Discord. Manual `[s]` deploys immediately. Local prod (`[p]` → local) uses a separate `prod-deploy` shadow, so stage and prod can upload in parallel. Disable with `--no-auto-deploy-stage`; tune with `--deploy-cooldown <s>` / `--stage-deploy-cmd <cmd>`.
 
 **Offline agents:** install mcp-ify’s `offline-agent` (`bash offline-agent/install.sh`) so `mcpify-agent` is on PATH — then watch runs fully locally via Ollama + mcp-ify with no Cursor cloud dependency.
 
@@ -149,17 +149,24 @@ The heuristic flags string literals / Vue template text carrying a non-source-lo
 
 It's still a candidate flagger, so **expect false positives** (log/throw strings, content/data modules that are intentionally untranslated) — the point is a fast feedback loop for triage, not a fix list.
 
-### How `main-shadow` works
+### How shadow worktrees work
 
-For each new remote commit, chong creates (or resets) a git worktree called `main-shadow` as a sibling of the watched repo:
+Chong keeps throwaway worktrees under `~/.chong/worktrees/` (not as siblings of the
+watched repo):
 
 ```
-~/projects/
-  my-repo/         ← watched repo
-  main-shadow/     ← chong's worktree, always at origin/main
+~/.chong/worktrees/
+  FRONTEND-main-shadow-<hash>/          ← auto-fix / inject / maintain
+  FRONTEND-stage-deploy-shadow-<hash>/  ← local app-ci deploy
+  FRONTEND-prod-deploy-shadow-<hash>/   ← local production deploy
 ```
 
-`node_modules` is symlinked from the source repo (same lockfile, no reinstall). Auto-fix commits are tagged `FIX:` and skipped on re-check to avoid loops.
+`node_modules` is symlinked from the source repo (same lockfile, no reinstall). Auto-fix
+commits are tagged `FIX:` and skipped on re-check to avoid loops.
+
+**Stage and prod can deploy in parallel:** each target resets and builds in its own
+tree, so one deploy's `git reset --hard` / `dist/` write cannot corrupt the other.
+S3 soft-claims still serialize two watches racing the *same* target.
 
 ### Deploy trust boundary
 

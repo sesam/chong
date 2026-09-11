@@ -3,18 +3,28 @@
  *
  * Replaces git-pushing `main → stage` (which burned GitHub Actions minutes) with:
  *   1. a debounce countdown after origin/main moves
- *   2. `scripts/deploy-frontend.sh ci` from main-shadow at that tip
+ *   2. `scripts/deploy-frontend.sh ci` from a dedicated stage-deploy shadow at that tip
  *   3. advancing the **local** `stage` branch to that tip (tracking only — never pushed)
  *   4. S3 markers (`deployed-git-sha.txt` + `deployed-tree-sha.txt`) so a stray
  *      stage-branch CI run can no-op — and so watch can prefer the LIVE tip over a
  *      stale local branch / origin/prod when comparing the pipeline
  *   5. Discord via the notify-discord relay (same channel as FE CI)
+ *
+ * Stage and prod each get their own shadow worktree (see {@link ShadowRole}) so a
+ * local prod upload and an auto stage deploy can run in parallel without one
+ * `reset --hard` / `dist/` write stomping the other. Maintain/inject keep using
+ * main-shadow on `checkQueue`.
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { c } from "../util";
-import { ensureShadow, runEslintFix, tryAgentLintFix } from "./checks";
+import {
+  ensureShadow,
+  runEslintFix,
+  tryAgentLintFix,
+  type ShadowRole,
+} from "./checks";
 import {
   acquireDeployClaim,
   CLAIM_HEARTBEAT_MS,
@@ -29,11 +39,88 @@ import { appendDeployHistory, deployHistoryPath } from "./deploy-history";
 import { formatLintSummary, isAgentableLintFailure, lintableChangedFiles, runEslint } from "./lint";
 import { repo } from "./repo";
 import { formatUnresolvedSummary, scanUnresolvedImports } from "./unresolved-imports";
+import {
+  releaseWorktreeClaim,
+  touchWorktreeClaim,
+  WORKTREE_CLAIM_TOUCH_MS,
+} from "./worktree-claim";
 
 export const DEPLOYED_SHA_KEY = "deployed-git-sha.txt";
 export const DEPLOYED_TREE_KEY = "deployed-tree-sha.txt";
 export const DEFAULT_DEPLOY_COOLDOWN_SEC = 60;
 export const STAGE_TRACK_BRANCH = "stage";
+
+/** Braille spinner frames for the TUI "deploying…" suffix (advances once per second). */
+const DEPLOY_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+
+/**
+ * Ordered phases for the stage-deploy progress suffix (`n/total`).
+ * Claim force / aborting / etc. are omitted — they still show as a label, just without a counter.
+ */
+const STAGE_DEPLOY_STEPS = [
+  "claiming",
+  "claim wait",
+  "reset shadow",
+  "eslint",
+  "import scan",
+  "build+upload",
+] as const;
+
+/**
+ * Short label for the TUI's ongoing-deploy line.
+ *
+ * Returns `null` when the message is side-channel noise (heartbeat, Discord, marker
+ * follow-ups) that should not replace the active step — those still go to notices.
+ */
+export function shortDeployStep(msg: string): string | null {
+  const m = msg.trim();
+  if (!m) return null;
+  if (/^deploy: heartbeat/i.test(m)) return null;
+  if (/claim release failed/i.test(m)) return null;
+  if (/Discord notify failed/i.test(m)) return null;
+  if (/live, but/i.test(m)) return null;
+  if (/could not resolve tree/i.test(m)) return null;
+
+  if (/^deploy claim: writing/i.test(m)) return "claiming";
+  if (/^deploy claim: waiting/i.test(m)) return "claim wait";
+  if (/^deploy claim: FORCE/i.test(m)) return "claim force";
+  if (/forced claim/i.test(m)) return "claim forced";
+
+  if (/resetting shadow/i.test(m)) return "reset shadow";
+  if (/eslint gate/i.test(m)) return "eslint";
+  if (/unresolved-import/i.test(m)) return "import scan";
+  if (/\brunning\b/i.test(m)) return "build+upload";
+  if (/lost soft claim/i.test(m)) return "aborting";
+
+  let s = m
+    .replace(/^deploy (stage|prod):\s*/i, "")
+    .replace(/^deploy claim:\s*/i, "")
+    .replace(/…$/, "")
+    .replace(/\.\.\.$/, "")
+    .trim();
+  if (s.length > 28) s = `${s.slice(0, 27)}…`;
+  return s || null;
+}
+
+/**
+ * Bracketed suffix for an ongoing deploy line: `[⠋ 4/6 eslint, 12s]`.
+ * Seconds count from when the current step started (resets on each new detail).
+ */
+export function formatDeployStepSuffix(
+  detail: string | undefined,
+  stepStartedAt: number | undefined,
+  now = Date.now(),
+): string {
+  if (!detail && stepStartedAt == null) return "";
+  const secs = stepStartedAt != null ? Math.max(0, Math.floor((now - stepStartedAt) / 1000)) : 0;
+  const spin = DEPLOY_SPINNER[secs % DEPLOY_SPINNER.length] ?? "⠋";
+  const stepIdx = detail
+    ? (STAGE_DEPLOY_STEPS as readonly string[]).indexOf(detail)
+    : -1;
+  const counter = stepIdx >= 0 ? `${stepIdx + 1}/${STAGE_DEPLOY_STEPS.length} ` : "";
+  if (detail) return ` [${spin} ${counter}${detail}, ${secs}s]`;
+  return ` [${spin} ${secs}s]`;
+}
 
 const DISCORD_ENDPOINTS = [
   "https://notify-discord.42b.eu",
@@ -335,7 +422,7 @@ export function defaultStageDeployCmd(repoPath: string): string | null {
     // because s5cmd is often missing on laptops) pinned every chong deploy to the
     // slower tool even on machines that had s5cmd.
     // FORCE skips the tty prompt. CI=true makes pnpm non-interactive
-    // (confirmModulesPurge). DEPLOY_SKIP_INSTALL=1 relies on the main-shadow
+    // (confirmModulesPurge). DEPLOY_SKIP_INSTALL=1 relies on the deploy-shadow
     // node_modules symlink — no reinstall in the worktree.
     return "CI=true FORCE=1 DEPLOY_SKIP_INSTALL=1 ./scripts/deploy-frontend.sh ci";
   }
@@ -1086,18 +1173,39 @@ async function unresolvedImportGate(
   };
 }
 
-/** Reset the shadow worktree to `sha` and give the deploy the same .env a manual run sees. */
+/**
+ * Keep a deploy shadow's worktree claim fresh for the duration of a long build/upload.
+ * Main-shadow is touched by the watch clock; deploy trees are only held while deploying,
+ * so without this a >20m deploy would look abandoned.
+ */
+function startDeployWorktreeTouch(shadowPath: string, processId: string): () => void {
+  touchWorktreeClaim(shadowPath, processId);
+  const id = setInterval(() => {
+    touchWorktreeClaim(shadowPath, processId);
+  }, WORKTREE_CLAIM_TOUCH_MS);
+  return () => clearInterval(id);
+}
+
+/** Reset a per-target deploy shadow to `sha` and give the deploy the same .env a manual run sees. */
 async function prepareShadow(
   repoPath: string,
   sha: string,
   processId: string,
-): Promise<{ shadowPath?: string; error?: string }> {
+  role: Extract<ShadowRole, "stage-deploy" | "prod-deploy">,
+): Promise<{ shadowPath?: string; error?: string; claimed: boolean }> {
   // `processId` is required: this resets the shared worktree, so it must hold the claim.
   // It used to be optional and pass `undefined` through, which silently skipped the claim
   // check entirely — the fourth such bypass, and the one that only surfaced once
   // `ensureShadow` made the claim mandatory rather than opt-in.
-  const shadow = await ensureShadow(repoPath, sha, { processId });
-  if (shadow.error) return { error: shadow.error };
+  const shadow = await ensureShadow(repoPath, sha, { processId, role });
+  if (shadow.error) {
+    // Claim may still be ours after a failed reset — caller releases when claimed.
+    return {
+      error: shadow.error,
+      claimed: shadow.claim.ok,
+      shadowPath: shadow.shadowPath,
+    };
+  }
 
   // Only `.env` — deliberately NOT `.env.local`. Vite loads .env.local after .env and it
   // wins, so copying it would let a developer's localhost values into a real deploy.
@@ -1110,18 +1218,21 @@ async function prepareShadow(
       /* deploy script will warn */
     }
   }
-  return { shadowPath: shadow.shadowPath };
+  return { shadowPath: shadow.shadowPath, claimed: true };
 }
 
 /**
- * Build+upload PRODUCTION from a shadow worktree at `sha`, instead of pushing the `prod`
- * branch and letting GitHub Actions do it.
+ * Build+upload PRODUCTION from a dedicated prod-deploy shadow at `sha`, instead of
+ * pushing the `prod` branch and letting GitHub Actions do it.
  *
  * `sha` is the stage lane tip — the same commit `promote()` would have pushed — so local
  * and remote prod deploys ship identical content and differ only in who runs the build.
  *
  * Soft-claims the prod marker bucket before uploading (same eventually-consistent race as
  * stage). Pass `force: true` to proceed even when another watch holds the claim.
+ *
+ * Uses the `prod-deploy` worktree (not main-shadow), so a concurrent stage deploy or
+ * maintain pass cannot `reset --hard` underneath the vite build / S3 sync.
  *
  * No eslint or unresolved-import gate here, unlike the stage path: this exact commit
  * already passed both on its way to stage, and re-running the agent auto-fix at
@@ -1188,14 +1299,19 @@ export async function runLocalProdDeploy(
     { onProgress: note },
   );
 
+  let deployShadowPath: string | null = null;
+  let stopWorktreeTouch: (() => void) | null = null;
+
   try {
     const lost = await confirmClaimBeforeUpload(markerBucket, heldClaim, sha, "prod", force);
     if (lost) return lost;
 
-    const shadow = await prepareShadow(repoPath, sha, opts.processId);
+    const shadow = await prepareShadow(repoPath, sha, opts.processId, "prod-deploy");
+    if (shadow.claimed && shadow.shadowPath) deployShadowPath = shadow.shadowPath;
     if (shadow.error || !shadow.shadowPath) {
       return { action: "blocked", message: `shadow: ${shadow.error}`, sha };
     }
+    stopWorktreeTouch = startDeployWorktreeTouch(shadow.shadowPath, opts.processId);
 
     const lost2 = await confirmClaimBeforeUpload(markerBucket, heldClaim, sha, "prod", force);
     if (lost2) return lost2;
@@ -1254,6 +1370,10 @@ export async function runLocalProdDeploy(
       sha,
     };
   } finally {
+    stopWorktreeTouch?.();
+    if (deployShadowPath) {
+      releaseWorktreeClaim(deployShadowPath, opts.processId);
+    }
     stopHeartbeat();
     if (markerBucket && heldClaim) {
       const relErr = await releaseDeployClaim(markerBucket, heldClaim);
@@ -1267,7 +1387,9 @@ export async function runLocalProdDeploy(
  * Does not push the `stage` git branch.
  *
  * Soft-claims the stage marker bucket before uploading so parallel `chong watch`
- * processes defer instead of racing the same bucket.
+ * processes defer instead of racing the same bucket. Builds in the `stage-deploy`
+ * worktree so a concurrent local prod deploy (or main-shadow maintain) cannot
+ * clobber the tree mid-upload.
  */
 export async function runLocalStageDeploy(
   repoPath: string,
@@ -1318,13 +1440,18 @@ export async function runLocalStageDeploy(
     { onProgress: note },
   );
 
+  let deployShadowPath: string | null = null;
+  let stopWorktreeTouch: (() => void) | null = null;
+
   try {
     note(`deploy stage: resetting shadow to ${tip.slice(0, 7)}…`);
 
-    const shadow = await ensureShadow(repoPath, tip, { processId: opts.processId });
-    if (shadow.error) {
+    const shadow = await prepareShadow(repoPath, tip, opts.processId, "stage-deploy");
+    if (shadow.claimed && shadow.shadowPath) deployShadowPath = shadow.shadowPath;
+    if (shadow.error || !shadow.shadowPath) {
       return { action: "blocked", message: `shadow: ${shadow.error}`, sha: tip };
     }
+    stopWorktreeTouch = startDeployWorktreeTouch(shadow.shadowPath, opts.processId);
 
     note("deploy stage: eslint gate…");
     const eslintResult = await eslintGate(
@@ -1343,16 +1470,6 @@ export async function runLocalStageDeploy(
       note("deploy stage: unresolved-import scan…");
       const importGate = await unresolvedImportGate(shadow.shadowPath, tip);
       if (importGate) return importGate;
-    }
-
-    const envSrc = path.join(repoPath, ".env");
-    const envDst = path.join(shadow.shadowPath, ".env");
-    if (existsSync(envSrc)) {
-      try {
-        await Bun.write(envDst, await Bun.file(envSrc).arrayBuffer());
-      } catch {
-        /* deploy script will warn */
-      }
     }
 
     const lost = await confirmClaimBeforeUpload(markerBucket, heldClaim, tip, "stage", false);
@@ -1414,6 +1531,10 @@ export async function runLocalStageDeploy(
       sha: tip,
     };
   } finally {
+    stopWorktreeTouch?.();
+    if (deployShadowPath) {
+      releaseWorktreeClaim(deployShadowPath, opts.processId);
+    }
     stopHeartbeat();
     if (markerBucket && heldClaim) {
       const relErr = await releaseDeployClaim(markerBucket, heldClaim);

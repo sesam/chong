@@ -396,29 +396,51 @@ export type ShadowClaimOpts = {
 };
 
 /**
- * Where chong keeps a repo's main-shadow worktree: under ~/.chong/worktrees/ rather
- * than as a sibling of the repo, so unrelated tooling (and the user) never trip over
- * it. Keyed by repo basename + a short hash of the absolute top-level path, so two
- * checkouts that share a basename get distinct shadow worktrees.
+ * Which chong worktree under ~/.chong/worktrees/ to use.
+ *
+ * - `main` — auto-fix / inject / maintain (one shared tree per watch)
+ * - `stage-deploy` / `prod-deploy` — local deploys only
+ *
+ * Deploy roles are separate on purpose: stage and prod upload to different S3 buckets
+ * and can run in parallel, but both used to reset the same main-shadow (and write the
+ * same `dist/`), which corrupted whichever build was mid-flight. Separate trees keep
+ * `reset --hard` + vite output isolated while main-shadow stays free for maintain.
  */
-export function shadowPathFor(repoPath: string): string {
-  const base = path.basename(repoPath);
-  const hash = createHash("sha1").update(repoPath).digest("hex").slice(0, 8);
-  return path.join(homedir(), ".chong", "worktrees", `${base}-main-shadow-${hash}`);
-}
+export type ShadowRole = "main" | "stage-deploy" | "prod-deploy";
 
 /**
- * Ensure the main-shadow worktree exists and is hard-reset to `ref`.
+ * Where chong keeps a repo's shadow worktree: under ~/.chong/worktrees/ rather
+ * than as a sibling of the repo, so unrelated tooling (and the user) never trip over
+ * it. Keyed by repo basename + a short hash of the absolute top-level path, so two
+ * checkouts that share a basename get distinct shadow worktrees. `role` selects
+ * main vs per-target deploy trees (see {@link ShadowRole}).
+ */
+export function shadowPathFor(repoPath: string, role: ShadowRole = "main"): string {
+  const base = path.basename(repoPath);
+  const hash = createHash("sha1").update(repoPath).digest("hex").slice(0, 8);
+  const label = role === "main" ? "main-shadow" : `${role}-shadow`;
+  return path.join(homedir(), ".chong", "worktrees", `${base}-${label}-${hash}`);
+}
+
+export type EnsureShadowOpts = ShadowClaimOpts & {
+  /** Defaults to `main`. Deploy callers pass `stage-deploy` / `prod-deploy`. */
+  role?: ShadowRole;
+};
+
+/**
+ * Ensure a shadow worktree exists and is hard-reset to `ref`.
  *
  * Requires a worktree claim — see {@link ShadowClaimOpts} for why that is mandatory
- * rather than optional.
+ * rather than optional. Deploy callers should release the worktree claim when the
+ * deploy finishes so another watch can reuse that target's tree.
  */
 export async function ensureShadow(
   repoPath: string,
   ref: string,
-  opts: ShadowClaimOpts,
+  opts: EnsureShadowOpts,
 ): Promise<ShadowInfo> {
-  const shadowPath = shadowPathFor(repoPath);
+  const role = opts.role ?? "main";
+  const shadowPath = shadowPathFor(repoPath, role);
   mkdirSync(path.dirname(shadowPath), { recursive: true });
   const warnings: string[] = [];
 
@@ -451,24 +473,27 @@ export async function ensureShadow(
   // `git status` (nothing to lose) and a detached HEAD (the shape *we* create — a
   // worktree on a real branch is somebody's working copy, not our leftover). Otherwise
   // warn and leave it alone; an orphaned registration is harmless next to lost work.
-  const legacyPath = path.join(path.dirname(repoPath), "main-shadow");
-  if (legacyPath !== shadowPath) {
-    const reg = await git(["worktree", "list", "--porcelain"], repoPath);
-    const legacyLinked = reg.out
-      .split("\n")
-      .some((l) => l.startsWith("worktree ") && l.slice("worktree ".length).trim() === legacyPath);
-    if (legacyLinked) {
-      const dirty = await statusPaths(legacyPath);
-      const branchR = await git(["symbolic-ref", "--quiet", "HEAD"], legacyPath);
-      const detached = !branchR.ok;
-      if (dirty.length > 0 || !detached) {
-        warnings.push(
-          `legacy worktree ${legacyPath} left in place — ${
-            dirty.length > 0 ? `${dirty.length} uncommitted change(s)` : `on branch ${branchR.out}`
-          }; remove it by hand once you've saved anything you need`,
-        );
-      } else {
-        await git(["worktree", "remove", legacyPath], repoPath);
+  // Deploy roles never used the sibling path — skip migration for them.
+  if (role === "main") {
+    const legacyPath = path.join(path.dirname(repoPath), "main-shadow");
+    if (legacyPath !== shadowPath) {
+      const reg = await git(["worktree", "list", "--porcelain"], repoPath);
+      const legacyLinked = reg.out
+        .split("\n")
+        .some((l) => l.startsWith("worktree ") && l.slice("worktree ".length).trim() === legacyPath);
+      if (legacyLinked) {
+        const dirty = await statusPaths(legacyPath);
+        const branchR = await git(["symbolic-ref", "--quiet", "HEAD"], legacyPath);
+        const detached = !branchR.ok;
+        if (dirty.length > 0 || !detached) {
+          warnings.push(
+            `legacy worktree ${legacyPath} left in place — ${
+              dirty.length > 0 ? `${dirty.length} uncommitted change(s)` : `on branch ${branchR.out}`
+            }; remove it by hand once you've saved anything you need`,
+          );
+        } else {
+          await git(["worktree", "remove", legacyPath], repoPath);
+        }
       }
     }
   }

@@ -1,5 +1,6 @@
 import { c } from "../util";
 import { gapHotkeys } from "./model";
+import { formatDeployStepSuffix } from "./stage-deploy";
 import type { CIState, Gap, Lane, Pipeline } from "./types";
 
 const mag = (s: string) => `\x1b[35m${s}\x1b[0m`;
@@ -28,6 +29,10 @@ export type UIState = {
     secsLeft: number;
     /** Who holds the soft claim when kind is remote-deploying / deploying. */
     by?: string;
+    /** Current deploy phase label (e.g. "eslint", "build+upload"). */
+    detail?: string;
+    /** Epoch ms when `detail` last changed — render derives elapsed seconds from this. */
+    stepStartedAt?: number;
   } | null;
   /**
    * This repo can deploy prod locally, so the prod prompt offers [r]emote / [l]ocal
@@ -307,7 +312,8 @@ export function render(p: Pipeline, ui: UIState): string {
       );
     } else if (sd.kind === "deploying") {
       const by = sd.by ? ` (${sd.by})` : "";
-      line = c.yellow(`  🚀 deploying ${sd.shaShort} → app-ci…${by}`);
+      const step = formatDeployStepSuffix(sd.detail, sd.stepStartedAt);
+      line = c.yellow(`  🚀 deploying ${sd.shaShort} → app-ci…${by}${step}`);
     } else if (sd.kind === "remote-deploying") {
       line = c.yellow(
         `  🚀 app-ci deploy in progress by ${sd.by ?? "someone"} (${sd.shaShort}) — waiting`,

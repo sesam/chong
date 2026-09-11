@@ -7,10 +7,12 @@ import {
   defaultProdDeployCmd,
   defaultStageDeployCmd,
   ensureChongIgnored,
+  formatDeployStepSuffix,
   liveTipCoversSha,
   loadRepoDeployConfig,
   prodDeployedShaBucket,
   selectLiveDeployTip,
+  shortDeployStep,
   stageDeployedShaBucket,
   startClaimHeartbeat,
 } from "./stage-deploy";
@@ -535,5 +537,42 @@ describe("startClaimHeartbeat — serializes overlapping ticks", () => {
 
     expect(calls).toBeGreaterThan(1);
     expect(lostCalls).toBe(0);
+  });
+});
+
+describe("shortDeployStep / formatDeployStepSuffix", () => {
+  test("maps known progress messages to short labels", () => {
+    expect(shortDeployStep("deploy claim: writing as alice@host…")).toBe("claiming");
+    expect(shortDeployStep("deploy claim: waiting 8s for competing writers…")).toBe("claim wait");
+    expect(shortDeployStep("deploy stage: resetting shadow to abc1234…")).toBe("reset shadow");
+    expect(shortDeployStep("deploy stage: eslint gate…")).toBe("eslint");
+    expect(shortDeployStep("deploy stage: unresolved-import scan…")).toBe("import scan");
+    expect(shortDeployStep("deploy stage: running CI=true ./scripts/deploy-frontend.sh ci…")).toBe(
+      "build+upload",
+    );
+    expect(shortDeployStep("deploy prod: running npm run deploy:prod…")).toBe("build+upload");
+  });
+
+  test("ignores heartbeat / follow-up noise so the active step stays put", () => {
+    expect(shortDeployStep("deploy: heartbeat attempt failed (1/3) — timed out")).toBeNull();
+    expect(shortDeployStep("deploy stage: claim release failed (boom)")).toBeNull();
+    expect(shortDeployStep("deploy stage: Discord notify failed")).toBeNull();
+    expect(
+      shortDeployStep("deploy stage: live, but S3 marker failed (AccessDenied)"),
+    ).toBeNull();
+  });
+
+  test("suffix includes spinner, step counter when known, and elapsed seconds", () => {
+    const started = 1_000_000;
+    expect(formatDeployStepSuffix("eslint", started, started + 12_500)).toBe(
+      " [⠹ 4/6 eslint, 12s]",
+    );
+    expect(formatDeployStepSuffix("build+upload", started, started)).toBe(
+      " [⠋ 6/6 build+upload, 0s]",
+    );
+    // Unknown label: no n/total, still shows spinner + seconds.
+    expect(formatDeployStepSuffix("aborting", started, started + 3_000)).toBe(
+      " [⠸ aborting, 3s]",
+    );
   });
 });

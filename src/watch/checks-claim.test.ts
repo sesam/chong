@@ -73,6 +73,24 @@ function plantForeignClaim(repoPath: string): string {
   return shadowPath;
 }
 
+describe("shadowPathFor roles isolate deploy trees", () => {
+  test("main / stage-deploy / prod-deploy resolve to distinct paths", () => {
+    const repo = "/tmp/example/FRONTEND";
+    const main = shadowPathFor(repo);
+    const stage = shadowPathFor(repo, "stage-deploy");
+    const prod = shadowPathFor(repo, "prod-deploy");
+    expect(main).toContain("main-shadow");
+    expect(stage).toContain("stage-deploy-shadow");
+    expect(prod).toContain("prod-deploy-shadow");
+    expect(new Set([main, stage, prod]).size).toBe(3);
+  });
+
+  test("default role stays main-shadow for existing callers", () => {
+    const repo = "/tmp/example/FRONTEND";
+    expect(shadowPathFor(repo)).toBe(shadowPathFor(repo, "main"));
+  });
+});
+
 describe("ensureShadow requires a claim", () => {
   test("the claim is a required argument, not an optional one", () => {
     // A type-level guarantee, asserted here so the intent is recorded next to the

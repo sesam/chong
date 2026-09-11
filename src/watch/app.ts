@@ -28,12 +28,14 @@ import { type WatchConfig, computePipeline, enrichCI, gapHotkeys, promote } from
 import { type UIState, render } from "./render";
 import {
   defaultProdDeployCmd,
+  formatDeployStepSuffix,
   prodDeployedShaBucket,
   resolveLiveProdTip,
   resolveLiveStageTip,
   resolveStageDeployCmd,
   runLocalProdDeploy,
   runLocalStageDeploy,
+  shortDeployStep,
   stageDeployedShaBucket,
 } from "./stage-deploy";
 import {
@@ -137,6 +139,15 @@ export async function runWatch(
   let pendingStageDeploySha: string | null = null;
   let stageDeployAt: number | null = null; // epoch ms
   let stageDeploying = false;
+  /** Current phase label while `stageDeploying` (shown on the pipeline line). */
+  let stageDeployDetail = "";
+  /** When `stageDeployDetail` last changed — elapsed seconds reset per step. */
+  let stageDeployStepAt = 0;
+  /**
+   * Live prod-deploy status line bits. Kept outside `ui.status` so the 1s clock can
+   * refresh the spinner/seconds without waiting for the next onProgress callback.
+   */
+  let prodDeployLive: { base: string; detail: string; stepAt: number } | null = null;
   /** Soft claim held by another watch (polled from S3); pauses our auto-deploy. */
   let remoteStageClaim: DeployClaim | null = null;
   let remoteProdClaim: DeployClaim | null = null;
@@ -197,6 +208,12 @@ export async function runWatch(
   const write = (s: string) => process.stdout.write(s);
 
   function paint(force = false): void {
+    // Refresh prod deploy spinner/seconds on every paint (1s clock), not only onProgress.
+    if (prodDeployLive) {
+      ui.status = c.yellow(
+        `${prodDeployLive.base}${formatDeployStepSuffix(prodDeployLive.detail, prodDeployLive.stepAt)}`,
+      );
+    }
     const frame = pipeline
       ? render(pipeline, ui)
       : `${c.bold("chong watch")}\n\n  ${c.dim("loading…")}`;
@@ -305,6 +322,8 @@ export async function runWatch(
         shaShort: (pendingStageDeploySha ?? cfg.stageDeployedSha ?? "").slice(0, 7),
         secsLeft: 0,
         by: process.env.USER || "local",
+        detail: stageDeployDetail || "starting",
+        stepStartedAt: stageDeployStepAt || Date.now(),
       };
       return;
     }
@@ -387,6 +406,8 @@ export async function runWatch(
     stageDeploying = true;
     pendingStageDeploySha = tip;
     stageDeployAt = null;
+    stageDeployDetail = "starting";
+    stageDeployStepAt = Date.now();
     syncStageDeployUi();
     ui.status = c.yellow(`deploying stage ${tip.slice(0, 7)} (${reason})…`);
     paint();
@@ -408,6 +429,12 @@ export async function runWatch(
           importScan: cfg.importScan,
           processId,
           onProgress: (msg) => {
+            const step = shortDeployStep(msg);
+            if (step && step !== stageDeployDetail) {
+              stageDeployDetail = step;
+              stageDeployStepAt = Date.now();
+              syncStageDeployUi();
+            }
             addNotice(c.dim(msg));
             paint();
           },
@@ -415,6 +442,8 @@ export async function runWatch(
       );
 
       stageDeploying = false;
+      stageDeployDetail = "";
+      stageDeployStepAt = 0;
       if (res.action === "deployed" && res.sha) {
         cfg.stageDeployedSha = res.sha;
         pendingStageDeploySha = null;
@@ -457,6 +486,8 @@ export async function runWatch(
       }
     } catch (e) {
       stageDeploying = false;
+      stageDeployDetail = "";
+      stageDeployStepAt = 0;
       stageDeployBlockedForTip = tip;
       pendingStageDeploySha = null;
       stageDeployAt = null;
@@ -977,18 +1008,22 @@ export async function runWatch(
         return;
       }
       ui.busy = true;
-      ui.status = c.yellow(
-        `deploying ${stageTip.slice(0, 7)} → PRODUCTION (local${mode === "force" ? ", forced" : ""})…`,
-      );
+      const prodBase = `deploying ${stageTip.slice(0, 7)} → PRODUCTION (local${mode === "force" ? ", forced" : ""})…`;
+      prodDeployLive = { base: prodBase, detail: "starting", stepAt: Date.now() };
       paint();
       const res = await runLocalProdDeploy(cfg.repoPath, gap.to, stageTip, prodDeployCmd, {
         force: mode === "force",
         processId,
         onProgress: (m) => {
-          ui.status = c.yellow(m);
+          const step = shortDeployStep(m);
+          if (prodDeployLive && step && step !== prodDeployLive.detail) {
+            prodDeployLive = { ...prodDeployLive, detail: step, stepAt: Date.now() };
+          }
+          addNotice(c.dim(m));
           paint();
         },
       });
+      prodDeployLive = null;
       if (res.action === "deferred" && res.claim) {
         remoteProdClaim = res.claim;
         ui.status = c.yellow(`⏳ ${res.message} — [f] to force`);

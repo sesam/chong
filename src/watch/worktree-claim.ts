@@ -1,9 +1,11 @@
 /**
- * Soft ownership of the shared main-shadow worktree.
+ * Soft ownership of a chong shadow worktree (main-shadow or a per-target deploy tree).
  *
- * Multiple `chong watch` processes on one machine share `~/.chong/worktrees/<repo>-main-shadow-*`.
- * The owner file lives *beside* the worktree (not inside it) so `git clean -fd` / hard-reset
- * cannot wipe the claim mid-run.
+ * Multiple `chong watch` processes on one machine share paths under
+ * `~/.chong/worktrees/<repo>-*-shadow-*`. Each path has its own owner file *beside*
+ * the worktree (not inside it) so `git clean -fd` / hard-reset cannot wipe the claim
+ * mid-run. Stage-deploy and prod-deploy trees are claimed only for the duration of a
+ * deploy and released afterward; main-shadow is held for the whole watch session.
  *
  * Stale detection uses the file's mtime: the owning process touches it on a fixed timer for
  * as long as it still owns the worktree — liveness does not depend on repo activity, so a
