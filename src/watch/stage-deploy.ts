@@ -169,6 +169,63 @@ export function loadRepoDeployConfig(repoPath: string): RepoDeployConfig {
 }
 
 /**
+ * S3 bucket-name grammar enforced on a CONFIGURED marker bucket.
+ *
+ * `.chong/config.json` is deliberately committed to each watched repo (see the comment on
+ * {@link rejectUnsafeConfiguredCmd}), so `stageDeployedShaBucket` / `prodDeployedShaBucket`
+ * are repo-controlled. There is no argv-injection risk here — the value lands in one
+ * `s3://<bucket>/<key>` argv element, so shell metacharacters just make a malformed URI, not
+ * an extra flag — but a repo-chosen bucket name still redirects two things that matter:
+ *
+ *   - WRITES (`writeS3DeployedSha` / `writeDeployClaim`): a compromised repo can send the
+ *     deployed SHA and the operator's user/host to any bucket the operator can write to —
+ *     cross-project marker corruption, plus a cheap exfiltration channel.
+ *   - READS: `selectLiveDeployTip` treats the S3 marker as authoritative over local refs, and
+ *     `liveTipCoversSha` uses it to decide whether a commit still needs deploying. A bucket
+ *     that echoes back the current tip makes chong believe prod already ships that commit and
+ *     silently skip the deploy.
+ *
+ * This validates FORMAT only: `^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$` (3-63 chars, lowercase
+ * letters/digits/dots/hyphens, must start and end with a letter or digit), plus the two other
+ * shapes S3 itself rejects — `..` and an IP-address-looking name. A validly-named bucket the
+ * attacker actually owns still passes: this is hygiene against malformed/abusive values, not a
+ * trust boundary around bucket ownership. The owner explicitly chose format validation over
+ * prompting on change.
+ */
+const S3_BUCKET_NAME_RE = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
+const IP_ADDRESS_LIKE_RE = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+
+function isValidMarkerBucketName(name: string): boolean {
+  return S3_BUCKET_NAME_RE.test(name) && !name.includes("..") && !IP_ADDRESS_LIKE_RE.test(name);
+}
+
+/**
+ * Validate a marker-bucket name that came from the watched repo's own `.chong/config.json`.
+ *
+ * Returns the (trimmed) name unchanged when it is a well-formed S3 bucket name. An empty
+ * value (nothing configured, or blank after trim) is treated as "no bucket" silently — the
+ * same state as omitting the key. Anything non-empty that fails the grammar is refused with a
+ * one-line error naming the config key, the repo, and why (mirrors the voice/mechanism of
+ * {@link rejectUnsafeConfiguredCmd}'s startup refusal), and reads as "no bucket configured"
+ * rather than being used anyway.
+ */
+function validateMarkerBucketName(
+  repoPath: string,
+  key: "stageDeployedShaBucket" | "prodDeployedShaBucket",
+  raw: string,
+): string | null {
+  const name = raw.trim();
+  if (!name) return null;
+  if (isValidMarkerBucketName(name)) return name;
+  console.error(
+    c.red(
+      `chong: refusing .chong/config.json "${key}" (${repoPath}) — "${name}" is not a valid S3 bucket name (must match ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$, must not contain ".." and must not look like an IP address). A committed repo config must not be able to redirect where deploy markers are written or read from. Treating this repo as though no ${key} were configured.`,
+    ),
+  );
+  return null;
+}
+
+/**
  * The bucket to write the SHA marker to, or null when this repo has none.
  *
  * Config only — no sniffing. This used to fall back to a hardcoded LynxCraft
@@ -176,15 +233,18 @@ export function loadRepoDeployConfig(repoPath: string): RepoDeployConfig {
  * shipped one project's infrastructure name and would write that project's
  * marker on behalf of a repo that merely had a similarly-named script. The repo
  * declares its own bucket in .chong/config.json; a repo that declares none gets
- * no marker, which is the safe default.
+ * no marker, which is the safe default. See {@link validateMarkerBucketName} for the
+ * format check applied to whatever the repo configures.
  */
 export function stageDeployedShaBucket(repoPath: string): string | null {
-  return loadRepoDeployConfig(repoPath).stageDeployedShaBucket?.trim() || null;
+  const raw = loadRepoDeployConfig(repoPath).stageDeployedShaBucket;
+  return raw ? validateMarkerBucketName(repoPath, "stageDeployedShaBucket", raw) : null;
 }
 
-/** Production marker bucket, or null when this repo has none configured. */
+/** Production marker bucket, or null when this repo has none configured (see {@link validateMarkerBucketName}). */
 export function prodDeployedShaBucket(repoPath: string): string | null {
-  return loadRepoDeployConfig(repoPath).prodDeployedShaBucket?.trim() || null;
+  const raw = loadRepoDeployConfig(repoPath).prodDeployedShaBucket;
+  return raw ? validateMarkerBucketName(repoPath, "prodDeployedShaBucket", raw) : null;
 }
 
 /**

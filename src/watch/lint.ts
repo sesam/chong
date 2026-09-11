@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { splitNulPaths } from "./checks";
 
 type Run = { ok: boolean; out: string; err: string };
 
@@ -13,7 +14,15 @@ export type EslintError = {
   ruleId: string;
 };
 
-/** JS/TS/Vue paths that differ between two refs (CI uses the same diff filter). */
+/**
+ * JS/TS/Vue paths that differ between two refs (CI uses the same diff filter).
+ *
+ * `-z`: without it, `--name-only` C-quotes any path containing a space or a non-ASCII
+ * character (`"a b.txt"`, `"\304\215.txt"`), and that quoted form never matches a real
+ * file on disk — the file is silently dropped from the lint set instead of being linted
+ * or reported. `splitNulPaths` (from `./checks`, converted the same way there) splits the
+ * NUL-terminated, unquoted output.
+ */
 export async function lintableChangedFiles(
   git: (args: string[], cwd: string) => Promise<Run>,
   cwd: string,
@@ -21,12 +30,11 @@ export async function lintableChangedFiles(
   toRef: string,
 ): Promise<string[]> {
   const r = await git(
-    ["diff", "--diff-filter=d", "--name-only", fromRef, toRef, "--", ...LINT_GLOBS],
+    ["diff", "--diff-filter=d", "--name-only", "-z", fromRef, toRef, "--", ...LINT_GLOBS],
     cwd,
   );
   if (!r.ok || !r.out) return [];
-  return r.out
-    .split("\n")
+  return splitNulPaths(r.out)
     .map((f) => f.trim())
     .filter((f) => f && existsSync(path.join(cwd, f)));
 }

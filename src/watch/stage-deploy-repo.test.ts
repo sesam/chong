@@ -73,6 +73,59 @@ describe("prodDeployedShaBucket", () => {
   });
 });
 
+describe("marker bucket name validation — repo-controlled config, format only", () => {
+  // .chong/config.json is deliberately committed to the watched repo, so
+  // stageDeployedShaBucket/prodDeployedShaBucket are repo-supplied text. There is no argv
+  // injection here (the value lands in one s3://<bucket>/<key> argv element), but a bad
+  // name can redirect marker WRITES (deployed SHA + operator user/host, to any bucket the
+  // operator can write) or READS (liveTipCoversSha trusting a bucket that echoes back the
+  // current tip, silently skipping a needed deploy). A refused name must read as exactly
+  // "no bucket configured" — the same state as omitting the key.
+
+  test("a valid bucket name passes", () => {
+    const dir = repo();
+    withChong(dir, {
+      stageDeployedShaBucket: "my-app-ci-deploy-markers",
+      prodDeployedShaBucket: "my-app-prod-deploy-markers",
+    });
+    expect(stageDeployedShaBucket(dir)).toBe("my-app-ci-deploy-markers");
+    expect(prodDeployedShaBucket(dir)).toBe("my-app-prod-deploy-markers");
+  });
+
+  test("a bucket name with dots and digits passes", () => {
+    const dir = repo();
+    withChong(dir, { stageDeployedShaBucket: "app-ci.deploy-markers.42b" });
+    expect(stageDeployedShaBucket(dir)).toBe("app-ci.deploy-markers.42b");
+  });
+
+  const invalidCases: Array<[string, string]> = [
+    ["uppercase", "My-Bucket"],
+    ["too short", "ab"],
+    ["too long", `a${"b".repeat(62)}c`],
+    ["leading dot", ".my-bucket"],
+    ["trailing dot", "my-bucket."],
+    ["leading hyphen", "-my-bucket"],
+    ["trailing hyphen", "my-bucket-"],
+    ["double dot", "my..bucket"],
+    ["IP address", "192.168.1.1"],
+    ["empty after trim", "   "],
+  ];
+
+  for (const [label, bad] of invalidCases) {
+    test(`refuses a stage bucket that is ${label}`, () => {
+      const dir = repo();
+      withChong(dir, { stageDeployedShaBucket: bad });
+      expect(stageDeployedShaBucket(dir)).toBeNull();
+    });
+
+    test(`refuses a prod bucket that is ${label}`, () => {
+      const dir = repo();
+      withChong(dir, { prodDeployedShaBucket: bad });
+      expect(prodDeployedShaBucket(dir)).toBeNull();
+    });
+  }
+});
+
 describe("selectLiveDeployTip — prefer live S3 markers", () => {
   const s3 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const branch = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
