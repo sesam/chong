@@ -371,6 +371,34 @@ export const repo = {
   },
 
   /**
+   * Create an annotated tag at `sha` and push it to `remote`.
+   *
+   * This is the only durable, shared record of a prod deploy. The local `prod`
+   * branch chong advances is never pushed, so `origin/prod` drifts arbitrarily
+   * far behind what is actually live — on 2026-09-17 it was two days and ~400
+   * commits stale, and reading it led to a wrong call about what production
+   * was running. A pushed tag cannot drift: it is on origin the moment the
+   * deploy finishes, and `git tag --list` / `git describe` answer "what went
+   * up when" for anyone, from any clone.
+   *
+   * Best-effort by contract. The caller has already deployed; a tag that fails
+   * to create or push must be reported and then ignored, never retried into a
+   * failed deploy.
+   */
+  async tagAndPush(
+    cwd: string,
+    remote: string,
+    tag: string,
+    sha: string,
+    message: string,
+  ): Promise<string | null> {
+    const created = await git(["tag", "-a", tag, sha, "-m", message], cwd);
+    if (!created.ok) return created.err || `tag ${tag} failed`;
+    const pushed = await git(["push", remote, `refs/tags/${tag}`], cwd);
+    return pushed.ok ? null : pushed.err || `tag ${tag} push failed`;
+  },
+
+  /**
    * The worktree path where `branch` is currently checked out, or null if it isn't
    * checked out in any worktree. Used to decide whether a local ref can be moved
    * directly (safe) or must go through a fast-forward merge in its worktree.

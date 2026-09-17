@@ -122,6 +122,21 @@ export function formatDeployStepSuffix(
   return ` [${spin} ${secs}s]`;
 }
 
+/**
+ * Release tag for a prod deploy: `prod-YYYYMMDD-HHMMSS`, UTC.
+ *
+ * UTC so tags from different machines and DST sides order correctly, and
+ * zero-padded throughout so lexical sort is chronological sort — `git tag
+ * --list 'prod-*' | tail -1` is then the current release. Only characters git
+ * accepts in a ref name, so no escaping or sanitising is needed.
+ */
+export function prodReleaseTagName(now: Date): string {
+  const p = (n: number, w = 2) => String(n).padStart(w, "0");
+  const d = `${now.getUTCFullYear()}${p(now.getUTCMonth() + 1)}${p(now.getUTCDate())}`;
+  const t = `${p(now.getUTCHours())}${p(now.getUTCMinutes())}${p(now.getUTCSeconds())}`;
+  return `prod-${d}-${t}`;
+}
+
 const DISCORD_ENDPOINTS = [
   "https://notify-discord.42b.eu",
   "https://notify-discord.cf42-0e1.workers.dev",
@@ -1252,6 +1267,8 @@ export async function runLocalProdDeploy(
     force?: boolean;
     /** Stable UUID for this `chong watch` process. */
     processId: string;
+    /** Remote the release tag is pushed to. Defaults to `origin`. */
+    remote?: string;
   },
 ): Promise<StageDeployResult> {
   const note = opts.onProgress ?? (() => {});
@@ -1341,6 +1358,23 @@ export async function runLocalProdDeploy(
       note(`deploy prod: live, but local ${prodBranch} ref update failed (${refErr.slice(0, 120)})`);
     }
 
+    // Permanent record of this release. Local `prod` tracks what is live but is
+    // never pushed, so origin has no idea; this tag is the part that reaches
+    // everyone. Named for the deploy *completion* time in UTC, which sorts
+    // lexically and is what you actually want when asking "what was live at
+    // 14:00 on the 12th". Failure is noted and dropped — the deploy has already
+    // succeeded and must not be reported as failed over its bookkeeping.
+    const releaseTag = prodReleaseTagName(new Date());
+    const who = (await repo.userName(repoPath)) ?? process.env.USER ?? "unknown";
+    const tagErr = await repo.tagAndPush(
+      repoPath,
+      opts.remote ?? "origin",
+      releaseTag,
+      sha,
+      `prod deploy ${sha.slice(0, 7)} by ${who}`,
+    );
+    if (tagErr) note(`deploy prod: live, but release tag failed (${tagErr.slice(0, 120)})`);
+
     if (markerBucket) {
       const tipTree2 = tipTree ?? (await repo.treeOf(repoPath, sha));
       const shaErr = await writeS3DeployedSha(markerBucket, sha);
@@ -1359,14 +1393,17 @@ export async function runLocalProdDeploy(
       who: (await repo.userName(repoPath)) ?? process.env.USER ?? "unknown",
     });
 
+    const tagNote = tagErr ? "(release tag failed)" : `· tag \`${releaseTag}\` pushed`;
     const discordOk = await notifyDiscordStage(
-      `✅ FE prod (chong local) deployed! ${sha.slice(0, 7)} — local \`${prodBranch}\` advanced, not pushed`,
+      `✅ FE prod (chong local) deployed! ${sha.slice(0, 7)} — local \`${prodBranch}\` advanced, not pushed ${tagNote}`,
     );
     if (!discordOk) note("deploy prod: Discord notify failed");
 
     return {
       action: "deployed",
-      message: `deployed ${sha.slice(0, 7)} → production (local ${prodBranch} advanced, not pushed)`,
+      message: `deployed ${sha.slice(0, 7)} → production (local ${prodBranch} advanced, not pushed; ${
+        tagErr ? "release tag failed" : `tag ${releaseTag} pushed`
+      })`,
       sha,
     };
   } finally {
