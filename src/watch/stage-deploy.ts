@@ -1458,37 +1458,33 @@ export async function runLocalStageDeploy(
   const note = opts.onProgress ?? (() => {});
 
   const markerBucket = stageDeployedShaBucket(repoPath);
-  const gate = await claimOrDefer(markerBucket, tip, opts.processId, "stage", {
+
+  // Assigned from inside gatesP, so held in an object: TS narrows closure-assigned `let`s to null.
+  const deploy: { shadowPath: string | null; stopTouch: (() => void) | null } = {
+    shadowPath: null,
+    stopTouch: null,
+  };
+  let stopHeartbeat: () => void = () => {};
+  let heldClaim: DeployClaim | null = null;
+  let claimLost = false;
+
+  // The claim's propagation wait is a fixed sleep, so the shadow reset, eslint gate and
+  // import scan run inside it instead of after it. They only read the tree (an eslint
+  // auto-fix lands on main, which any later deploy would ship anyway); the upload still
+  // waits for the claim below.
+  const claimP = claimOrDefer(markerBucket, tip, opts.processId, "stage", {
     onProgress: note,
   });
-  if (!gate.proceed) return gate.result;
-  const heldClaim = gate.claim;
 
-  let claimLost = false;
-  const stopHeartbeat = startClaimHeartbeat(
-    markerBucket,
-    heldClaim,
-    () => {
-      claimLost = true;
-      // Unlike the prod path, stage has no `force` option — shouldAbort below is a plain
-      // `claimLost`, so losing the claim always aborts here; the message stays accurate.
-      note("deploy stage: lost soft claim mid-upload — aborting");
-    },
-    { onProgress: note },
-  );
-
-  let deployShadowPath: string | null = null;
-  let stopWorktreeTouch: (() => void) | null = null;
-
-  try {
+  const gatesP = (async (): Promise<StageDeployResult | null> => {
     note(`deploy stage: resetting shadow to ${tip.slice(0, 7)}…`);
 
     const shadow = await prepareShadow(repoPath, tip, opts.processId, "stage-deploy");
-    if (shadow.claimed && shadow.shadowPath) deployShadowPath = shadow.shadowPath;
+    if (shadow.claimed && shadow.shadowPath) deploy.shadowPath = shadow.shadowPath;
     if (shadow.error || !shadow.shadowPath) {
       return { action: "blocked", message: `shadow: ${shadow.error}`, sha: tip };
     }
-    stopWorktreeTouch = startDeployWorktreeTouch(shadow.shadowPath, opts.processId);
+    deploy.stopTouch = startDeployWorktreeTouch(shadow.shadowPath, opts.processId);
 
     note("deploy stage: eslint gate…");
     const eslintResult = await eslintGate(
@@ -1508,6 +1504,32 @@ export async function runLocalStageDeploy(
       const importGate = await unresolvedImportGate(shadow.shadowPath, tip);
       if (importGate) return importGate;
     }
+    return null;
+  })();
+
+  try {
+    const [claimRes, gatesRes] = await Promise.allSettled([claimP, gatesP]);
+
+    if (claimRes.status === "fulfilled" && claimRes.value.proceed) {
+      heldClaim = claimRes.value.claim;
+      stopHeartbeat = startClaimHeartbeat(
+        markerBucket,
+        heldClaim,
+        () => {
+          claimLost = true;
+          // Unlike the prod path, stage has no `force` option — shouldAbort below is a plain
+          // `claimLost`, so losing the claim always aborts here; the message stays accurate.
+          note("deploy stage: lost soft claim mid-upload — aborting");
+        },
+        { onProgress: note },
+      );
+    }
+    if (claimRes.status === "rejected") throw claimRes.reason;
+    if (!claimRes.value.proceed) return claimRes.value.result;
+    if (gatesRes.status === "rejected") throw gatesRes.reason;
+    if (gatesRes.value) return gatesRes.value;
+
+    const shadow = { shadowPath: deploy.shadowPath as string };
 
     const lost = await confirmClaimBeforeUpload(markerBucket, heldClaim, tip, "stage", false);
     if (lost) return lost;
@@ -1568,9 +1590,9 @@ export async function runLocalStageDeploy(
       sha: tip,
     };
   } finally {
-    stopWorktreeTouch?.();
-    if (deployShadowPath) {
-      releaseWorktreeClaim(deployShadowPath, opts.processId);
+    deploy.stopTouch?.();
+    if (deploy.shadowPath) {
+      releaseWorktreeClaim(deploy.shadowPath, opts.processId);
     }
     stopHeartbeat();
     if (markerBucket && heldClaim) {
