@@ -310,6 +310,15 @@ async function subjectRepeatsRecently(cwd: string, subject: string, n = 10): Pro
   return r.out.split("\n").includes(subject);
 }
 
+async function subjectCountRecently(cwd: string, subject: string, n = 10): Promise<number> {
+  const r = await git(["log", `-${n}`, "--format=%s"], cwd);
+  if (!r.ok) return 0;
+  return r.out.split("\n").filter((l) => l === subject).length;
+}
+
+/** Style commits among the last 10 at which the skip note becomes a real warning. */
+const CODE_STYLE_ESCALATE_AT = 4;
+
 /**
  * Per-repo+branch persisted flag directory for auto-fix loop guards. Deliberately
  * outside the shadow worktree (which can be recreated/reset) and outside the repo
@@ -1627,14 +1636,17 @@ export async function runMaintenance(
     if (fmtTouched.length === 0) {
       step("✓ code style: already clean");
     } else if (await subjectRepeatsRecently(shadowPath, CODE_STYLE_SUBJECT)) {
-      await setAutoFixBlocker(
-        repoPath,
-        branch,
-        "codestyle",
-        `"${CODE_STYLE_SUBJECT}" already in the last 10 commits but the formatter produced a diff again — looks like an oscillation (e.g. a file with real unresolved conflict markers), not forward progress.`,
-      );
+      // Style fixes are low-stakes: skipping a stretch of them costs nothing, so no
+      // durable blocker. Just don't commit again (that's the anti-spam guard) and say
+      // so in one line. Only when most of the recent history is our own style commits
+      // (a likely real oscillation) do we escalate to the long warning.
       await resetShadowDirty(shadowPath);
-      step(`⚠ code style: loop detected — blocked, see ~/.chong/state/ (${branch})`);
+      const n = await subjectCountRecently(shadowPath, CODE_STYLE_SUBJECT);
+      step(
+        n >= CODE_STYLE_ESCALATE_AT
+          ? `⚠ code style: "${CODE_STYLE_SUBJECT}" is ${n} of the last 10 commits and the formatter still produces a diff — likely an oscillation (e.g. a file with real unresolved conflict markers). Not committing; check ${branch}.`
+          : `· code style: skipped (recent "${CODE_STYLE_SUBJECT}" already, avoiding spam)`,
+      );
     } else if ((await unexpectedUntracked(shadowPath, fmtTouched)).length > 0) {
       step("⚠ code style: unexpected untracked file(s) present — not committing");
     } else {
