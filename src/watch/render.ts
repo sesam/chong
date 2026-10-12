@@ -43,6 +43,14 @@ export type UIState = {
    * When set, another watch owns the shared main-shadow worktree — show [o] override.
    */
   worktreeOverride?: string | null;
+  /** `[s]` picker for multi-target repos (see deploy-targets.ts). */
+  targetPicker?: {
+    loading: boolean;
+    items: { name: string; label: string; status: string; auto: boolean }[];
+    sel: number;
+    /** Set after enter: waiting for y/n on the selected item. */
+    confirm: string | null;
+  } | null;
 };
 
 const cols = () => process.stdout.columns || 100;
@@ -354,6 +362,23 @@ export function render(p: Pipeline, ui: UIState): string {
       }
       if (gap.queued.length > 12) out.push(c.dim(`  … and ${gap.queued.length - 12} more`));
     }
+    out.push("");
+  }
+
+  // ── deploy-target picker
+  if (ui.targetPicker) {
+    const tp = ui.targetPicker;
+    out.push(rule("DEPLOY TARGETS  (no staging: a deploy goes live)"));
+    if (tp.loading) out.push(c.dim("  loading…"));
+    tp.items.forEach((it, i) => {
+      const row = `  ${it.name.padEnd(26)} ${it.status}${it.auto ? c.dim("  auto") : ""}`;
+      out.push(i === tp.sel && !tp.confirm ? inverse(row) : row);
+    });
+    out.push(
+      tp.confirm
+        ? c.yellow(`  ${tp.confirm}  [y] deploy  [n] cancel`)
+        : c.dim("  [↑/↓] select  [enter] deploy  [esc] close"),
+    );
     out.push("");
   }
 

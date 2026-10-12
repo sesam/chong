@@ -372,3 +372,43 @@ describe("worktree-claim", () => {
     expect(acquireWorktreeClaim(shadow, other).ok).toBe(true);
   });
 });
+
+describe("deploy-claim key prefix (per-target claims)", () => {
+  const bucket = "test-marker-bucket";
+  const sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+  afterEach(() => {
+    (Bun.spawn as unknown as { mockRestore?: () => void }).mockRestore?.();
+  });
+
+  test("no prefix keeps the root-level key; a prefix scopes the claim", async () => {
+    const store = new Map<string, string>();
+    stubAwsS3(store);
+    const a = await acquireDeployClaim(bucket, sha, "p-root", { waitMs: 0 });
+    const b = await acquireDeployClaim(bucket, sha, "p-agent", {
+      waitMs: 0,
+      prefix: "repo/agent-x/",
+    });
+    expect(a.ok && b.ok).toBe(true);
+    expect([...store.keys()].sort()).toEqual([
+      `s3://${bucket}/deploy-claim.json`,
+      `s3://${bucket}/repo/agent-x/deploy-claim.json`,
+    ]);
+  });
+
+  test("another live claim on the same target defers; other targets are independent", async () => {
+    const store = new Map<string, string>();
+    stubAwsS3(store);
+    const first = await acquireDeployClaim(bucket, sha, "p1", { waitMs: 0, prefix: "r/a/" });
+    expect(first.ok).toBe(true);
+    const second = await acquireDeployClaim(bucket, sha, "p2", { waitMs: 0, prefix: "r/a/" });
+    expect(second.ok).toBe(false);
+    if (!second.ok) expect(second.reason).toBe("held");
+    const other = await acquireDeployClaim(bucket, sha, "p2", { waitMs: 0, prefix: "r/b/" });
+    expect(other.ok).toBe(true);
+    if (first.ok) {
+      await releaseDeployClaim(bucket, first.claim, "r/a/");
+      expect(store.has(`s3://${bucket}/r/a/deploy-claim.json`)).toBe(false);
+    }
+  });
+});

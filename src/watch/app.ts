@@ -4,12 +4,12 @@ import { findAgentBin } from "./agent";
 import {
   AUTO_MAINT_EVERY_COMMITS,
   AUTO_MAINT_EVERY_MS,
+  INJECT_GRACE_MS,
+  type ShadowInfo,
   checkI18n,
   ensureShadow,
-  INJECT_GRACE_MS,
   isAutoFix,
   reconcileLocalMain,
-  type ShadowInfo,
   runFormatFix,
   runI18nFix,
   runLockfileFix,
@@ -18,14 +18,20 @@ import {
   shadowPathFor,
   tryAgentI18nFix,
 } from "./checks";
+import { type DeployClaim, formatClaimHolder, isClaimStale, readDeployClaim } from "./deploy-claim";
 import {
-  formatClaimHolder,
-  isClaimStale,
-  readDeployClaim,
-  type DeployClaim,
-} from "./deploy-claim";
+  type DeployTarget,
+  defaultGateDeps,
+  describeTarget,
+  effectiveTargetCmd,
+  formatStatus,
+  resolveDeployTargets,
+  runTargetDeploy,
+  targetStatus,
+} from "./deploy-targets";
 import { type WatchConfig, computePipeline, enrichCI, gapHotkeys, promote } from "./model";
 import { type UIState, render } from "./render";
+import { detectRepoProfile } from "./repo-profile";
 import {
   defaultProdDeployCmd,
   formatDeployStepSuffix,
@@ -38,17 +44,17 @@ import {
   shortDeployStep,
   stageDeployedShaBucket,
 } from "./stage-deploy";
+import type { Pipeline } from "./types";
 import {
+  WORKTREE_CLAIM_TOUCH_MS,
+  type WorktreeClaim,
   acquireWorktreeClaim,
   formatWorktreeHolder,
   isWorktreeClaimActive,
   readWorktreeClaim,
   releaseWorktreeClaim,
   touchWorktreeClaim,
-  WORKTREE_CLAIM_TOUCH_MS,
-  type WorktreeClaim,
 } from "./worktree-claim";
-import type { Pipeline } from "./types";
 
 const ALT_ON = "\x1b[?1049h\x1b[?25l"; // alt screen + hide cursor
 const ALT_OFF = "\x1b[?25h\x1b[?1049l"; // show cursor + leave alt screen
@@ -153,6 +159,19 @@ export async function runWatch(
   let remoteProdClaim: DeployClaim | null = null;
   /** Seconds to wait before retrying after we lost a soft claim race. */
   const CLAIM_RETRY_SEC = 30;
+  const profile = detectRepoProfile(cfg.repoPath);
+  // Multi-target repos (`<dir>/deploy.sh` discovery + `targets` overrides): `[s]` opens a
+  // picker instead of the stage lane deploy. Loaded async; empty for FRONTEND-shaped repos.
+  let deployTargets: DeployTarget[] = [];
+  let targetDeploying = false;
+  const autoTargetTried = new Set<string>();
+  let autoTargetTip: string | null = null;
+  let autoTargetTipAt = 0;
+  void resolveDeployTargets(cfg.repoPath).then((r) => {
+    deployTargets = r.targets;
+    for (const e of r.errors) addNotice(c.yellow(`⚠ targets: ${e}`));
+    paint();
+  });
   const stageDeployCmd = resolveStageDeployCmd(cfg.repoPath, cfg.stageDeployCmd);
   const localStageDeploy = cfg.autoDeployStage && !!stageDeployCmd;
   // Null when this repo has no way to deploy prod locally. The prod prompt then falls back
@@ -566,7 +585,12 @@ export async function runWatch(
         const res = await runMaintenance(
           repoPath,
           shadow.shadowPath,
-          { format: cfg.formatCmd, test: cfg.testCmd, i18n: cfg.i18nCmd },
+          {
+            format: cfg.formatCmd,
+            test: cfg.testCmd,
+            i18n: cfg.i18nCmd,
+            supports: profile.supports,
+          },
           remote,
           headBranch,
           (msg) => {
@@ -616,7 +640,9 @@ export async function runWatch(
     const headBranch = lanes[0].name;
 
     // i18n mismatch flag
-    const i18n = await checkI18n(repoPath, sha);
+    const i18n = profile.supports.i18n
+      ? await checkI18n(repoPath, sha)
+      : { hasPo: false, hasI18nCode: false, mismatch: false };
     if (i18n.mismatch) {
       addNotice(
         i18n.hasI18nCode
@@ -656,7 +682,9 @@ export async function runWatch(
 
     // i18n auto-fix (paused for 2h after an uncertain agent i18n verdict)
     const i18nPaused = Date.now() < i18nPausedUntil;
-    if (i18nPaused) {
+    if (!profile.supports.i18n) {
+      // not a pnpm/i18n repo: nothing to run
+    } else if (i18nPaused) {
       addNotice(
         c.dim(
           `⏸ ${sha.slice(0, 7)}: i18n auto-fix paused ${Math.ceil((i18nPausedUntil - Date.now()) / 60000)}m`,
@@ -729,7 +757,9 @@ export async function runWatch(
 
     // Lockfile fix: a package.json change without a matching lockfile update breaks
     // CI's --frozen-lockfile install. Regenerate pnpm-lock.yaml and push.
-    const lockFix = await runLockfileFix(repoPath, shadow.shadowPath, sha, remote, headBranch);
+    const lockFix = profile.supports.lockfile
+      ? await runLockfileFix(repoPath, shadow.shadowPath, sha, remote, headBranch)
+      : { committed: false, pushed: false, leftovers: [], error: null };
     if (lockFix.error) {
       addNotice(c.red(`✗ ${sha.slice(0, 7)} lockfile: ${lockFix.error}`));
     } else if (lockFix.committed) {
@@ -869,18 +899,14 @@ export async function runWatch(
       }
     }
     ui.worktreeOverride =
-      !worktreeOwned && foreignWorktreeClaim
-        ? formatWorktreeHolder(foreignWorktreeClaim)
-        : null;
+      !worktreeOwned && foreignWorktreeClaim ? formatWorktreeHolder(foreignWorktreeClaim) : null;
 
     if (remoteProdClaim) {
       // Surface once per claim id so the status line is not spammy every poll.
       const key = `prod-claim:${remoteProdClaim.id}`;
       if (!warnedBlocks.has(key)) {
         warnedBlocks.add(key);
-        addNotice(
-          c.yellow(`⏳ prod deploy in progress by ${formatClaimHolder(remoteProdClaim)}`),
-        );
+        addNotice(c.yellow(`⏳ prod deploy in progress by ${formatClaimHolder(remoteProdClaim)}`));
       }
     }
     syncStageDeployUi();
@@ -1124,7 +1150,12 @@ export async function runWatch(
         const res = await runMaintenance(
           repoPath,
           shadow.shadowPath,
-          { format: cfg.formatCmd, test: cfg.testCmd, i18n: cfg.i18nCmd },
+          {
+            format: cfg.formatCmd,
+            test: cfg.testCmd,
+            i18n: cfg.i18nCmd,
+            supports: profile.supports,
+          },
           remote,
           headBranch,
           (msg) => {
@@ -1169,6 +1200,7 @@ export async function runWatch(
     // Avoid repainting while the maintenance screen is open: it prints copy prompts
     // and constant redraws break terminal mouse selection.
     tickStageDeployCooldown();
+    tickAutoTargets();
     maybeTouchWorktreeClaim();
     if (!ui.maintenance) paint();
   }, 1000); // keep "↻ Ns ago" + stage countdown fresh
@@ -1191,6 +1223,122 @@ export async function runWatch(
     process.stdin.pause();
     write(ALT_OFF);
     resolve();
+  }
+
+  async function openTargetPicker(): Promise<void> {
+    const tip = pipeline?.lanes[0]?.tip;
+    if (!tip) return;
+    ui.targetPicker = {
+      loading: true,
+      sel: 0,
+      confirm: null,
+      items: deployTargets.map((t) => ({
+        name: describeTarget(t),
+        label: t.name,
+        status: c.dim("…"),
+        auto: t.auto === true,
+      })),
+    };
+    paint();
+    const statuses = await Promise.all(
+      deployTargets.map((t) => targetStatus(cfg.repoPath, t, tip)),
+    );
+    if (!ui.targetPicker) return;
+    ui.targetPicker.items = deployTargets.map((t, i) => ({
+      name: describeTarget(t),
+      label: t.name,
+      status: formatStatus(statuses[i]),
+      auto: t.auto === true,
+    }));
+    ui.targetPicker.loading = false;
+    paint();
+  }
+
+  async function deployTarget(t: DeployTarget, reason: string): Promise<void> {
+    const tip = pipeline?.lanes[0]?.tip;
+    const mainBranch = pipeline?.lanes[0]?.name ?? "main";
+    if (!tip || targetDeploying) return;
+    targetDeploying = true;
+    ui.busy = true;
+    let step = "starting";
+    let stepAt = Date.now();
+    const base = `deploying ${t.name} ${tip.slice(0, 7)} (${reason})…`;
+    prodDeployLive = { base, detail: step, stepAt };
+    paint();
+    try {
+      const note = (m: string) => {
+        step = m.replace(`${t.name}: `, "");
+        stepAt = Date.now();
+        if (prodDeployLive) prodDeployLive = { base, detail: step, stepAt };
+        addNotice(c.dim(m));
+        paint();
+      };
+      const res = await runTargetDeploy(cfg.repoPath, cfg.remote, mainBranch, tip, t, {
+        processId,
+        gate: defaultGateDeps(cfg.repoPath, note),
+        onProgress: note,
+      });
+      const ok = res.action === "deployed";
+      ui.status = ok
+        ? c.green(`✓ ${res.message}`)
+        : res.action === "deferred" || res.action === "blocked"
+          ? c.yellow(`⚠ ${res.message}`)
+          : c.red(`✗ ${res.message}`);
+      addNotice(ui.status);
+    } catch (e) {
+      ui.status = c.red(
+        `✗ ${t.name} deploy crashed: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    } finally {
+      prodDeployLive = null;
+      targetDeploying = false;
+      ui.busy = false;
+      paint();
+    }
+  }
+
+  /** `auto: true` targets only: deploy a stale one after origin/main is quiet for the cooldown. */
+  function tickAutoTargets(): void {
+    const tip = pipeline?.lanes[0]?.tip;
+    if (!tip || targetDeploying || !deployTargets.some((t) => t.auto)) return;
+    if (tip !== autoTargetTip) {
+      autoTargetTip = tip;
+      autoTargetTipAt = Date.now();
+      return;
+    }
+    if (Date.now() - autoTargetTipAt < cfg.deployCooldownSec * 1000) return;
+    const t = deployTargets.find((x) => x.auto && !autoTargetTried.has(`${x.name}@${tip}`));
+    if (!t) return;
+    autoTargetTried.add(`${t.name}@${tip}`);
+    const run = async () => {
+      const st = await targetStatus(cfg.repoPath, t, tip);
+      if (st.stale && !st.claim) await deployTarget(t, "auto");
+    };
+    checkQueue = checkQueue.then(run, run);
+  }
+
+  function onTargetPickerKey(s: string): void {
+    const tp = ui.targetPicker;
+    if (!tp) return;
+    if (tp.confirm) {
+      if (s === "y") {
+        const t = deployTargets[tp.sel];
+        ui.targetPicker = null;
+        if (t) checkQueue = checkQueue.then(() => deployTarget(t, "manual"));
+      } else if (s === "n" || s === "\x1b") tp.confirm = null;
+      paint();
+      return;
+    }
+    if (s === "\x1b" || s === "q") ui.targetPicker = null;
+    else if (s === "\x1b[A" || s === "k") tp.sel = Math.max(0, tp.sel - 1);
+    else if (s === "\x1b[B" || s === "j") tp.sel = Math.min(tp.items.length - 1, tp.sel + 1);
+    else if (s === "\r" || s === "\n") {
+      const t = deployTargets[tp.sel];
+      if (t && !tp.loading) {
+        tp.confirm = `Deploy ${describeTarget(t)} @ ${pipeline?.lanes[0]?.tip.slice(0, 7)} to PRODUCTION from this machine (\`${effectiveTargetCmd(cfg.repoPath, t)}\`)?`;
+      }
+    }
+    paint();
   }
 
   function onKey(s: string): void {
@@ -1235,6 +1383,16 @@ export async function runWatch(
     if (pendingWorktreeOverride && !(s === "y" && ui.confirm === null)) {
       pendingWorktreeOverride = null;
       ui.status = "";
+    }
+
+    if (ui.targetPicker) {
+      if (s === "\x03") quit();
+      else onTargetPickerKey(s);
+      return;
+    }
+    if (s === "s" && deployTargets.length > 0) {
+      if (!targetDeploying) void openTargetPicker();
+      return;
     }
 
     const maxGap = pipeline.gaps.length - 1;

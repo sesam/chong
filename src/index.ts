@@ -3,21 +3,31 @@ import { cmdAbandon } from "./commands/abandon";
 import { authLogin } from "./commands/auth";
 import { cmdCheck } from "./commands/check";
 import { cmdCommit } from "./commands/commit";
+import { cmdDeploy } from "./commands/deploy";
 import { cmdHistory } from "./commands/history";
 import { cmdNew } from "./commands/new";
 import { cmdShadowWork } from "./commands/shadow-work";
 import { cmdShow } from "./commands/show";
 import { cmdStatus } from "./commands/status";
 import { cmdUpload } from "./commands/upload";
+import { cmdVerify } from "./commands/verify";
 import { cmdWatch } from "./commands/watch";
 import { c } from "./util";
 
 const HELP = `chong — ship change-lists to the company git backend
 
-  chong commit -m "<msg>" [<path>...] [--rm <a,b>] [--patch <file>]
+  chong commit -m "<msg>" [<path>...] [--rm <a,b>] [--patch <file>] [--no-verify]
                                         atomic commit that bypasses the shared git
                                         index — safe alongside parallel agents in the
                                         same worktree
+  chong verify [<path>] [--phase commit|deploy] [--fix] [--all] [--json]
+                                        run the repo's checks (ruff for Python repos,
+                                        or "checks" in .chong/config.json); exits non-zero
+                                        on failure. Default: changed files only
+  chong deploy <target> [--sha <sha>] [--yes] [--force-gate] | --list
+                                        gated local deploy of one "targets" entry from
+                                        .chong/config.json (checks + CI must pass; never
+                                        automatic unless the target sets auto: true)
   chong new "<title>" [--repo <name>]   create a CL + worktree off latest main
   chong upload                          format, push, squash-merge to main
   chong status                          your open chongs (local + remote)
@@ -78,6 +88,10 @@ async function main(): Promise<void> {
       return await cmdWatch(rest);
     case "shadow-work":
       return await cmdShadowWork(rest);
+    case "deploy":
+      return await cmdDeploy(rest);
+    case "verify":
+      return await cmdVerify(rest);
     case "check":
       return await cmdCheck(rest);
     default:

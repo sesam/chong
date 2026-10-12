@@ -13,19 +13,8 @@ import {
   lintGatePrompt,
   lintResolvePrompt,
 } from "./agent";
-import {
-  type EslintError,
-  formatLintSummary,
-  lintableChangedFiles,
-  runEslint,
-} from "./lint";
 import { filterDepsByReleasePolicy, readDepsPolicy } from "./deps-policy";
 import { fetchDismissedPackageNames, parseGitHubSlug } from "./gh";
-import {
-  acquireWorktreeClaim,
-  formatWorktreeHolder,
-  type WorktreeAcquireResult,
-} from "./worktree-claim";
 import {
   type Untranslated,
   addedLineNumbers,
@@ -34,7 +23,15 @@ import {
   isExcludedPath,
   isScannable,
 } from "./i18n-scan";
+import { type EslintError, formatLintSummary, lintableChangedFiles, runEslint } from "./lint";
 import { repo } from "./repo";
+import { splitArgv } from "./repo-config";
+import { type RepoSupports, detectRepoProfile } from "./repo-profile";
+import {
+  type WorktreeAcquireResult,
+  acquireWorktreeClaim,
+  formatWorktreeHolder,
+} from "./worktree-claim";
 
 type Run = { ok: boolean; out: string; err: string };
 
@@ -415,7 +412,7 @@ export type ShadowClaimOpts = {
  * same `dist/`), which corrupted whichever build was mid-flight. Separate trees keep
  * `reset --hard` + vite output isolated while main-shadow stays free for maintain.
  */
-export type ShadowRole = "main" | "stage-deploy" | "prod-deploy";
+export type ShadowRole = "main" | "stage-deploy" | "prod-deploy" | `target-${string}`;
 
 /**
  * Where chong keeps a repo's shadow worktree: under ~/.chong/worktrees/ rather
@@ -489,7 +486,9 @@ export async function ensureShadow(
       const reg = await git(["worktree", "list", "--porcelain"], repoPath);
       const legacyLinked = reg.out
         .split("\n")
-        .some((l) => l.startsWith("worktree ") && l.slice("worktree ".length).trim() === legacyPath);
+        .some(
+          (l) => l.startsWith("worktree ") && l.slice("worktree ".length).trim() === legacyPath,
+        );
       if (legacyLinked) {
         const dirty = await statusPaths(legacyPath);
         const branchR = await git(["symbolic-ref", "--quiet", "HEAD"], legacyPath);
@@ -497,7 +496,9 @@ export async function ensureShadow(
         if (dirty.length > 0 || !detached) {
           warnings.push(
             `legacy worktree ${legacyPath} left in place — ${
-              dirty.length > 0 ? `${dirty.length} uncommitted change(s)` : `on branch ${branchR.out}`
+              dirty.length > 0
+                ? `${dirty.length} uncommitted change(s)`
+                : `on branch ${branchR.out}`
             }; remove it by hand once you've saved anything you need`,
           );
         } else {
@@ -550,6 +551,21 @@ export async function ensureShadow(
   }
   symlinkSync(nmSource, nmLink);
 
+  // Profile-declared extras (a Python repo's .venv): same idea as node_modules.
+  for (const rel of detectRepoProfile(repoPath).shadowLinks) {
+    const src = path.join(repoPath, rel);
+    const dst = path.join(shadowPath, rel);
+    if (!existsSync(src)) continue;
+    try {
+      const st = lstatSync(dst);
+      if (st.isSymbolicLink()) unlinkSync(dst);
+      else rmSync(dst, { recursive: true, force: true });
+    } catch {
+      /* nothing there yet */
+    }
+    symlinkSync(src, dst);
+  }
+
   return done(null);
 }
 
@@ -580,10 +596,7 @@ async function commitAgeMs(cwd: string, sha: string): Promise<number | null> {
  * not be pushed — otherwise `git cherry` still lists the local SHA as unique
  * and the next poll re-injects forever.
  */
-export function cherryPickPatchPreserved(
-  sourceId: string | null,
-  headId: string | null,
-): boolean {
+export function cherryPickPatchPreserved(sourceId: string | null, headId: string | null): boolean {
   return !!sourceId && !!headId && sourceId === headId;
 }
 
@@ -1034,7 +1047,10 @@ export async function tryAgentLintFix(
 
   const gate = await agentGate(shadowPath, lintGatePrompt(summary));
   if (gate.verdict !== "SAFE") {
-    return { fixed: false, message: `eslint agent ${gate.verdict.toLowerCase()} — promote blocked` };
+    return {
+      fixed: false,
+      message: `eslint agent ${gate.verdict.toLowerCase()} — promote blocked`,
+    };
   }
 
   const edit = await agentEdit(shadowPath, lintResolvePrompt(summary));
@@ -1193,8 +1209,8 @@ export async function runFormatFix(
   const files = await commitFiles(repoPath, sha);
   if (files.length === 0) return { committed: false, pushed: false, leftovers: [], error: null };
 
-  const [cmd, ...cmdArgs] = formatCmd.trim().split(/\s+/);
-  await sh([cmd, ...cmdArgs], shadowPath);
+  if (!formatCmd.trim()) return { committed: false, pushed: false, leftovers: [], error: null };
+  await sh(splitArgv(formatCmd), shadowPath);
   // Ignore exit code — formatters exit 1 when they modify files
 
   const modified = await statusPaths(shadowPath);
@@ -1465,6 +1481,79 @@ export async function tryAgentI18nFix(
 }
 
 /**
+ * Maintenance for repos without pnpm (e.g. a Python/uv repo): format + tests only.
+ * No deps bump, lockfile, i18n or hardcoded-string steps — those are pnpm/Vue specific.
+ */
+async function runGenericMaintenance(
+  repoPath: string,
+  shadowPath: string,
+  cmds: { format: string; test: string },
+  remote: string,
+  branch: string,
+  onStep: ((msg: string) => void) | undefined,
+  mode: "full" | "commits",
+): Promise<MaintResult> {
+  const steps: string[] = [];
+  const prompts: MaintPrompt[] = [];
+  const step = (msg: string) => {
+    steps.push(msg);
+    onStep?.(msg);
+  };
+
+  if (!cmds.format.trim()) {
+    step("· code style: no formatter configured");
+  } else if (await autoFixBlockReason(repoPath, branch, "codestyle")) {
+    step("⏸ code style: blocked — see ~/.chong/state/");
+  } else if ((await headSubject(shadowPath)) === CODE_STYLE_SUBJECT) {
+    step("✓ code style: already clean (last commit was the fix)");
+  } else {
+    onStep?.("format: running formatter…");
+    const before = new Set(await statusPaths(shadowPath));
+    await sh(splitArgv(cmds.format), shadowPath);
+    const touched = (await statusPaths(shadowPath)).filter((f) => !before.has(f));
+    if (touched.length === 0) {
+      step("✓ code style: already clean");
+    } else if (await subjectRepeatsRecently(shadowPath, CODE_STYLE_SUBJECT)) {
+      await resetShadowDirty(shadowPath);
+      step(`· code style: skipped (recent "${CODE_STYLE_SUBJECT}" already, avoiding spam)`);
+    } else if ((await unexpectedUntracked(shadowPath, touched)).length > 0) {
+      step("⚠ code style: unexpected untracked file(s) present — not committing");
+    } else {
+      await git(["add", "--", ...touched], shadowPath);
+      await git(["commit", "-m", CODE_STYLE_SUBJECT, "--no-verify"], shadowPath);
+      const pr = await git(["push", remote, `HEAD:refs/heads/${branch}`], shadowPath);
+      step(
+        pr.ok
+          ? `✓ code style: committed & pushed to ${branch}`
+          : `⚠ code style: committed but push failed (${pr.err})`,
+      );
+    }
+  }
+
+  if (mode === "commits" || !cmds.test.trim()) return { steps, prompts, error: null };
+
+  onStep?.("test: running unit tests…");
+  const test = await sh(splitArgv(cmds.test), shadowPath);
+  if (test.ok) {
+    step("✓ tests: passing");
+  } else {
+    step("⚠ tests: failing — see copy prompt below");
+    prompts.push({
+      title: "fix failing test(s)",
+      text: [
+        "Unit tests fail.",
+        "",
+        "Reproduce:",
+        cmds.test,
+        "",
+        test.out.split("\n").slice(-30).join("\n"),
+      ].join("\n"),
+    });
+  }
+  return { steps, prompts, error: null };
+}
+
+/**
  * Maintenance pass in the main-shadow worktree.
  *   1 / 1b / 2 — commit-producing (deps, lockfile, format); push to origin/<branch>
  *   3–5 — diagnostics (tests, i18n, hardcoded scan); skipped when mode=`commits`
@@ -1475,13 +1564,16 @@ export async function tryAgentI18nFix(
 export async function runMaintenance(
   repoPath: string,
   shadowPath: string,
-  cmds: { format: string; test: string; i18n: string },
+  cmds: { format: string; test: string; i18n: string; supports?: RepoSupports },
   remote: string,
   branch: string,
   onStep?: (msg: string) => void,
   opts: MaintOpts = {},
 ): Promise<MaintResult> {
   const mode = opts.mode ?? "full";
+  if (cmds.supports && !cmds.supports.depsBump) {
+    return runGenericMaintenance(repoPath, shadowPath, cmds, remote, branch, onStep, mode);
+  }
   const agentI18n = opts.agentI18n !== false && !!findAgentBin();
   const steps: string[] = [];
   const prompts: MaintPrompt[] = [];
@@ -1557,9 +1649,7 @@ export async function runMaintenance(
         .slice(0, 3)
         .map((s) => `${s.target} (${s.reason})`)
         .join("; ");
-      step(
-        `⚠ deps: skipped ${skipped.length} update(s)${preview ? ` — ${preview}` : ""}`,
-      );
+      step(`⚠ deps: skipped ${skipped.length} update(s)${preview ? ` — ${preview}` : ""}`);
     }
     const dirty = await statusPaths(shadowPath);
     if (updated.length > 0 && dirty.length > 0) {

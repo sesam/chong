@@ -15,34 +15,40 @@
  * `reset --hard` / `dist/` write stomping the other. Maintain/inject keep using
  * main-shadow on `checkQueue`.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { c } from "../util";
+import { type ShadowRole, ensureShadow, runEslintFix, tryAgentLintFix } from "./checks";
 import {
-  ensureShadow,
-  runEslintFix,
-  tryAgentLintFix,
-  type ShadowRole,
-} from "./checks";
-import {
-  acquireDeployClaim,
   CLAIM_HEARTBEAT_MS,
+  type DeployClaim,
+  acquireDeployClaim,
   formatClaimHolder,
   heartbeatDeployClaim,
   readDeployClaim,
   releaseDeployClaim,
   writeS3ShaMarkerVerified,
-  type DeployClaim,
 } from "./deploy-claim";
 import { appendDeployHistory, deployHistoryPath } from "./deploy-history";
 import { formatLintSummary, isAgentableLintFailure, lintableChangedFiles, runEslint } from "./lint";
 import { repo } from "./repo";
+import type { RepoCheck } from "./repo-config";
 import { formatUnresolvedSummary, scanUnresolvedImports } from "./unresolved-imports";
 import {
+  WORKTREE_CLAIM_TOUCH_MS,
   releaseWorktreeClaim,
   touchWorktreeClaim,
-  WORKTREE_CLAIM_TOUCH_MS,
 } from "./worktree-claim";
 
 export const DEPLOYED_SHA_KEY = "deployed-git-sha.txt";
@@ -114,9 +120,7 @@ export function formatDeployStepSuffix(
   if (!detail && stepStartedAt == null) return "";
   const secs = stepStartedAt != null ? Math.max(0, Math.floor((now - stepStartedAt) / 1000)) : 0;
   const spin = DEPLOY_SPINNER[secs % DEPLOY_SPINNER.length] ?? "⠋";
-  const stepIdx = detail
-    ? (STAGE_DEPLOY_STEPS as readonly string[]).indexOf(detail)
-    : -1;
+  const stepIdx = detail ? (STAGE_DEPLOY_STEPS as readonly string[]).indexOf(detail) : -1;
   const counter = stepIdx >= 0 ? `${stepIdx + 1}/${STAGE_DEPLOY_STEPS.length} ` : "";
   if (detail) return ` [${spin} ${counter}${detail}, ${secs}s]`;
   return ` [${spin} ${secs}s]`;
@@ -223,6 +227,46 @@ export type RepoDeployConfig = {
   prodDeployedShaBucket?: string;
   /** Local prod deploy command; overrides detection. Omit to disable local prod deploys. */
   prodDeployCmd?: string;
+  /**
+   * Independently deployable units of a multi-project repo (see `deploy-targets.ts`).
+   * Raw, unvalidated JSON here — `resolveDeployTargets` is the only reader.
+   */
+  targets?: DeployTarget[];
+  /** Repo-relative paths whose change makes EVERY discovered target stale. */
+  sharedPaths?: string[];
+  /** Dir names/targets that must not be auto-discovered from `<dir>/deploy.sh`. */
+  ignoreTargets?: string[];
+  /** S3 bucket for per-target deployed-SHA markers + soft claims (multi-target repos). */
+  targetMarkerBucket?: string;
+  /** Key prefix inside `targetMarkerBucket`; default `<repoDirName>/`. */
+  targetMarkerPrefix?: string;
+  /** Pre-commit / pre-deploy checks; overrides profile detection. See ./repo-config. */
+  checks?: RepoCheck[];
+};
+
+/** One deployable unit of a multi-target repo. Validated by `resolveDeployTargets`. */
+export type DeployTarget = {
+  /** `^[a-z0-9][a-z0-9_-]*$`; the only value ever used in a per-target path. */
+  name: string;
+  /**
+   * Override of the command run via `bash -c` in a clean shadow worktree at the deployed
+   * SHA. Omit to use the discovered `deploy.sh` (see `effectiveTargetCmd`).
+   */
+  cmd?: string;
+  /** Repo-relative dir that owns the `deploy.sh` (set by discovery, never read from config). */
+  dir?: string;
+  /** Repo-relative prefixes; a change under one makes the target stale. Omit = any change. */
+  paths?: string[];
+  /** Repo-relative env file PARSED by chong (never sourced) and merged over process.env. */
+  envFile?: string;
+  /** Only `true` opts in to the cooldown auto-deploy. Default false. */
+  auto?: boolean;
+  /** Shown in the confirm prompt, e.g. "production". */
+  label?: string;
+  /** Check names that must pass before deploying. Default: every deploy-phase check. */
+  requires?: string[];
+  /** Post-deploy smoke command; the deployed-SHA record is written only if it passes. */
+  verifyCmd?: string;
 };
 
 /** Where a live deploy tip came from — S3 wins when the marker exists. */
@@ -311,9 +355,9 @@ function isValidMarkerBucketName(name: string): boolean {
  * {@link rejectUnsafeConfiguredCmd}'s startup refusal), and reads as "no bucket configured"
  * rather than being used anyway.
  */
-function validateMarkerBucketName(
+export function validateMarkerBucketName(
   repoPath: string,
-  key: "stageDeployedShaBucket" | "prodDeployedShaBucket",
+  key: "stageDeployedShaBucket" | "prodDeployedShaBucket" | "targetMarkerBucket",
   raw: string,
 ): string | null {
   const name = raw.trim();
@@ -366,7 +410,7 @@ export function prodDeployedShaBucket(repoPath: string): string | null {
  * `"CI=true FORCE=1 DEPLOY_SKIP_INSTALL=1 ./scripts/deploy-frontend.sh ci"` must keep
  * working, and it is chong's own trusted string, not repo-supplied.
  */
-const FORBIDDEN_CMD_CHARS = /[;|&$`()<>\n\r]/;
+export const FORBIDDEN_CMD_CHARS = /[;|&$`()<>\n\r]/;
 
 function describeForbiddenChar(ch: string): string {
   if (ch === "\n") return "\\n (newline)";
@@ -702,8 +746,7 @@ async function claimOrDefer(
 
   if (acquired.reason === "verify") {
     const detail =
-      acquired.error ||
-      `claim verify failed (expected ${acquired.expected.id.slice(0, 8)}…)`;
+      acquired.error || `claim verify failed (expected ${acquired.expected.id.slice(0, 8)}…)`;
     return {
       proceed: false,
       result: { action: "error", message: detail, sha },
@@ -881,7 +924,7 @@ export function liveTipCoversSha(
 /** Grace period between SIGTERM and SIGKILL when an abort has to reach a process group. */
 const ABORT_KILL_GRACE_MS = 5_000;
 
-async function runDeployCommand(
+export async function runDeployCommand(
   shadowPath: string,
   cmd: string,
   historyFile?: string,
@@ -1201,6 +1244,29 @@ function startDeployWorktreeTouch(shadowPath: string, processId: string): () => 
   return () => clearInterval(id);
 }
 
+/**
+ * Symlink the source repo's `.venv` into a shadow, like `node_modules` — a Python repo has
+ * no install step to repeat, and the deploy scripts expect the pinned interpreter there.
+ * No-op when the source has no `.venv`.
+ */
+export function linkVenv(repoPath: string, shadowPath: string): void {
+  const src = path.join(repoPath, ".venv");
+  if (!existsSync(src)) return;
+  const link = path.join(shadowPath, ".venv");
+  try {
+    const st = lstatSync(link);
+    if (st.isSymbolicLink()) unlinkSync(link);
+    else rmSync(link, { recursive: true, force: true });
+  } catch {
+    /* nothing there yet */
+  }
+  try {
+    symlinkSync(src, link);
+  } catch {
+    /* best effort — the deploy script reports a missing interpreter itself */
+  }
+}
+
 /** Reset a per-target deploy shadow to `sha` and give the deploy the same .env a manual run sees. */
 async function prepareShadow(
   repoPath: string,
@@ -1221,6 +1287,8 @@ async function prepareShadow(
       shadowPath: shadow.shadowPath,
     };
   }
+
+  linkVenv(repoPath, shadow.shadowPath);
 
   // Only `.env` — deliberately NOT `.env.local`. Vite loads .env.local after .env and it
   // wins, so copying it would let a developer's localhost values into a real deploy.
@@ -1355,7 +1423,9 @@ export async function runLocalProdDeploy(
 
     const refErr = await repo.setLocalBranch(repoPath, prodBranch, sha);
     if (refErr) {
-      note(`deploy prod: live, but local ${prodBranch} ref update failed (${refErr.slice(0, 120)})`);
+      note(
+        `deploy prod: live, but local ${prodBranch} ref update failed (${refErr.slice(0, 120)})`,
+      );
     }
 
     // Permanent record of this release. Local `prod` tracks what is live but is

@@ -122,6 +122,103 @@ Dep bumps respect **`minimumReleaseAge`** from the watched repo's `pnpm-workspac
 
 Steps 1–2 commit with a `CLEAN:`/`FIX:` prefix and push so `origin/main` never goes stale mid-maintain. Those commits are skipped by the post-commit checks. The prompts are printed flush-left and color-free so they paste cleanly. Press `[esc]` to return to the pipeline, `[m]` to re-run.
 
+### Repo checks & profiles (`chong verify`, `chong commit`)
+
+chong detects what kind of repo it is watching and adapts:
+
+| Detected by | Profile | Format cmd | Pnpm-only steps (i18n, lockfile, deps bump, eslint, import scan) |
+|---|---|---|---|
+| `package.json` | `node` | `pnpm format` | on (today's behaviour, unchanged) |
+| `pyproject.toml` / `uv.lock`, no `package.json` | `python` | `uv run --no-sync ruff format --force-exclude` (when ruff is configured) | off; maintenance = format + `pytest -m "not integration"` |
+| neither | `generic` | none | off |
+
+Python shadow worktrees get the source repo's `.venv` symlinked in (like `node_modules`).
+
+**Checks** come from `checks` in `<repo>/.chong/config.json` (wins over detection) or, for Python repos with ruff, from detection (`ruff check` + `ruff format --check`, both with `--force-exclude` so `extend-exclude` holds for named files):
+
+```json
+{ "checks": [
+  { "name": "ruff-lint", "cmd": "uv run ruff check --force-exclude", "fixCmd": "uv run ruff check --fix --force-exclude",
+    "scope": "files", "match": ["**/*.py"], "phases": ["commit"] },
+  { "name": "preflight", "cmd": "uv run python scripts/verify_deploy_targets.py", "phases": ["deploy"] }
+] }
+```
+
+- `scope: "files"` appends the changed/committed paths matching `match` (`**`, `*`, `?` globs; a pattern without `/` matches the basename anywhere) and skips the check when none match. In whole-repo mode it appends `.`. `scope: "repo"` (default) runs as-is.
+- `phases` defaults to both `commit` and `deploy`. Commands run without a shell, are split on whitespace (quotes honoured), and are rejected if they contain a shell metacharacter (same rule as deploy commands).
+
+`chong verify [<path>] [--phase commit|deploy] [--fix] [--all] [--json]` runs them: changed files by default, whole repo with `--all` or `--phase deploy`, `--fix` runs each `fixCmd` first. Exit code is non-zero on any failure.
+
+`chong commit` runs the commit-phase checks on just the paths being committed and refuses (nothing committed) on failure; `--no-verify` bypasses. A repo with no applicable checks (e.g. FRONTEND) is unaffected.
+
+### Multi-target repos (`targets`, `chong deploy`)
+
+For a repo with several independently deployable folders (lynxcraft-agents: Agent Engine
+agents, `render-api`, `calendar-fn`) there is **one convention**: every deployable
+directory owns a `deploy.sh`. chong discovers tracked `<dir>/deploy.sh` files (depth ≤ 2);
+the target name is the path with `/` → `-` (`agents/opn_agent/deploy.sh` → `agents-opn_agent`).
+It runs `bash deploy.sh` with cwd = that directory and `CHONG_TARGET`, `CHONG_SHA`,
+`CHONG_REPO_ROOT` set — in a clean shadow worktree at the deployed SHA. In a uv Python repo
+(`pyproject.toml` + `uv.lock`) the command is `uv run --frozen --no-sync bash deploy.sh`, so
+the project `.venv` leads `PATH` the way `pnpm` does for FRONTEND (`--no-sync`: the shadow's
+`.venv` is a symlink to the shared one and a deploy must not change it). The effective
+command is shown in the confirm prompt and in `chong deploy --list`.
+
+`.chong/config.json` is only needed for overrides (all optional; `targets` may also be an
+object keyed by target name instead of an array):
+
+```json
+{
+  "targetMarkerBucket": "my-markers-bucket",
+  "targetMarkerPrefix": "lynxcraft-agents/",
+  "sharedPaths": ["constants.py", "tools/", "pyproject.toml", "uv.lock"],
+  "ignoreTargets": ["render-api-adk-upscale-agent"],
+  "targets": [
+    {
+      "name": "agents-opn_agent",
+      "label": "production",
+      "paths": ["agents/opn_agent", "agents/shared"],
+      "envFile": ".env",
+      "requires": ["ruff-lint-all", "ruff-format-all"],
+      "verifyCmd": "bash smoke.sh",
+      "auto": false
+    },
+    { "name": "scripts-job", "cmd": "bash scripts/job-deploy.sh" }
+  ]
+}
+```
+
+- **Staleness**: a target is stale when `git diff --name-only <deployed>..<tip> -- <paths>`
+  is non-empty (never deployed ⇒ stale). Default paths: the target's own dir plus
+  `sharedPaths`; an override's `paths` replaces the dir part, `sharedPaths` always apply.
+- **No auto-deploy by default.** There is no staging copy of an agent, so a local deploy is a
+  production change, and an Agent Engine `update` *replaces* the live container env with
+  whatever the deploying machine holds. Only `auto: true` opts a target into the cooldown
+  deploy (`--deploy-cooldown`, default 60s of quiet on `origin/main`). In `chong watch`, `[s]`
+  opens a picker (↑/↓, enter, then `y`) instead of the stage lane deploy.
+- **Gate** before every deploy: the deploy-phase repo checks (see *Repo checks*; `requires`
+  narrows them by name) must pass in the shadow, and the `ci.yml` verdict for the SHA must
+  not be red (`gh run list --workflow ci.yml --commit <sha>`, same semantics as
+  `scripts/ci_result_for_sha.sh`; no run ⇒ rely on local checks). Only commits already on
+  `origin/main` deploy. The sole bypass is the CLI flag `--force-gate` (never config).
+- **`envFile`** (repo-relative, read from the *source* repo, git-ignored) is **parsed**
+  (`KEY=VALUE`, `export`, quotes, comments) and merged over `process.env` for the deploy
+  only. It is never `source`d, and its values are redacted from error output.
+- **Remote bookkeeping** (who deploys what): with `targetMarkerBucket` set (validated like the
+  stage/prod marker buckets), each target gets `<prefix><target>/deployed-git-sha.txt` and a
+  soft claim `<prefix><target>/deploy-claim.json` (same acquire / heartbeat / release code as
+  stage/prod; prefix default `<repoDirName>/`). A live claim held by someone else refuses the
+  deploy and shows as `user@host (sha)` in the picker and `--list`. Without a bucket the
+  local `.chong/deployed/<name>` record is the only state. The SHA is recorded only after
+  the command (and `verifyCmd`, if any) succeeds.
+- `cmd` / `verifyCmd` are checked for shell metacharacters like `stageDeployCmd`; an entry
+  with `cmd` and no `deploy.sh` is the escape hatch.
+
+```
+chong deploy --list                         # status (fresh/stale, deployed sha + source, claim) + command
+chong deploy <target> [--sha <sha>] [--yes] [--force-gate]
+```
+
 ### `chong shadow-work [<path>] [options]`
 
 Manually trigger the same i18n + format checks against the latest origin/main commit — useful for debugging or re-running after a failure.

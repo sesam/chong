@@ -128,14 +128,22 @@ export function formatClaimHolder(claim: DeployClaim): string {
   return `${claim.user}${where} (${short})`;
 }
 
-export async function readDeployClaim(bucket: string): Promise<DeployClaim | null> {
-  const raw = await readS3Text(bucket, DEPLOY_CLAIM_KEY);
+/**
+ * `prefix` scopes the claim per deploy target in a multi-target repo
+ * (`<prefix>deploy-claim.json`). Empty = the original root-level key, byte-identical.
+ */
+export async function readDeployClaim(bucket: string, prefix = ""): Promise<DeployClaim | null> {
+  const raw = await readS3Text(bucket, `${prefix}${DEPLOY_CLAIM_KEY}`);
   if (raw === null) return null;
   return parseDeployClaim(raw);
 }
 
-export async function writeDeployClaim(bucket: string, claim: DeployClaim): Promise<string | null> {
-  return writeS3Text(bucket, DEPLOY_CLAIM_KEY, formatDeployClaim(claim));
+export async function writeDeployClaim(
+  bucket: string,
+  claim: DeployClaim,
+  prefix = "",
+): Promise<string | null> {
+  return writeS3Text(bucket, `${prefix}${DEPLOY_CLAIM_KEY}`, formatDeployClaim(claim));
 }
 
 /**
@@ -147,10 +155,11 @@ export async function writeDeployClaim(bucket: string, claim: DeployClaim): Prom
 export async function releaseDeployClaim(
   bucket: string,
   ours: DeployClaim,
+  prefix = "",
 ): Promise<string | null> {
-  const current = await readDeployClaim(bucket);
+  const current = await readDeployClaim(bucket, prefix);
   if (!current || current.id !== ours.id) return null;
-  return deleteS3Object(bucket, DEPLOY_CLAIM_KEY);
+  return deleteS3Object(bucket, `${prefix}${DEPLOY_CLAIM_KEY}`);
 }
 
 /**
@@ -171,11 +180,12 @@ async function readDeployClaimRetrying(
   bucket: string,
   retries: number,
   delayMs: number,
+  prefix = "",
 ): Promise<DeployClaim | null> {
-  let got = await readDeployClaim(bucket);
+  let got = await readDeployClaim(bucket, prefix);
   for (let attempt = 0; got === null && attempt < retries; attempt++) {
     await sleep(delayMs);
-    got = await readDeployClaim(bucket);
+    got = await readDeployClaim(bucket, prefix);
   }
   return got;
 }
@@ -183,11 +193,15 @@ async function readDeployClaimRetrying(
 /**
  * Rewrite `at` for a claim we still own. Returns false if someone else took it.
  */
-export async function heartbeatDeployClaim(bucket: string, ours: DeployClaim): Promise<boolean> {
-  const current = await readDeployClaim(bucket);
+export async function heartbeatDeployClaim(
+  bucket: string,
+  ours: DeployClaim,
+  prefix = "",
+): Promise<boolean> {
+  const current = await readDeployClaim(bucket, prefix);
   if (!current || current.id !== ours.id) return false;
   const next: DeployClaim = { ...ours, at: new Date().toISOString() };
-  const err = await writeDeployClaim(bucket, next);
+  const err = await writeDeployClaim(bucket, next, prefix);
   if (err) return false;
   ours.at = next.at;
   return true;
@@ -205,6 +219,8 @@ export async function acquireDeployClaim(
   processId: string,
   opts: {
     force?: boolean;
+    /** Key prefix for a per-target claim (see {@link readDeployClaim}). Default: none. */
+    prefix?: string;
     waitMs?: number;
     onProgress?: (msg: string) => void;
     /** Test hook: override the read-back retry count (default {@link VERIFY_READBACK_RETRIES}). */
@@ -219,14 +235,15 @@ export async function acquireDeployClaim(
   const verifyRetries = opts.verifyRetries ?? VERIFY_READBACK_RETRIES;
   const verifyRetryDelayMs = opts.verifyRetryDelayMs ?? VERIFY_READBACK_RETRY_DELAY_MS;
 
-  const existing = await readDeployClaim(bucket);
+  const prefix = opts.prefix ?? "";
+  const existing = await readDeployClaim(bucket, prefix);
   if (existing && !isClaimStale(existing) && existing.id !== processId && !force) {
     return { ok: false, reason: "held", claim: existing };
   }
 
   const claim = makeDeployClaim(sha, processId);
   note(`deploy claim: writing as ${formatClaimHolder(claim)}…`);
-  const writeErr = await writeDeployClaim(bucket, claim);
+  const writeErr = await writeDeployClaim(bucket, claim, prefix);
   if (writeErr) return { ok: false, reason: "write", error: writeErr };
 
   if (waitMs > 0) {
@@ -234,7 +251,7 @@ export async function acquireDeployClaim(
     await sleep(waitMs);
   }
 
-  const got = await readDeployClaimRetrying(bucket, verifyRetries, verifyRetryDelayMs);
+  const got = await readDeployClaimRetrying(bucket, verifyRetries, verifyRetryDelayMs, prefix);
   if (got && got.id === claim.id) {
     return { ok: true, claim };
   }
@@ -242,7 +259,7 @@ export async function acquireDeployClaim(
   if (force) {
     note(`deploy claim: FORCE — overwriting ${got ? formatClaimHolder(got) : "(empty)"}`);
     const forced = makeDeployClaim(sha, processId);
-    const forceErr = await writeDeployClaim(bucket, forced);
+    const forceErr = await writeDeployClaim(bucket, forced, prefix);
     if (forceErr) return { ok: false, reason: "write", error: forceErr };
 
     if (waitMs > 0) {
@@ -250,7 +267,12 @@ export async function acquireDeployClaim(
       await sleep(waitMs);
     }
 
-    const gotAfterForce = await readDeployClaimRetrying(bucket, verifyRetries, verifyRetryDelayMs);
+    const gotAfterForce = await readDeployClaimRetrying(
+      bucket,
+      verifyRetries,
+      verifyRetryDelayMs,
+      prefix,
+    );
     if (gotAfterForce && gotAfterForce.id === forced.id) {
       return { ok: true, claim: forced, forced: true };
     }
@@ -260,7 +282,7 @@ export async function acquireDeployClaim(
       // after retrying. Don't abandon a live claim in the bucket — release the one we
       // just wrote so the next watch to look doesn't see a foreign claim with nobody
       // around to clear it.
-      await releaseDeployClaim(bucket, forced);
+      await releaseDeployClaim(bucket, forced, prefix);
     }
 
     return {
@@ -282,7 +304,7 @@ export async function acquireDeployClaim(
     // Same reasoning as the force branch above: our own write succeeded, the read-back
     // just can't confirm it, so don't leave that claim behind for someone else to trip
     // over as a phantom "held by <us>".
-    await releaseDeployClaim(bucket, claim);
+    await releaseDeployClaim(bucket, claim, prefix);
   }
 
   return {
@@ -333,7 +355,11 @@ export async function writeS3ShaMarkerVerified(
   return writeS3TextVerified(bucket, key, `${sha.toLowerCase()}\n`);
 }
 
-async function writeS3Text(bucket: string, key: string, value: string): Promise<string | null> {
+export async function writeS3Text(
+  bucket: string,
+  key: string,
+  value: string,
+): Promise<string | null> {
   const uri = `s3://${bucket}/${key}`;
   const body = value.endsWith("\n") || value === "" ? value : `${value}\n`;
   const proc = Bun.spawn(
@@ -373,7 +399,7 @@ async function deleteS3Object(bucket: string, key: string): Promise<string | nul
   return code === 0 ? null : err.trim() || `aws s3 rm failed (${code})`;
 }
 
-async function readS3Text(bucket: string, key: string): Promise<string | null> {
+export async function readS3Text(bucket: string, key: string): Promise<string | null> {
   const uri = `s3://${bucket}/${key}`;
   const proc = Bun.spawn(["aws", "s3", "cp", uri, "-", "--quiet"], {
     stdout: "pipe",

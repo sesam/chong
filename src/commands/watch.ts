@@ -2,6 +2,7 @@ import { c, parseArgs } from "../util";
 import { runWatch } from "../watch/app";
 import type { WatchConfig } from "../watch/model";
 import { repo } from "../watch/repo";
+import { detectRepoProfile } from "../watch/repo-profile";
 import {
   DEFAULT_DEPLOY_COOLDOWN_SEC,
   ensureChongIgnored,
@@ -35,12 +36,16 @@ export async function cmdWatch(argv: string[]): Promise<void> {
     throw new Error("need at least 2 branches to form a pipeline (e.g. --branches main,prod)");
   }
 
-  const formatCmd = typeof flags["format-cmd"] === "string" ? flags["format-cmd"] : "pnpm format";
-  const testCmd = typeof flags["test-cmd"] === "string" ? flags["test-cmd"] : "pnpm test";
+  // Node repos keep the pnpm defaults; Python/other repos get what detectRepoProfile finds
+  // (e.g. ruff) and have the pnpm-only steps (i18n, lockfile, deps, eslint, import scan) off.
+  const profile = detectRepoProfile(repoPath);
+  const formatCmd =
+    typeof flags["format-cmd"] === "string" ? flags["format-cmd"] : profile.formatCmd;
+  const testCmd = typeof flags["test-cmd"] === "string" ? flags["test-cmd"] : profile.testCmd;
   const i18nCmd = typeof flags["i18n-cmd"] === "string" ? flags["i18n-cmd"] : "pnpm i18n";
-  const i18nScan = flags["no-i18n-scan"] !== true;
+  const i18nScan = flags["no-i18n-scan"] !== true && profile.supports.i18n;
   const agent = flags["no-agent"] !== true;
-  const importScan = flags["no-import-scan"] !== true;
+  const importScan = flags["no-import-scan"] !== true && profile.supports.importScan;
   const autoMaintain = flags["no-auto-maintain"] !== true;
   // Master switch for reconcileLocalMain's auto-push (fast-forward + diverged
   // cherry-pick paths) — see the doc comment on ReconcileOpts.autoInject in checks.ts.
