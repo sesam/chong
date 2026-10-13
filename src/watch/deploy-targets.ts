@@ -314,6 +314,23 @@ export function readTargetEnv(
   }
 }
 
+/**
+ * Keep the full (already redacted) output of a failed deploy under ~/.chong/logs. The
+ * status line only has room for the last few lines, which is rarely where a traceback's
+ * cause is. Best effort: a log that cannot be written must not mask the deploy failure.
+ */
+function writeDeployLog(target: string, sha: string, text: string): string | null {
+  try {
+    const dir = path.join(homedir(), ".chong", "logs");
+    mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `deploy-${target}-${sha.slice(0, 7)}.log`);
+    writeFileSync(file, `${text}\n`, { mode: 0o600 });
+    return file;
+  } catch {
+    return null;
+  }
+}
+
 /** Remove every env-file value from text bound for the terminal. */
 export function redactValues(text: string, env: Record<string, string>): string {
   let out = text;
@@ -693,8 +710,11 @@ export async function runTargetDeploy(
       return { action: "deferred", message: `${target.name}: aborted — deploy claim stolen`, sha };
     }
     if (!run.ok) {
-      const tail = redactValues(run.output, envRes.env).split("\n").slice(-4).join(" | ");
-      return { action: "error", message: `deploy failed: ${tail || "non-zero exit"}`, sha };
+      const redacted = redactValues(run.output, envRes.env);
+      const tail = redacted.split("\n").slice(-4).join(" | ");
+      const logPath = writeDeployLog(target.name, sha, redacted);
+      const where = logPath ? ` (full log: ${logPath})` : "";
+      return { action: "error", message: `deploy failed${where}: ${tail || "non-zero exit"}`, sha };
     }
     if (target.verifyCmd) {
       note(`${target.name}: verifying…`);
