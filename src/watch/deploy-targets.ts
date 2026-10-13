@@ -515,7 +515,10 @@ export function defaultGateDeps(repoPath: string, onProgress?: (m: string) => vo
       let checks = checksForPhase(detectRepoProfile(shadowPath).checks, "deploy");
       if (target.requires) checks = checks.filter((ck) => target.requires?.includes(ck.name));
       if (checks.length === 0) return null;
-      const results = await runChecks(shadowPath, checks, { phase: "deploy" });
+      const results = await runChecks(shadowPath, checks, {
+        phase: "deploy",
+        env: { CHONG_TARGET: target.name },
+      });
       const failed = results.filter((r) => r.status === "fail");
       return {
         ok: !anyFailed(results),

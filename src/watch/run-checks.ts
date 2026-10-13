@@ -17,13 +17,24 @@ export type RunChecksOpts = {
   phase: RepoCheckPhase;
   /** Run `fixCmd` first, then (re-)check. */
   fix?: boolean;
+  /** Extra environment for the check commands (e.g. CHONG_TARGET for a deploy gate). */
+  env?: Record<string, string>;
 };
 
 const TAIL_LINES = 40;
 
-async function run(argv: string[], cwd: string): Promise<{ ok: boolean; text: string }> {
+async function run(
+  argv: string[],
+  cwd: string,
+  env?: Record<string, string>,
+): Promise<{ ok: boolean; text: string }> {
   try {
-    const proc = Bun.spawn(argv, { cwd, stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn(argv, {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      ...(env ? { env: { ...process.env, ...env } } : {}),
+    });
     const [out, err, code] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
@@ -58,10 +69,10 @@ export async function runChecks(
     const argv = [...splitArgv(ck.cmd), ...extra];
     let fixed = false;
     if (opts.fix && ck.fixCmd) {
-      await run([...splitArgv(ck.fixCmd), ...extra], cwd);
+      await run([...splitArgv(ck.fixCmd), ...extra], cwd, opts.env);
       fixed = true;
     }
-    const r = await run(argv, cwd);
+    const r = await run(argv, cwd, opts.env);
     results.push({
       name: ck.name,
       status: r.ok ? "pass" : "fail",
