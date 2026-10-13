@@ -363,7 +363,8 @@ function scanJs(src: string, baseLine: number): Cand[] {
       const wrapped = TRANS_CALL.test(buf);
       // A `case '…'` label, `=== '…'` comparison, or `obj['…']` member access is a
       // lookup key, not display copy.
-      const keyish = KEY_POSITION.test(buf) || LOOKUP_KEY_POSITION.test(buf) || isBracketAccess(buf);
+      const keyish =
+        KEY_POSITION.test(buf) || LOOKUP_KEY_POSITION.test(buf) || isBracketAccess(buf);
       const precededByPlus = /\+\s*$/.test(buf);
       let value = "";
       let escape = false;

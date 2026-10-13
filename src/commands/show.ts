@@ -9,7 +9,9 @@ export async function cmdShow(argv: string[]): Promise<void> {
   const repo = (flags.repo as string | undefined) ?? (await defaultRepo());
   if (!repo) {
     console.error(
-      c.red("✗ could not determine repo — pass --repo or add .chong/config.json with { \"repo\": \"...\" }"),
+      c.red(
+        '✗ could not determine repo — pass --repo or add .chong/config.json with { "repo": "..." }',
+      ),
     );
     process.exit(1);
   }
@@ -24,7 +26,9 @@ export async function cmdShow(argv: string[]): Promise<void> {
   }
 
   if (!sha) {
-    console.error(c.red("usage: chong show <sha> [--repo <name>]   |   chong show --latest [--repo <name>]"));
+    console.error(
+      c.red("usage: chong show <sha> [--repo <name>]   |   chong show --latest [--repo <name>]"),
+    );
     process.exit(1);
   }
 

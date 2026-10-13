@@ -1,11 +1,19 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
-import { lstatSync, mkdtempSync, readFileSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   WORKTREE_CLAIM_STALE_MS,
   WORKTREE_CLAIM_TOUCH_MS,
+  type WorktreeClaim,
   acquireWorktreeClaim,
   formatWorktreeHolder,
   isWorktreeClaimActive,
@@ -14,7 +22,6 @@ import {
   touchWorktreeClaim,
   worktreeOwnerPath,
   writeWorktreeClaim,
-  type WorktreeClaim,
 } from "./worktree-claim";
 
 function freshShadow(): string {

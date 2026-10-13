@@ -20,30 +20,24 @@ export type Worktree = { path: string; branch: string };
 export const git = {
   fetch: (remote = "origin") => run(["git", "fetch", remote]),
 
-  currentBranch: (cwd?: string) =>
-    run(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd }),
+  currentBranch: (cwd?: string) => run(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd }),
 
-  headSha: (cwd?: string) =>
-    run(["git", "rev-parse", "HEAD"], { cwd }),
+  headSha: (cwd?: string) => run(["git", "rev-parse", "HEAD"], { cwd }),
 
-  topLevel: (cwd?: string) =>
-    run(["git", "rev-parse", "--show-toplevel"], { cwd }),
+  topLevel: (cwd?: string) => run(["git", "rev-parse", "--show-toplevel"], { cwd }),
 
-  remoteUrl: (remote = "origin") =>
-    run(["git", "remote", "get-url", remote]),
+  remoteUrl: (remote = "origin") => run(["git", "remote", "get-url", remote]),
 
   push: (remote: string, branch: string, cwd?: string) =>
     run(["git", "push", "--set-upstream", remote, branch], { cwd }),
 
-  mergeBase: (a: string, b: string, cwd?: string) =>
-    run(["git", "merge-base", a, b], { cwd }),
+  mergeBase: (a: string, b: string, cwd?: string) => run(["git", "merge-base", a, b], { cwd }),
 
   /** Files changed (added/modified/renamed) between `base` and HEAD. Excludes deletions. */
   diffNames: async (base: string, cwd?: string): Promise<string[]> => {
-    const out = await run(
-      ["git", "diff", "--name-only", "--diff-filter=ACMR", base, "HEAD"],
-      { cwd },
-    );
+    const out = await run(["git", "diff", "--name-only", "--diff-filter=ACMR", base, "HEAD"], {
+      cwd,
+    });
     return out.split("\n").filter(Boolean);
   },
 
@@ -56,17 +50,14 @@ export const git = {
       .map((l) => l.slice(3));
   },
 
-  add: (paths: string[], cwd?: string) =>
-    run(["git", "add", "--", ...paths], { cwd }),
+  add: (paths: string[], cwd?: string) => run(["git", "add", "--", ...paths], { cwd }),
 
-  commit: (message: string, cwd?: string) =>
-    run(["git", "commit", "-m", message], { cwd }),
+  commit: (message: string, cwd?: string) => run(["git", "commit", "-m", message], { cwd }),
 
   worktreeAdd: (path: string, branch: string, base: string) =>
     run(["git", "worktree", "add", "-b", branch, path, base]),
 
-  worktreeRemove: (path: string) =>
-    run(["git", "worktree", "remove", "--force", path]),
+  worktreeRemove: (path: string) => run(["git", "worktree", "remove", "--force", path]),
 
   branchDelete: async (branch: string): Promise<void> => {
     try {

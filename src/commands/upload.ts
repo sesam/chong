@@ -8,9 +8,7 @@ export async function cmdUpload(_argv: string[]): Promise<void> {
   const cwd = process.cwd();
   const id = await findCLByCwd(cwd);
   if (!id) {
-    console.error(
-      c.red("✗ not inside a chong worktree (no matching CL in .chong/state.json)"),
-    );
+    console.error(c.red("✗ not inside a chong worktree (no matching CL in .chong/state.json)"));
     process.exit(1);
   }
 
@@ -30,7 +28,9 @@ export async function cmdUpload(_argv: string[]): Promise<void> {
     for (const f of formatted) console.log(c.dim(`    fixed: ${f}`));
     await git.add(formatted, wtAbs);
     await git.commit("style: prettier auto-format [chong]", wtAbs);
-    console.log(c.green(`  ✓ formatted ${formatted.length} file${formatted.length === 1 ? "" : "s"}`));
+    console.log(
+      c.green(`  ✓ formatted ${formatted.length} file${formatted.length === 1 ? "" : "s"}`),
+    );
   } else {
     console.log(c.green("  ✓ already clean"));
   }

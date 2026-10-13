@@ -26,7 +26,9 @@ describe("addedLineLooksLikeI18nCode", () => {
       ),
     ).toBe(false);
     expect(
-      addedLineLooksLikeI18nCode('+            pages = [p for p in pages if p.get("type") == "page"]'),
+      addedLineLooksLikeI18nCode(
+        '+            pages = [p for p in pages if p.get("type") == "page"]',
+      ),
     ).toBe(false);
     expect(addedLineLooksLikeI18nCode("+  const parts = path.split('/')")).toBe(false);
     expect(addedLineLooksLikeI18nCode("+  test('unit case', () => {})")).toBe(false);

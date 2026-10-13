@@ -38,10 +38,7 @@ describe("isAgentableLintRule", () => {
 
 describe("isAgentableLintFailure", () => {
   test("requires every error to be agentable", () => {
-    const allAgentable = parseEslintErrors(
-      "f.js\n  1:1  error  'x' is not defined  no-undef",
-      ".",
-    );
+    const allAgentable = parseEslintErrors("f.js\n  1:1  error  'x' is not defined  no-undef", ".");
     const mixed = parseEslintErrors(
       "f.js\n  1:1  error  'x' is not defined  no-undef\n  2:1  error  bad  no-console",
       ".",

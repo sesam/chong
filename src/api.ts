@@ -1,12 +1,6 @@
 import { readAuth } from "./config";
 
-export type CLStatus =
-  | "DRAFT"
-  | "BUILDING"
-  | "LINT_ERROR"
-  | "BUILD_ERROR"
-  | "LIVE"
-  | "ABANDONED";
+export type CLStatus = "DRAFT" | "BUILDING" | "LINT_ERROR" | "BUILD_ERROR" | "LIVE" | "ABANDONED";
 
 export type CL = {
   id: string;
@@ -65,14 +59,12 @@ export const api = {
 
   getCL: (id: string) => req<CL>(`/api/cls/${encodeURIComponent(id)}`),
 
-  listCLs: (q: { author?: string; status?: string } = {}) =>
-    req<CL[]>(`/api/cls${qs(q)}`),
+  listCLs: (q: { author?: string; status?: string } = {}) => req<CL[]>(`/api/cls${qs(q)}`),
 
   abandonCL: (id: string) =>
     req<{ ok: true }>(`/api/cls/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
-  history: (q: { repo?: string; author?: string } = {}) =>
-    req<Commit[]>(`/api/history${qs(q)}`),
+  history: (q: { repo?: string; author?: string } = {}) => req<Commit[]>(`/api/history${qs(q)}`),
 
   commit: (sha: string, repo: string) =>
     req<CommitDetail>(`/api/commit/${encodeURIComponent(sha)}${qs({ repo })}`),

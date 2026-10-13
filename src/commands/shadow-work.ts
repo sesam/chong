@@ -132,7 +132,14 @@ async function runShadowFixes(
 
   // Format fix
   process.stdout.write(`  ${formatCmd}… `);
-  const fmtFix = await runFormatFix(repoPath, shadow.shadowPath, tip, formatCmd, remote, headBranch);
+  const fmtFix = await runFormatFix(
+    repoPath,
+    shadow.shadowPath,
+    tip,
+    formatCmd,
+    remote,
+    headBranch,
+  );
   if (fmtFix.error) {
     log(c.red(`✗ ${fmtFix.error}`));
   } else if (fmtFix.committed && fmtFix.pushed) {

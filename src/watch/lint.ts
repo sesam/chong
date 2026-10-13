@@ -73,7 +73,9 @@ export function isAgentableLintFailure(errors: EslintError[]): boolean {
 }
 
 export function formatLintSummary(errors: EslintError[]): string {
-  const lines = errors.slice(0, 20).map((e) => `${e.file}:${e.line}:${e.col}  ${e.message}  ${e.ruleId}`);
+  const lines = errors
+    .slice(0, 20)
+    .map((e) => `${e.file}:${e.line}:${e.col}  ${e.message}  ${e.ruleId}`);
   if (errors.length > 20) lines.push(`… +${errors.length - 20} more`);
   return lines.join("\n");
 }

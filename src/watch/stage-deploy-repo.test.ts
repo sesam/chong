@@ -557,9 +557,7 @@ describe("shortDeployStep / formatDeployStepSuffix", () => {
     expect(shortDeployStep("deploy: heartbeat attempt failed (1/3) — timed out")).toBeNull();
     expect(shortDeployStep("deploy stage: claim release failed (boom)")).toBeNull();
     expect(shortDeployStep("deploy stage: Discord notify failed")).toBeNull();
-    expect(
-      shortDeployStep("deploy stage: live, but S3 marker failed (AccessDenied)"),
-    ).toBeNull();
+    expect(shortDeployStep("deploy stage: live, but S3 marker failed (AccessDenied)")).toBeNull();
   });
 
   test("suffix includes spinner, step counter when known, and elapsed seconds", () => {
@@ -571,8 +569,6 @@ describe("shortDeployStep / formatDeployStepSuffix", () => {
       " [⠋ 6/6 build+upload, 0s]",
     );
     // Unknown label: no n/total, still shows spinner + seconds.
-    expect(formatDeployStepSuffix("aborting", started, started + 3_000)).toBe(
-      " [⠸ aborting, 3s]",
-    );
+    expect(formatDeployStepSuffix("aborting", started, started + 3_000)).toBe(" [⠸ aborting, 3s]");
   });
 });

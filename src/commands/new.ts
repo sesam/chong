@@ -16,7 +16,9 @@ export async function cmdNew(argv: string[]): Promise<void> {
   const repo = (flags.repo as string | undefined) ?? (await defaultRepo());
   if (!repo) {
     console.error(
-      c.red("✗ could not determine repo — pass --repo or add .chong/config.json with { \"repo\": \"...\" }"),
+      c.red(
+        '✗ could not determine repo — pass --repo or add .chong/config.json with { "repo": "..." }',
+      ),
     );
     process.exit(1);
   }
