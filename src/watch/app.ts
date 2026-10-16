@@ -250,6 +250,19 @@ export async function runWatch(
     ui.notices = [msg, ...ui.notices].slice(0, 5);
   }
 
+  /**
+   * A failed deploy must not scroll away as one of five dim notices: raise a modal
+   * (any key dismisses) and ring the terminal bell. Local only — no Discord post.
+   */
+  function showDeployFailure(target: "stage" | "prod", message: string): void {
+    const body: string[] = [];
+    for (const line of message.split("\n")) {
+      for (let i = 0; i < Math.max(1, line.length); i += 64) body.push(line.slice(i, i + 64));
+    }
+    ui.modal = { title: `✗ DEPLOY FAILED · ${target}`, body };
+    process.stdout.write("\x07");
+  }
+
   function tryTakeWorktree(force = false): boolean {
     const prev = readWorktreeClaim(shadowPath);
     const res = acquireWorktreeClaim(shadowPath, processId, { force });
@@ -502,6 +515,7 @@ export async function runWatch(
         stageDeployAt = null;
         addNotice(c.red(`✗ stage: ${res.message}`));
         ui.status = c.red(`✗ stage: ${res.message}`);
+        showDeployFailure("stage", res.message);
       }
     } catch (e) {
       stageDeploying = false;
@@ -513,6 +527,7 @@ export async function runWatch(
       const msg = e instanceof Error ? e.message : String(e);
       addNotice(c.red(`✗ stage deploy crashed: ${msg}`));
       ui.status = c.red(`✗ stage deploy crashed: ${msg}`);
+      showDeployFailure("stage", `crashed: ${msg}`);
     }
     syncStageDeployUi();
     paint();
@@ -1060,6 +1075,7 @@ export async function runWatch(
         ui.status = c.dim(res.message);
       } else {
         ui.status = c.red(`✗ ${res.message}`);
+        if (res.action === "error") showDeployFailure("prod", res.message);
       }
       ui.busy = false;
       await refresh();
