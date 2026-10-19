@@ -58,8 +58,8 @@ describe("scrubbedAgentEnv", () => {
 
 describe("fenceUntrustedText", () => {
   test("wraps content in a labelled untrusted-data block", () => {
-    const out = fenceUntrustedText("eslint-summary", "some/file.js:1:1  message  rule-id");
-    expect(out).toContain('<untrusted-data label="eslint-summary">');
+    const out = fenceUntrustedText("lint-summary", "some/file.js:1:1  message  rule-id");
+    expect(out).toContain('<untrusted-data label="lint-summary">');
     expect(out).toContain("</untrusted-data>");
     expect(out).toContain("some/file.js:1:1  message  rule-id");
     expect(out.toLowerCase()).toContain("not instructions");
@@ -88,7 +88,7 @@ describe("fenceUntrustedText", () => {
 
   test("strips control characters, including ANSI escapes", () => {
     const withAnsi = "\x1b[31merror\x1b[0m: \x07bell\x00null";
-    const fenced = fenceUntrustedText("eslint-summary", withAnsi);
+    const fenced = fenceUntrustedText("lint-summary", withAnsi);
     expect(fenced).not.toContain("\x1b");
     expect(fenced).not.toContain("\x07");
     expect(fenced).not.toContain("\x00");

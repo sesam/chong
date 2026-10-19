@@ -7,24 +7,39 @@ import {
   isAgentableLintFailure,
   isAgentableLintRule,
   lintableChangedFiles,
-  parseEslintErrors,
+  parseOxlintErrors,
 } from "./lint";
 
-describe("parseEslintErrors", () => {
-  test("extracts error lines and ignores warnings", () => {
-    const out = [
-      "src/layouts/useAppNavItems.js",
-      "  75:16  error  'tJournal' is not defined  no-undef",
-      "  82:16  error  'tJournal' is not defined  no-undef",
-      "  10:1   warning  Unexpected console statement  no-console",
-    ].join("\n");
-    const errors = parseEslintErrors(out, "/repo");
-    expect(errors).toHaveLength(2);
-    expect(errors[0]).toMatchObject({
-      file: "src/layouts/useAppNavItems.js",
-      line: 75,
-      ruleId: "no-undef",
+const diag = (code: string, severity = "error", filename = "src/a.js") => ({
+  message: "msg",
+  code,
+  severity,
+  filename,
+  labels: [{ span: { offset: 0, length: 1, line: 75, column: 16 } }],
+});
+
+describe("parseOxlintErrors", () => {
+  test("extracts error diagnostics, maps rule ids and ignores warnings", () => {
+    const out = JSON.stringify({
+      diagnostics: [
+        diag("eslint(no-undef)", "error", "/repo/src/layouts/useAppNavItems.js"),
+        diag("import(named)"),
+        diag("lynx(i18n-t-literal)"),
+        diag("eslint(no-console)", "warning"),
+      ],
+      number_of_files: 3,
     });
+    const errors = parseOxlintErrors(`banner\n${out}\n`, "/repo");
+    expect(errors.map((e) => e.ruleId)).toEqual([
+      "no-undef",
+      "import/named",
+      "lynx/i18n-t-literal",
+    ]);
+    expect(errors[0]).toMatchObject({ file: "src/layouts/useAppNavItems.js", line: 75, col: 16 });
+  });
+
+  test("returns no errors for unparseable output", () => {
+    expect(parseOxlintErrors("not json", ".")).toEqual([]);
   });
 });
 
@@ -38,9 +53,12 @@ describe("isAgentableLintRule", () => {
 
 describe("isAgentableLintFailure", () => {
   test("requires every error to be agentable", () => {
-    const allAgentable = parseEslintErrors("f.js\n  1:1  error  'x' is not defined  no-undef", ".");
-    const mixed = parseEslintErrors(
-      "f.js\n  1:1  error  'x' is not defined  no-undef\n  2:1  error  bad  no-console",
+    const allAgentable = parseOxlintErrors(
+      JSON.stringify({ diagnostics: [diag("eslint(no-undef)")] }),
+      ".",
+    );
+    const mixed = parseOxlintErrors(
+      JSON.stringify({ diagnostics: [diag("eslint(no-undef)"), diag("eslint(no-empty)")] }),
       ".",
     );
     expect(isAgentableLintFailure(allAgentable)).toBe(true);

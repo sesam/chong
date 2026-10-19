@@ -29,7 +29,7 @@ import {
 import { homedir } from "node:os";
 import path from "node:path";
 import { c } from "../util";
-import { type ShadowRole, ensureShadow, runEslintFix, tryAgentLintFix } from "./checks";
+import { type ShadowRole, ensureShadow, runLintFix, tryAgentLintFix } from "./checks";
 import {
   CLAIM_HEARTBEAT_MS,
   type DeployClaim,
@@ -41,7 +41,7 @@ import {
   writeS3ShaMarkerVerified,
 } from "./deploy-claim";
 import { appendDeployHistory, deployHistoryPath } from "./deploy-history";
-import { formatLintSummary, isAgentableLintFailure, lintableChangedFiles, runEslint } from "./lint";
+import { formatLintSummary, isAgentableLintFailure, lintableChangedFiles, runLint } from "./lint";
 import { repo } from "./repo";
 import type { RepoCheck } from "./repo-config";
 import { formatUnresolvedSummary, scanUnresolvedImports } from "./unresolved-imports";
@@ -67,7 +67,7 @@ const STAGE_DEPLOY_STEPS = [
   "claiming",
   "claim wait",
   "reset shadow",
-  "eslint",
+  "lint",
   "import scan",
   "build+upload",
 ] as const;
@@ -93,7 +93,7 @@ export function shortDeployStep(msg: string): string | null {
   if (/forced claim/i.test(m)) return "claim forced";
 
   if (/resetting shadow/i.test(m)) return "reset shadow";
-  if (/eslint gate/i.test(m)) return "eslint";
+  if (/lint gate/i.test(m)) return "lint";
   if (/unresolved-import/i.test(m)) return "import scan";
   if (/\brunning\b/i.test(m)) return "build+upload";
   if (/lost soft claim/i.test(m)) return "aborting";
@@ -109,7 +109,7 @@ export function shortDeployStep(msg: string): string | null {
 }
 
 /**
- * Bracketed suffix for an ongoing deploy line: `[⠋ 4/6 eslint, 12s]`.
+ * Bracketed suffix for an ongoing deploy line: `[⠋ 4/6 lint, 12s]`.
  * Seconds count from when the current step started (resets on each new detail).
  */
 export function formatDeployStepSuffix(
@@ -1116,10 +1116,10 @@ export function startClaimHeartbeat(
 }
 
 /**
- * ESLint the files changed between `baseSha` and HEAD in the shadow worktree.
+ * Lint the files changed between `baseSha` and HEAD in the shadow worktree.
  * When baseSha is null, skip the gate (first deploy).
  */
-async function eslintGate(
+async function lintGate(
   repoPath: string,
   shadowPath: string,
   remote: string,
@@ -1134,33 +1134,26 @@ async function eslintGate(
   const files = await lintableChangedFiles(git, shadowPath, baseSha, tip);
   if (files.length === 0) return null;
 
-  let run = await runEslint(shadowPath, files);
+  let run = await runLint(shadowPath, files);
   if (run.ok) return null;
 
   // Try --fix via the existing stage-diff helpers (uses origin/stage as base when present).
   const stageTip = await repo.tip(repoPath, remote, stageBranch);
   if (stageTip) {
-    const fix = await runEslintFix(
-      repoPath,
-      shadowPath,
-      remote,
-      mainBranch,
-      mainBranch,
-      stageBranch,
-    );
+    const fix = await runLintFix(repoPath, shadowPath, remote, mainBranch, mainBranch, stageBranch);
     if (fix.committed && fix.pushed) {
       return {
         action: "fixed",
-        message: "eslint fix pushed to main — redeploy after tip moves",
+        message: "lint fix pushed to main — redeploy after tip moves",
         sha: tip,
       };
     }
-    run = await runEslint(shadowPath, files);
+    run = await runLint(shadowPath, files);
     if (run.ok) return null;
 
     if (agent && isAgentableLintFailure(run.errors)) {
       const summary = [
-        "ESLint errors before local stage deploy:",
+        "lint errors before local stage deploy:",
         formatLintSummary(run.errors),
         "",
         run.output.slice(0, 4000),
@@ -1176,7 +1169,7 @@ async function eslintGate(
       if (agentRes.fixed) {
         return {
           action: "fixed",
-          message: "eslint agent fixed → pushed to main — redeploy after tip moves",
+          message: "lint agent fixed → pushed to main — redeploy after tip moves",
           sha: tip,
         };
       }
@@ -1187,7 +1180,7 @@ async function eslintGate(
   const preview = formatLintSummary(run.errors).slice(0, 300);
   return {
     action: "blocked",
-    message: `eslint blocks stage deploy${preview ? `: ${preview}` : ""}`,
+    message: `lint blocks stage deploy${preview ? `: ${preview}` : ""}`,
     sha: tip,
   };
 }
@@ -1200,7 +1193,7 @@ async function eslintGate(
  * renders a blank page on navigation. A deletion or rename sweep is the usual cause — the
  * dangling import lives in a file the commit never touched.
  *
- * Unlike `eslintGate` this does NOT diff against the last deployed SHA. Scoping it to
+ * Unlike `lintGate` this does NOT diff against the last deployed SHA. Scoping it to
  * changed files would skip the importing file, which is exactly the one that matters. The
  * whole tree costs ~0.5s on a 1,700-file repo, so there is nothing to save.
  *
@@ -1317,7 +1310,7 @@ async function prepareShadow(
  * Uses the `prod-deploy` worktree (not main-shadow), so a concurrent stage deploy or
  * maintain pass cannot `reset --hard` underneath the vite build / S3 sync.
  *
- * No eslint or unresolved-import gate here, unlike the stage path: this exact commit
+ * No lint or unresolved-import gate here, unlike the stage path: this exact commit
  * already passed both on its way to stage, and re-running the agent auto-fix at
  * prod-promote time could mutate the tree at the worst possible moment.
  *
@@ -1538,8 +1531,8 @@ export async function runLocalStageDeploy(
   let heldClaim: DeployClaim | null = null;
   let claimLost = false;
 
-  // The claim's propagation wait is a fixed sleep, so the shadow reset, eslint gate and
-  // import scan run inside it instead of after it. They only read the tree (an eslint
+  // The claim's propagation wait is a fixed sleep, so the shadow reset, lint gate and
+  // import scan run inside it instead of after it. They only read the tree (an lint
   // auto-fix lands on main, which any later deploy would ship anyway); the upload still
   // waits for the claim below.
   const claimP = claimOrDefer(markerBucket, tip, opts.processId, "stage", {
@@ -1556,8 +1549,8 @@ export async function runLocalStageDeploy(
     }
     deploy.stopTouch = startDeployWorktreeTouch(shadow.shadowPath, opts.processId);
 
-    note("deploy stage: eslint gate…");
-    const eslintResult = await eslintGate(
+    note("deploy stage: lint gate…");
+    const lintResult = await lintGate(
       repoPath,
       shadow.shadowPath,
       remote,
@@ -1567,7 +1560,7 @@ export async function runLocalStageDeploy(
       tip,
       opts.agent !== false,
     );
-    if (eslintResult) return eslintResult;
+    if (lintResult) return lintResult;
 
     if (opts.importScan !== false) {
       note("deploy stage: unresolved-import scan…");

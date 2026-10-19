@@ -23,7 +23,7 @@ import {
   isExcludedPath,
   isScannable,
 } from "./i18n-scan";
-import { type EslintError, formatLintSummary, lintableChangedFiles, runEslint } from "./lint";
+import { type LintError, formatLintSummary, lintableChangedFiles, runLint } from "./lint";
 import { repo } from "./repo";
 import { splitArgv } from "./repo-config";
 import { type RepoSupports, detectRepoProfile } from "./repo-profile";
@@ -123,7 +123,7 @@ async function untrackedStatusPaths(cwd: string): Promise<string[]> {
  * Untracked ("??") paths in `cwd` that a step did NOT expect — used by every auto-commit
  * site below to refuse the commit instead of silently sweeping such files in with
  * `git add -A` (a scratch file/directory an agent run left behind; leftover output from
- * a previous step). `isExpected` is either an explicit allowlist (eslint's `files`, or a
+ * a previous step). `isExpected` is either an explicit allowlist (oxlint's file list, or a
  * step's own before/after-diffed touched paths) or a predicate for open-ended scope
  * (i18n's ".po"/".pot" allowance). Empty result ⇒ safe to stage the expected paths and
  * commit.
@@ -963,34 +963,34 @@ export async function reconcileLocalMain(
   });
 }
 
-const ESLINT_FIX_SUBJECT = "FIX: eslint";
+const LINT_FIX_SUBJECT = "FIX: lint";
 
 /**
- * Run eslint --fix in shadow, commit only lintable files from the stage diff, push to main.
+ * Run lint --fix in shadow, commit only lintable files from the stage diff, push to main.
  */
-export async function runEslintFix(
+export async function runLintFix(
   repoPath: string,
   shadowPath: string,
   remote: string,
   branch: string,
   from: string,
   to: string,
-): Promise<FixResult & { errors?: EslintError[] }> {
+): Promise<FixResult & { errors?: LintError[] }> {
   const fromRef = `${remote}/${to}`;
   const toRef = `${remote}/${from}`;
   const scope = await lintableChangedFiles(git, shadowPath, fromRef, toRef);
   if (scope.length === 0) return { committed: false, pushed: false, leftovers: [], error: null };
 
-  await runEslint(shadowPath, scope, true);
+  await runLint(shadowPath, scope, true);
 
   const modified = await statusPaths(shadowPath);
   if (modified.length === 0) {
-    const check = await runEslint(shadowPath, scope);
+    const check = await runLint(shadowPath, scope);
     return {
       committed: false,
       pushed: false,
       leftovers: [],
-      error: check.ok ? null : `eslint: ${formatLintSummary(check.errors)}`,
+      error: check.ok ? null : `lint: ${formatLintSummary(check.errors)}`,
       errors: check.errors,
     };
   }
@@ -1004,18 +1004,18 @@ export async function runEslintFix(
   }
 
   if (toCommit.length === 0) {
-    const check = await runEslint(shadowPath, scope);
+    const check = await runLint(shadowPath, scope);
     return {
       committed: false,
       pushed: false,
       leftovers,
-      error: check.ok ? null : `eslint: ${formatLintSummary(check.errors)}`,
+      error: check.ok ? null : `lint: ${formatLintSummary(check.errors)}`,
       errors: check.errors,
     };
   }
 
   await git(["add", "--", ...toCommit], shadowPath);
-  const commitR = await git(["commit", "-m", ESLINT_FIX_SUBJECT, "--no-verify"], shadowPath);
+  const commitR = await git(["commit", "-m", LINT_FIX_SUBJECT, "--no-verify"], shadowPath);
   if (!commitR.ok) {
     return { committed: false, pushed: false, leftovers, error: `commit: ${commitR.err}` };
   }
@@ -1032,7 +1032,7 @@ export async function runEslintFix(
   return { committed: true, pushed: true, leftovers, error: null };
 }
 
-/** Ask the coding agent to fix agentable eslint errors (e.g. no-undef). */
+/** Ask the coding agent to fix agentable lint errors (e.g. no-undef). */
 export async function tryAgentLintFix(
   repoPath: string,
   shadowPath: string,
@@ -1042,39 +1042,39 @@ export async function tryAgentLintFix(
   branch: string,
 ): Promise<{ fixed: boolean; message: string }> {
   if (!findAgentBin()) {
-    return { fixed: false, message: "no agent on PATH — cannot auto-fix eslint" };
+    return { fixed: false, message: "no agent on PATH — cannot auto-fix lint" };
   }
 
   const gate = await agentGate(shadowPath, lintGatePrompt(summary));
   if (gate.verdict !== "SAFE") {
     return {
       fixed: false,
-      message: `eslint agent ${gate.verdict.toLowerCase()} — promote blocked`,
+      message: `lint agent ${gate.verdict.toLowerCase()} — promote blocked`,
     };
   }
 
   const edit = await agentEdit(shadowPath, lintResolvePrompt(summary));
   if (!edit.ok) {
-    return { fixed: false, message: `eslint agent edit failed (${edit.text.slice(0, 120)})` };
+    return { fixed: false, message: `lint agent edit failed (${edit.text.slice(0, 120)})` };
   }
 
-  const verify = await runEslint(shadowPath, files);
+  const verify = await runLint(shadowPath, files);
   if (!verify.ok) {
     await resetShadowDirty(shadowPath);
     return {
       fixed: false,
-      message: `eslint still failing after agent (${formatLintSummary(verify.errors).slice(0, 200)})`,
+      message: `lint still failing after agent (${formatLintSummary(verify.errors).slice(0, 200)})`,
     };
   }
 
   const changedAfterAgent = await statusPaths(shadowPath);
   if (changedAfterAgent.length === 0) {
-    return { fixed: false, message: "eslint agent: nothing to commit" };
+    return { fixed: false, message: "lint agent: nothing to commit" };
   }
 
   if (await hasConflictMarkers(shadowPath)) {
     await resetShadowDirty(shadowPath);
-    return { fixed: false, message: "eslint agent left conflict markers" };
+    return { fixed: false, message: "lint agent left conflict markers" };
   }
 
   // Stage only the files the agent was asked to fix. Anything else it touched stays
@@ -1085,7 +1085,7 @@ export async function tryAgentLintFix(
   if (unexpectedNew.length > 0) {
     return {
       fixed: false,
-      message: `eslint agent left untracked file(s) outside the fix scope — not committing (${unexpectedNew
+      message: `lint agent left untracked file(s) outside the fix scope — not committing (${unexpectedNew
         .slice(0, 3)
         .join(", ")}${unexpectedNew.length > 3 ? ", …" : ""})`,
     };
@@ -1093,25 +1093,25 @@ export async function tryAgentLintFix(
 
   const toCommit = files.filter((f) => changedAfterAgent.includes(f));
   if (toCommit.length === 0) {
-    return { fixed: false, message: "eslint agent: nothing in scope to commit" };
+    return { fixed: false, message: "lint agent: nothing in scope to commit" };
   }
 
   await git(["add", "--", ...toCommit], shadowPath);
-  const commitR = await git(["commit", "-m", "FIX: eslint (agent)", "--no-verify"], shadowPath);
+  const commitR = await git(["commit", "-m", "FIX: lint (agent)", "--no-verify"], shadowPath);
   if (!commitR.ok) {
-    return { fixed: false, message: `eslint agent commit failed (${commitR.err})` };
+    return { fixed: false, message: `lint agent commit failed (${commitR.err})` };
   }
 
   const pushR = await git(["push", remote, `HEAD:refs/heads/${branch}`], shadowPath);
   if (!pushR.ok) {
-    return { fixed: false, message: `eslint agent committed but push failed (${pushR.err})` };
+    return { fixed: false, message: `lint agent committed but push failed (${pushR.err})` };
   }
 
   const head = await git(["rev-parse", "HEAD"], shadowPath);
   if (head.ok) {
     await git(["update-ref", `refs/remotes/${remote}/${branch}`, head.out], repoPath);
   }
-  return { fixed: true, message: `eslint agent fixed → pushed to ${branch}` };
+  return { fixed: true, message: `lint agent fixed → pushed to ${branch}` };
 }
 
 export type FixResult = {

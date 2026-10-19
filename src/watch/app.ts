@@ -486,7 +486,7 @@ export async function runWatch(
         ui.status = c.green(`✓ ${res.message}`);
         void refresh();
       } else if (res.action === "fixed") {
-        // eslint landed on main — wait for the new tip, then re-arm cooldown
+        // lint landed on main — wait for the new tip, then re-arm cooldown
         pendingStageDeploySha = null;
         stageDeployAt = null;
         addNotice(c.green(`✓ ${res.message}`));

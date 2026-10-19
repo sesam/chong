@@ -9,7 +9,7 @@ export type RepoSupports = {
   i18n: boolean;
   lockfile: boolean;
   depsBump: boolean;
-  eslint: boolean;
+  lint: boolean;
   importScan: boolean;
 };
 
@@ -29,14 +29,14 @@ const ALL: RepoSupports = {
   i18n: true,
   lockfile: true,
   depsBump: true,
-  eslint: true,
+  lint: true,
   importScan: true,
 };
 const NONE: RepoSupports = {
   i18n: false,
   lockfile: false,
   depsBump: false,
-  eslint: false,
+  lint: false,
   importScan: false,
 };
 

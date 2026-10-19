@@ -37,7 +37,7 @@ export async function cmdWatch(argv: string[]): Promise<void> {
   }
 
   // Node repos keep the pnpm defaults; Python/other repos get what detectRepoProfile finds
-  // (e.g. ruff) and have the pnpm-only steps (i18n, lockfile, deps, eslint, import scan) off.
+  // (e.g. ruff) and have the pnpm-only steps (i18n, lockfile, deps, lint, import scan) off.
   const profile = detectRepoProfile(repoPath);
   const formatCmd =
     typeof flags["format-cmd"] === "string" ? flags["format-cmd"] : profile.formatCmd;

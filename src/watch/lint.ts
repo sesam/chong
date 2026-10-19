@@ -6,7 +6,7 @@ type Run = { ok: boolean; out: string; err: string };
 
 const LINT_GLOBS = ["*.js", "*.mjs", "*.cjs", "*.ts", "*.vue"];
 
-export type EslintError = {
+export type LintError = {
   file: string;
   line: number;
   col: number;
@@ -39,25 +39,47 @@ export async function lintableChangedFiles(
     .filter((f) => f && existsSync(path.join(cwd, f)));
 }
 
-/** Parse `eslint` stdout/stderr for error lines (warnings are ignored — CI only blocks errors). */
-export function parseEslintErrors(output: string, cwd: string): EslintError[] {
-  const errors: EslintError[] = [];
-  let currentFile = "";
-  for (const line of output.split("\n")) {
-    if (!line.trim()) continue;
-    if (line.startsWith("/") || /^[\w@./-]+\.(js|mjs|cjs|ts|vue)$/.test(line.trim())) {
-      const raw = line.trim();
-      currentFile = path.isAbsolute(raw) ? path.relative(cwd, raw) : raw;
-      continue;
-    }
-    const m = line.match(/^\s+(\d+):(\d+)\s+error\s+(.+?)\s+([\w@/-]+)\s*$/);
-    if (!m || !currentFile) continue;
+/**
+ * Map an oxlint diagnostic code to a rule id: `eslint(no-undef)` → `no-undef`,
+ * `import(named)` → `import/named`, `lynx(i18n-t-literal)` → `lynx/i18n-t-literal`.
+ */
+function ruleIdFromCode(code: string): string {
+  const m = code.match(/^([\w@-]+)\((.+)\)$/);
+  if (!m) return code;
+  return m[1] === "eslint" ? m[2] : `${m[1]}/${m[2]}`;
+}
+
+/**
+ * Parse `oxlint --format json` output into error diagnostics (warnings are ignored — CI only
+ * blocks errors). Unparseable output yields no errors; the caller still fails on the exit code.
+ */
+export function parseOxlintErrors(output: string, cwd: string): LintError[] {
+  // oxlint can print a banner or warnings around the JSON document.
+  const start = output.indexOf('{ "diagnostics"');
+  const from = start >= 0 ? start : output.indexOf("{");
+  if (from < 0) return [];
+  let doc: { diagnostics?: unknown };
+  try {
+    doc = JSON.parse(output.slice(from, output.lastIndexOf("}") + 1));
+  } catch {
+    return [];
+  }
+  const errors: LintError[] = [];
+  for (const d of (doc.diagnostics ?? []) as {
+    message?: string;
+    code?: string;
+    severity?: string;
+    filename?: string;
+    labels?: { span?: { line?: number; column?: number } }[];
+  }[]) {
+    if (d.severity !== "error" || !d.filename) continue;
+    const span = d.labels?.[0]?.span;
     errors.push({
-      file: currentFile,
-      line: Number.parseInt(m[1], 10),
-      col: Number.parseInt(m[2], 10),
-      message: m[3],
-      ruleId: m[4],
+      file: path.isAbsolute(d.filename) ? path.relative(cwd, d.filename) : d.filename,
+      line: span?.line ?? 0,
+      col: span?.column ?? 0,
+      message: d.message ?? "",
+      ruleId: ruleIdFromCode(d.code ?? ""),
     });
   }
   return errors;
@@ -68,11 +90,11 @@ export function isAgentableLintRule(ruleId: string): boolean {
   return ruleId === "no-undef" || ruleId.startsWith("import/");
 }
 
-export function isAgentableLintFailure(errors: EslintError[]): boolean {
+export function isAgentableLintFailure(errors: LintError[]): boolean {
   return errors.length > 0 && errors.every((e) => isAgentableLintRule(e.ruleId));
 }
 
-export function formatLintSummary(errors: EslintError[]): string {
+export function formatLintSummary(errors: LintError[]): string {
   const lines = errors
     .slice(0, 20)
     .map((e) => `${e.file}:${e.line}:${e.col}  ${e.message}  ${e.ruleId}`);
@@ -91,29 +113,30 @@ async function sh(cmd: string[], cwd: string): Promise<Run> {
 }
 
 /**
- * Run eslint on specific files the way CI does: `pnpm exec eslint --no-error-on-unmatched-pattern`.
- * Falls back to `npx eslint` when pnpm is unavailable.
+ * Run oxlint on specific files the way CI does: `pnpm exec oxlint --no-error-on-unmatched-pattern`.
+ * Falls back to `npx oxlint` when pnpm is unavailable. `--format json` is only used for the
+ * check (not `fix`), so the agent-facing `output` stays the readable default when fixing.
  */
-export async function runEslint(
+export async function runLint(
   cwd: string,
   files: string[],
   fix = false,
-): Promise<{ ok: boolean; output: string; errors: EslintError[] }> {
+): Promise<{ ok: boolean; output: string; errors: LintError[] }> {
   if (files.length === 0) return { ok: true, output: "", errors: [] };
 
-  const eslintArgs = ["eslint", "--no-error-on-unmatched-pattern", ...files];
-  if (fix) eslintArgs.splice(1, 0, "--fix");
+  const args = ["oxlint", "--no-error-on-unmatched-pattern", "--format", "json", ...files];
+  if (fix) args.splice(1, 0, "--fix");
 
   let run: Run;
   if (Bun.which("pnpm")) {
-    run = await sh(["pnpm", "exec", ...eslintArgs], cwd);
+    run = await sh(["pnpm", "exec", ...args], cwd);
   } else if (Bun.which("npx")) {
-    run = await sh(["npx", ...eslintArgs], cwd);
+    run = await sh(["npx", ...args], cwd);
   } else {
     return { ok: false, output: "no pnpm or npx on PATH", errors: [] };
   }
 
   const output = `${run.out}\n${run.err}`.trim();
-  const errors = parseEslintErrors(output, cwd);
+  const errors = parseOxlintErrors(run.out, cwd);
   return { ok: run.ok && errors.length === 0, output, errors };
 }

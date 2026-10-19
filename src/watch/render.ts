@@ -29,7 +29,7 @@ export type UIState = {
     secsLeft: number;
     /** Who holds the soft claim when kind is remote-deploying / deploying. */
     by?: string;
-    /** Current deploy phase label (e.g. "eslint", "build+upload"). */
+    /** Current deploy phase label (e.g. "lint", "build+upload"). */
     detail?: string;
     /** Epoch ms when `detail` last changed — render derives elapsed seconds from this. */
     stepStartedAt?: number;
