@@ -1,5 +1,6 @@
 import { c, parseArgs } from "../util";
 import { runWatch } from "../watch/app";
+import { assertChongFresh } from "../watch/freshness";
 import type { WatchConfig } from "../watch/model";
 import { repo } from "../watch/repo";
 import { detectRepoProfile } from "../watch/repo-profile";
@@ -20,6 +21,7 @@ export async function cmdWatch(argv: string[]): Promise<void> {
     throw new Error(`${path} is not a git repository`);
   }
   const repoPath = await repo.topLevel(path);
+  assertChongFresh(repoPath);
 
   const remote = typeof flags.remote === "string" ? flags.remote : "origin";
   const branches =

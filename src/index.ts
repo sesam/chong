@@ -13,6 +13,7 @@ import { cmdUpload } from "./commands/upload";
 import { cmdVerify } from "./commands/verify";
 import { cmdWatch } from "./commands/watch";
 import { c } from "./util";
+import { versionLine } from "./version";
 
 const HELP = `chong — ship change-lists to the company git backend
 
@@ -52,6 +53,8 @@ const HELP = `chong — ship change-lists to the company git backend
                                         latest origin/main commit via main-shadow
   chong check i18n [<path>] [--json]    list hardcoded user-facing strings not
                                         wrapped in t() (detection feedback view)
+  chong --version                       build commit + timestamp (repos can require a minimum
+                                        via "minChongBuild" in .chong/config.json)
   chong auth login                      save server URL + PAT to ~/.chong/auth.json
 `;
 
@@ -60,6 +63,11 @@ async function main(): Promise<void> {
 
   if (!cmd || cmd === "-h" || cmd === "--help" || cmd === "help") {
     process.stdout.write(HELP);
+    return;
+  }
+
+  if (cmd === "--version" || cmd === "-v" || cmd === "version") {
+    process.stdout.write(`${versionLine()}\n`);
     return;
   }
 

@@ -216,6 +216,10 @@ export function hasFrontendStageDeployScript(repoPath: string): boolean {
  * skip a deploy it should have run. The marker is now opt-in per repo.
  */
 export type RepoDeployConfig = {
+  /** ISO timestamp: refuse to run `chong watch` with a chong built before this. */
+  minChongBuild?: string;
+  /** Shown with the refusal, e.g. what changed that needs the newer chong. */
+  minChongReason?: string;
   /** Deploy command; overrides detection. */
   stageDeployCmd?: string;
   /** S3 bucket for the stage/app-ci deployed-SHA marker. Omit to skip the marker entirely. */
