@@ -385,6 +385,25 @@ export const repo = {
    * to create or push must be reported and then ignored, never retried into a
    * failed deploy.
    */
+  /**
+   * Force-move a moving "what is live" tag (`current-stage` / `current-prod`) to `sha`
+   * and force-push it. Best-effort like {@link tagAndPush}: returns an error string or
+   * null, never throws. Tags are shared refs, so running this from a shadow worktree
+   * moves the tag for the main checkout too. Pushing a tag does not trigger CI.
+   */
+  async moveTagForce(
+    cwd: string,
+    remote: string,
+    tag: string,
+    sha: string,
+    message: string,
+  ): Promise<string | null> {
+    const created = await git(["tag", "-f", "-a", tag, sha, "-m", message], cwd);
+    if (!created.ok) return created.err || `tag ${tag} failed`;
+    const pushed = await git(["push", "--force", remote, `refs/tags/${tag}`], cwd);
+    return pushed.ok ? null : pushed.err || `tag ${tag} push failed`;
+  },
+
   async tagAndPush(
     cwd: string,
     remote: string,

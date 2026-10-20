@@ -1442,6 +1442,15 @@ export async function runLocalProdDeploy(
     );
     if (tagErr) note(`deploy prod: live, but release tag failed (${tagErr.slice(0, 120)})`);
 
+    const curErr = await repo.moveTagForce(
+      repoPath,
+      opts.remote ?? "origin",
+      "current-prod",
+      sha,
+      `deployed to production ${new Date().toISOString()}`,
+    );
+    if (curErr) note(`deploy prod: live, but current-prod tag failed (${curErr.slice(0, 120)})`);
+
     if (markerBucket) {
       const tipTree2 = tipTree ?? (await repo.treeOf(repoPath, sha));
       const shaErr = await writeS3DeployedSha(markerBucket, sha);
@@ -1627,6 +1636,15 @@ export async function runLocalStageDeploy(
         `deploy stage: live, but local ${stageBranch} ref update failed (${refErr.slice(0, 120)})`,
       );
     }
+
+    const curErr = await repo.moveTagForce(
+      repoPath,
+      remote,
+      "current-stage",
+      tip,
+      `deployed to stage ${new Date().toISOString()}`,
+    );
+    if (curErr) note(`deploy stage: live, but current-stage tag failed (${curErr.slice(0, 120)})`);
 
     if (markerBucket) {
       const s3Err = await writeS3DeployedSha(markerBucket, tip);
