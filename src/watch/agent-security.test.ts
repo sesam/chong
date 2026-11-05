@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { fenceUntrustedText, scrubbedAgentEnv } from "./agent";
+import {
+  fenceUntrustedText,
+  isForbiddenAgentBin,
+  scrubAgentPath,
+  scrubbedAgentEnv,
+} from "./agent";
 
 describe("scrubbedAgentEnv", () => {
   test("drops secret-shaped vars and keeps the essentials", () => {
@@ -53,6 +58,41 @@ describe("scrubbedAgentEnv", () => {
     const scrubbed = scrubbedAgentEnv({ PATH: "/usr/bin", HOME: undefined });
     expect(scrubbed.PATH).toBe("/usr/bin");
     expect("HOME" in scrubbed).toBe(false);
+  });
+
+  test("strips Antigravity dirs from PATH", () => {
+    const scrubbed = scrubbedAgentEnv({
+      PATH: "/Users/me/.antigravity/antigravity/bin:/usr/bin:/Users/me/.local/bin",
+      HOME: "/Users/me",
+    });
+    expect(scrubbed.PATH).toBe("/usr/bin:/Users/me/.local/bin");
+    expect(scrubbed.PATH).not.toContain("antigravity");
+  });
+});
+
+describe("scrubAgentPath", () => {
+  test("drops every PATH entry under an antigravity install", () => {
+    expect(
+      scrubAgentPath(
+        "/Users/me/.antigravity/antigravity/bin:/opt/homebrew/bin:/Applications/Antigravity.app/Contents/Resources/app/bin:/bin",
+      ),
+    ).toBe("/opt/homebrew/bin:/bin");
+  });
+});
+
+describe("isForbiddenAgentBin", () => {
+  test("rejects Antigravity install paths and agy basename", () => {
+    expect(isForbiddenAgentBin("/Users/me/.antigravity/antigravity/bin/agent")).toBe(true);
+    expect(isForbiddenAgentBin("/Applications/Antigravity.app/Contents/Resources/app/bin/agy")).toBe(
+      true,
+    );
+    expect(isForbiddenAgentBin("/usr/local/bin/antigravity")).toBe(true);
+  });
+
+  test("allows Cursor / mcpify agent paths", () => {
+    expect(isForbiddenAgentBin("/Users/me/.local/bin/cursor-agent")).toBe(false);
+    expect(isForbiddenAgentBin("/Users/me/.local/bin/agent")).toBe(false);
+    expect(isForbiddenAgentBin("/Users/me/.local/bin/mcpify-agent")).toBe(false);
   });
 });
 

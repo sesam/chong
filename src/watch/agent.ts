@@ -2,10 +2,13 @@
  * Headless coding-agent helpers for chong watch.
  *
  * Prefers offline `mcpify-agent` (Ollama + mcp-ify) when on PATH; falls back to
- * Cursor Agent (`agent` / `cursor-agent`) with `--model auto`.
+ * Cursor Agent (`cursor-agent`, then `agent`) with `--model auto`.
+ * Never binds Google Antigravity (partial uninstalls leave it first on PATH).
  *
  * Confidence gates use ask/read-only mode; edits use force/agent mode.
  */
+
+import { realpathSync } from "node:fs";
 
 export type AgentRun = {
   ok: boolean;
@@ -63,16 +66,55 @@ const ENV_ALLOW_EXACT = new Set([
 /** Locale vars (LC_ALL, LC_CTYPE, ...) — not secret-shaped, agent needs them. */
 const ENV_ALLOW_PREFIX = ["LC_"];
 
+/**
+ * Drop Antigravity install dirs from PATH. A partial uninstall often leaves
+ * `~/.antigravity/.../bin` first on PATH with broken symlinks into
+ * `/Applications/Antigravity.app`; keeping that entry lets a mis-bound `agent`
+ * (or anything that re-reads PATH) prefer a dead Google CLI over Cursor.
+ */
+export function scrubAgentPath(pathValue: string): string {
+  return pathValue
+    .split(":")
+    .filter((entry) => {
+      if (!entry) return false;
+      const lower = entry.toLowerCase();
+      return !lower.includes("antigravity");
+    })
+    .join(":");
+}
+
 /** Build the env passed to the spawned agent: allowlist only, see {@link ENV_ALLOW_EXACT}. */
 export function scrubbedAgentEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(source)) {
     if (v === undefined) continue;
     if (ENV_ALLOW_EXACT.has(k) || ENV_ALLOW_PREFIX.some((p) => k.startsWith(p))) {
-      out[k] = v;
+      out[k] = k === "PATH" ? scrubAgentPath(v) : v;
     }
   }
   return out;
+}
+
+/**
+ * True when a candidate agent binary is Google Antigravity (or lives under its
+ * install tree). Chong must never bind that CLI: it accepts neither Cursor's
+ * `--model auto --trust --force` flags nor our prompts, and a partial uninstall
+ * still leaves `~/.antigravity` / Application Support crumbs on PATH.
+ */
+export function isForbiddenAgentBin(bin: string): boolean {
+  const candidates = [bin];
+  try {
+    candidates.push(realpathSync(bin));
+  } catch {
+    /* dangling symlink — still judge from the unresolved path */
+  }
+  for (const path of candidates) {
+    const lower = path.toLowerCase();
+    if (lower.includes("antigravity")) return true;
+    const base = lower.split("/").pop() ?? "";
+    if (base === "agy" || base === "antigravity") return true;
+  }
+  return false;
 }
 
 // ── untrusted-content fencing ────────────────────────────────────────────────
@@ -117,9 +159,20 @@ export function fenceUntrustedText(label: string, text: string): string {
 /** Resolve the preferred agent CLI, or null if none on PATH. */
 export function findAgent(): FoundAgent | null {
   const mcpify = Bun.which("mcpify-agent");
-  if (mcpify) return { bin: mcpify, kind: "mcpify-agent" };
-  const cursor = Bun.which("agent") ?? Bun.which("cursor-agent");
-  if (cursor) return { bin: cursor, kind: "cursor-agent" };
+  if (mcpify && !isForbiddenAgentBin(mcpify)) {
+    return { bin: mcpify, kind: "mcpify-agent" };
+  }
+  // Prefer the unambiguous Cursor binary over bare `agent`. Antigravity also
+  // shipped an `agent` on PATH; binding it as cursor-agent silently mis-routed
+  // cherry-pick / i18n / lint resolves and could leave MCP grandchildren behind.
+  const cursorNamed = Bun.which("cursor-agent");
+  if (cursorNamed && !isForbiddenAgentBin(cursorNamed)) {
+    return { bin: cursorNamed, kind: "cursor-agent" };
+  }
+  const agent = Bun.which("agent");
+  if (agent && !isForbiddenAgentBin(agent)) {
+    return { bin: agent, kind: "cursor-agent" };
+  }
   return null;
 }
 

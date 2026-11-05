@@ -680,7 +680,9 @@ export type ReconcileResult = {
   /**
    * Local SHAs that must not be auto-injected again until the local tip moves.
    * Set when a cherry-pick would re-apply a *different* patch (partial apply) —
-   * re-trying those forever is what flooded origin/main with duplicate HTML hunks.
+   * re-trying those forever is what flooded origin/main with duplicate HTML hunks —
+   * and when a conflict / agent resolve fails (without this, the 15s poll re-spawns
+   * gate+edit forever on the same SHA, orphaning MCP children each attempt).
    */
   blockShas?: string[];
 };
@@ -874,11 +876,18 @@ export async function reconcileLocalMain(
         await repo.abortInProgress(shadow.shadowPath);
         await git(["reset", "--hard", originRef], shadow.shadowPath);
         await git(["clean", "-fd"], shadow.shadowPath);
+        // Block this SHA (and any not-yet-tried later ones in the batch) until the
+        // local tip moves. Without blockShas the next poll retries the same conflict
+        // immediately — including a full agent gate+edit — with no backoff.
+        const conflictIdx = toInject.indexOf(sha);
+        const blocked =
+          conflictIdx >= 0 ? toInject.slice(conflictIdx) : [sha];
         return tip({
           action: "conflict",
           count: toInject.length,
           pushed: false,
           message: `cherry-pick ${sha.slice(0, 7)} conflicted — left origin/${branch} untouched${agentNote}`,
+          blockShas: blocked,
         });
       }
 
