@@ -36,6 +36,7 @@ import {
   acquireDeployClaim,
   formatClaimHolder,
   heartbeatDeployClaim,
+  isClaimStale,
   readDeployClaim,
   releaseDeployClaim,
   writeS3ShaMarkerVerified,
@@ -809,6 +810,96 @@ async function confirmClaimBeforeUpload(
   };
 }
 
+/**
+ * What {@link verifyBeforeUpload} needs from the outside world, injected so the rules can be
+ * tested without S3 or git.
+ */
+export type PreUploadDeps = {
+  /** Current claim in the marker bucket (null = none / no bucket). */
+  readClaim: () => Promise<DeployClaim | null>;
+  /** `git fetch` the main branch, then its remote tip. Null when origin is not checked. */
+  fetchRemoteTip: (() => Promise<{ sha: string } | { error: string }>) | null;
+  /** Live deployed commit right now (S3 marker / local tracker). */
+  readLiveCommit: () => Promise<string | null>;
+  now?: () => number;
+};
+
+/**
+ * Last check before the deploy command runs. A deploy can sit a long time between deciding
+ * what to ship and shipping it (debounce, claim wait, lint gate with an agent fix, a laptop
+ * lid closed half-way). On 2026-11-06 a watch on another machine deployed a commit that
+ * origin had already replaced, overwriting a newer stage. So, immediately before the
+ * upload, all three must still hold:
+ *   1. the claim is still exactly the one we wrote (same process id AND same sha) and has
+ *      not gone stale (a stale claim means we were asleep long enough for others to take it);
+ *   2. origin's main, freshly fetched, still points at the sha we are about to ship
+ *      (stage only; prod ships an explicitly chosen sha);
+ *   3. nobody deployed in the meantime (the live commit is what it was when we started).
+ * Any failure defers; the next tick starts over from the fresh state. A failed fetch also
+ * defers: shipping without knowing where origin is was the failure mode.
+ */
+export async function verifyBeforeUpload(
+  input: {
+    target: "stage" | "prod";
+    sha: string;
+    claim: DeployClaim | null;
+    liveAtStart: string | null;
+    force?: boolean;
+    remoteRef?: string;
+  },
+  deps: PreUploadDeps,
+): Promise<StageDeployResult | null> {
+  const { target, claim, force } = input;
+  const sha = input.sha.toLowerCase();
+  const short = (x: string) => x.slice(0, 7);
+  const deferred = (
+    message: string,
+    extra: Partial<StageDeployResult> = {},
+  ): StageDeployResult => ({
+    action: "deferred",
+    message: `${target} deploy deferred before upload — ${message}`,
+    sha,
+    ...extra,
+  });
+
+  if (claim && !force) {
+    const current = await deps.readClaim();
+    if (!current) return deferred("claim cleared by another writer");
+    if (current.id !== claim.id) {
+      return deferred(`claim now held by ${formatClaimHolder(current)}`, { claim: current });
+    }
+    if (current.sha !== claim.sha || current.sha !== sha) {
+      return deferred(`claim is for ${short(current.sha)}, not ${short(sha)}`);
+    }
+    if (isClaimStale(current, deps.now?.() ?? Date.now())) {
+      return deferred("our claim went stale (machine asleep?); starting over");
+    }
+  }
+
+  if (deps.fetchRemoteTip) {
+    const ref = input.remoteRef ?? "origin/main";
+    const res = await deps.fetchRemoteTip();
+    if ("error" in res)
+      return deferred(`could not fetch ${ref} to confirm the tip (${res.error.slice(0, 120)})`);
+    const now = res.sha.toLowerCase();
+    if (!now) return deferred(`could not resolve ${ref} after fetch`);
+    if (now !== sha) {
+      return deferred(
+        `${ref} moved to ${short(now)} since this deploy picked ${short(sha)}; the next tick ships the new tip`,
+      );
+    }
+  }
+
+  const liveNow = (await deps.readLiveCommit())?.toLowerCase() ?? null;
+  const liveStart = input.liveAtStart?.toLowerCase() ?? null;
+  if (liveNow !== liveStart && liveNow !== sha) {
+    return deferred(
+      `${target} changed to ${liveNow ? short(liveNow) : "(none)"} while this deploy was preparing`,
+    );
+  }
+  return null;
+}
+
 export async function readS3DeployedSha(bucket: string): Promise<string | null> {
   return readS3ShaMarker(bucket, DEPLOYED_SHA_KEY);
 }
@@ -1395,8 +1486,15 @@ export async function runLocalProdDeploy(
     }
     stopWorktreeTouch = startDeployWorktreeTouch(shadow.shadowPath, opts.processId);
 
-    const lost2 = await confirmClaimBeforeUpload(markerBucket, heldClaim, sha, "prod", force);
-    if (lost2) return lost2;
+    const stale = await verifyBeforeUpload(
+      { target: "prod", sha, claim: heldClaim, liveAtStart: live.commit, force },
+      {
+        readClaim: () => (markerBucket ? readDeployClaim(markerBucket) : Promise.resolve(null)),
+        fetchRemoteTip: null,
+        readLiveCommit: async () => (await resolveLiveProdTip(repoPath)).commit,
+      },
+    );
+    if (stale && !force) return stale;
 
     note(`deploy prod: running ${deployCmd}…`);
     const run = await runDeployCommand(shadow.shadowPath, deployCmd, deployHistoryPath(repoPath), {
@@ -1607,8 +1705,26 @@ export async function runLocalStageDeploy(
 
     const shadow = { shadowPath: deploy.shadowPath as string };
 
-    const lost = await confirmClaimBeforeUpload(markerBucket, heldClaim, tip, "stage", false);
-    if (lost) return lost;
+    note(`deploy stage: confirming claim, ${remote}/${mainBranch} and live stage before upload…`);
+    const stale = await verifyBeforeUpload(
+      {
+        target: "stage",
+        sha: tip,
+        claim: heldClaim,
+        liveAtStart: already,
+        remoteRef: `${remote}/${mainBranch}`,
+      },
+      {
+        readClaim: () => (markerBucket ? readDeployClaim(markerBucket) : Promise.resolve(null)),
+        fetchRemoteTip: async () => {
+          const err = await repo.fetch(repoPath, remote, [mainBranch]);
+          if (err) return { error: err };
+          return { sha: await repo.tip(repoPath, remote, mainBranch) };
+        },
+        readLiveCommit: async () => (await resolveLiveStageTip(repoPath, stageBranch)).commit,
+      },
+    );
+    if (stale) return stale;
 
     note(`deploy stage: running ${deployCmd}…`);
     const run = await runDeployCommand(shadow.shadowPath, deployCmd, deployHistoryPath(repoPath), {
