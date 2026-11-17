@@ -49,6 +49,7 @@ export async function cmdWatch(argv: string[]): Promise<void> {
   const agent = flags["no-agent"] !== true;
   const importScan = flags["no-import-scan"] !== true && profile.supports.importScan;
   const autoMaintain = flags["no-auto-maintain"] !== true;
+  const autoRebase = flags["no-auto-rebase"] !== true;
   // Master switch for reconcileLocalMain's auto-push (fast-forward + diverged
   // cherry-pick paths) — see the doc comment on ReconcileOpts.autoInject in checks.ts.
   const autoInject = flags["no-auto-inject"] !== true;
@@ -95,6 +96,7 @@ export async function cmdWatch(argv: string[]): Promise<void> {
     i18nScan,
     agent,
     autoMaintain,
+    autoRebase,
     autoDeployStage: effectiveAutoDeploy,
     deployCooldownSec,
     stageDeployCmd,

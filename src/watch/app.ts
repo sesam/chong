@@ -932,15 +932,30 @@ export async function runWatch(
     // catches up to origin), so they don't repeat; blocked branches would re-report
     // every poll, so warn once per target sha.
     for (const s of synced) {
-      if (s.ok) {
+      if (s.ok && s.rewritten) {
+        // Rebased SHAs are the same commits: carry over "already checked" / "new" marks
+        // so a rebase does not re-run post-commit checks on them.
+        for (const [from, to] of s.rewritten) {
+          if (checkedShas.has(from)) checkedShas.add(to);
+          if (localBaseline?.has(from)) localBaseline.add(to);
+          if (ui.newLocalShas.has(from)) ui.newLocalShas.add(to);
+        }
+        addNotice(
+          c.green(
+            `⇡ ${s.branch}: rebased ${s.rewritten.length} local commit(s) onto ${s.behind} from origin → ${s.toShort}`,
+          ),
+        );
+      } else if (s.ok) {
         addNotice(c.green(`⇡ ${s.branch}: fast-forwarded ${s.behind} commit(s) → ${s.toShort}`));
       } else if (s.blocked) {
-        const key = `${s.branch}@${s.originSha}`;
+        const key = `${s.branch}@${s.originSha}@${s.localSha ?? ""}`;
         if (!warnedBlocks.has(key)) {
           warnedBlocks.add(key);
           addNotice(
             c.yellow(
-              `⚠ ${s.branch}: ${s.behind} behind origin — local changes block auto fast-forward`,
+              s.localSha
+                ? `⚠ ${s.branch}: ${s.behind} behind origin — not auto-rebased: ${s.reason}`
+                : `⚠ ${s.branch}: ${s.behind} behind origin — local changes block auto fast-forward`,
             ),
           );
         }

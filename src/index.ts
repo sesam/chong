@@ -43,9 +43,11 @@ const HELP = `chong — ship change-lists to the company git backend
                                         Default: agent Auto conflicts/i18n, auto-maintain
                                         on start / every 20 commits / 2h, auto-inject local
                                         main commits onto origin (30s grace window before
-                                        push, to allow a commit --amend), and (FRONTEND)
+                                        push, to allow a commit --amend), auto fast-forward /
+                                        rebase of local main onto origin when clean, and (FRONTEND)
                                         local stage deploy after 60s quiet on origin/main
                                         (--no-agent, --no-auto-maintain, --no-auto-inject,
+                                         --no-auto-rebase,
                                          --no-auto-deploy-stage, --deploy-cooldown <s>,
                                          --no-import-scan)
   chong shadow-work [<path>] [--remote <r>] [--format-cmd <cmd>]

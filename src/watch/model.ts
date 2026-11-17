@@ -1,5 +1,6 @@
 import { appendDeployHistory } from "./deploy-history";
 import { checkState, mergeBranches, parseGitHubSlug } from "./gh";
+import { syncHeadBranch } from "./local-rebase";
 import { repo } from "./repo";
 import type { Gap, Lane, Pipeline } from "./types";
 
@@ -57,6 +58,11 @@ export type WatchConfig = {
   /** Auto-run commit-producing maintain on start / every N commits / every 2h (default true). */
   autoMaintain: boolean;
   /**
+   * Keep the local head-lane branch (and its working tree) on top of origin: fast-forward
+   * when behind, rebase local-only commits when diverged — only when clean (default true).
+   */
+  autoRebase: boolean;
+  /**
    * Local stage deploy with cooldown (default true when scripts/deploy-frontend.sh exists).
    * Does NOT git-push the stage branch — builds+uploads to app-ci from origin/main.
    */
@@ -93,6 +99,9 @@ export type LocalSync = {
   ok: boolean; // the local ref was fast-forwarded
   blocked: boolean; // a fast-forward was possible but local changes prevented it
   reason?: string; // detail when blocked / failed
+  localSha?: string; // head lane only: the local tip the sync started from
+  /** Head lane only, set when it was rebased: [old, new] sha per replayed local commit. */
+  rewritten?: Array<[string, string]>;
 };
 
 /**
@@ -105,7 +114,7 @@ export type LocalSync = {
  *    or it is checked out but the worktree changes don't conflict with the incoming
  *    files (git's `--ff-only` merge fast-forwards, or aborts harmlessly if they do).
  *
- * The head lane (the branch you actively develop on) is intentionally left alone.
+ * The head lane (the branch you actively develop on) is handled by `syncHeadBranch`.
  * Assumes refs were just fetched. Never rewrites history and never discards work.
  */
 export async function syncLocalBranches(cfg: WatchConfig): Promise<LocalSync[]> {
@@ -161,6 +170,13 @@ export async function computePipeline(
   // Keep local downstream refs (stage/prod) in step with origin when it's safe.
   // Done before reading branch state so the pipeline reflects the post-sync refs.
   const synced = fetchErr ? [] : await syncLocalBranches(cfg);
+  // Then the head lane: fast-forward / rebase local `main` (and its working tree) onto
+  // origin when that is clean. Before the inject below it in the poll, so a diverged
+  // local branch normally becomes a plain linear push instead of a shadow cherry-pick.
+  if (!fetchErr && cfg.autoRebase) {
+    const head = await syncHeadBranch(repoPath, remote, branches[0]);
+    if (head) synced.push(head);
+  }
 
   const present = await repo.existingRemoteBranches(repoPath, remote, branches);
   if (present.length === 0) {

@@ -41,6 +41,7 @@ Options:
   --no-import-scan             disable the unresolved-import gate before stage deploy
   --no-agent                   disable mcpify-agent / cursor-agent for conflicts / i18n
   --no-auto-maintain           disable scheduled commit-producing maintain
+  --no-auto-rebase             never fast-forward / rebase the local head branch onto origin
   --no-auto-deploy-stage       disable local app-ci deploy cooldown (FRONTEND)
   --deploy-cooldown <seconds>  quiet window on origin/main before stage deploy (default 60)
   --stage-deploy-cmd <cmd>     override deploy command (default: CI=true FORCE=1 DEPLOY_SKIP_INSTALL=1 DEPLOY_S3_TOOL=aws ./scripts/deploy-frontend.sh ci)
@@ -51,6 +52,8 @@ Options:
 **TUI keys:** `[s]` deploy → app-ci (local) · `[p]` promote → prod · `[↑/↓]` select · `[space]` queued commits · `[m]` maintenance · `[f]` fetch · `[r]` CI · `[q]` quit
 
 **INCOMING** shows your local branch and remote origin/main commits merged by time. Commits that arrived after `chong watch` started are highlighted green.
+
+**Origin → local sync:** every poll fetches, then brings local `main` (and the working tree it is checked out in) up to `origin/main` when that can be done cleanly — fast-forward when it is only behind, rebase of the local-only commits when it has diverged. The rebase is computed off-tree (`git merge-tree` + `commit-tree`), so a conflict touches nothing; the branch then moves by compare-and-swap and the working tree follows the way `git checkout` would, keeping uncommitted and untracked files. It backs off — one yellow notice, nothing changed — on a replay conflict, a local merge commit, a rebase/merge/cherry-pick in progress, or local changes to a file origin also changed. No stash, no reset. Rebased commits keep their author and committer dates but lose GPG signatures. Disable with `--no-auto-rebase`.
 
 **Local → origin inject:** when local `main` has commits that aren't on `origin/main` (plain push if linear, or cherry-pick onto the clean `main-shadow` worktree when histories have diverged), watch lands them automatically. On cherry-pick conflict, the coding agent (`mcpify-agent` if on PATH, else `cursor-agent --model auto`) is asked for a `VERDICT: SAFE|UNSAFE`; only SAFE runs get an auto-resolve attempt. Failures stay a yellow warning and leave origin untouched.
 
