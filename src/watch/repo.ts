@@ -7,19 +7,31 @@ import type { Commit } from "./types";
 
 type Run = { ok: boolean; out: string; err: string; code: number };
 
+/** A git call that outlives this is hung (network, lock, credential prompt) — kill it. */
+export const GIT_TIMEOUT_MS = 10 * 60 * 1000;
+
 async function git(args: string[], cwd: string, env?: Record<string, string>): Promise<Run> {
   const proc = Bun.spawn(["git", ...args], {
     cwd,
     stdout: "pipe",
     stderr: "pipe",
-    ...(env ? { env: { ...process.env, ...env } } : {}),
+    timeout: GIT_TIMEOUT_MS,
+    // The TUI owns the terminal in raw mode: a credential prompt could never be answered
+    // and would hang the poll loop. Credential helpers still work.
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...env },
   });
   const [out, err] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
   ]);
   const code = await proc.exited;
-  return { ok: code === 0, out: out.trim(), err: err.trim(), code };
+  const timedOut = proc.signalCode !== null && proc.killed;
+  return {
+    ok: code === 0,
+    out: out.trim(),
+    err: timedOut ? `git ${args[0]} timed out` : err.trim(),
+    code,
+  };
 }
 
 /**
@@ -132,8 +144,14 @@ export const repo = {
     return found;
   },
 
+  /**
+   * Sha of `remote/branch`, or "" when it does not resolve. `--verify --quiet` matters:
+   * a plain `rev-parse` echoes the unresolved name on stdout, so a missing ref used to
+   * come back as the literal "origin/main" and sail through every `if (!tip)` check.
+   */
   async tip(cwd: string, remote: string, branch: string): Promise<string> {
-    return (await git(["rev-parse", `${remote}/${branch}`], cwd)).out;
+    const r = await git(["rev-parse", "--verify", "--quiet", `${remote}/${branch}^{commit}`], cwd);
+    return r.ok ? r.out : "";
   },
 
   async commitMeta(cwd: string, ref: string): Promise<Commit | null> {

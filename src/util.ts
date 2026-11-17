@@ -29,15 +29,39 @@ export type Args = {
   flags: Record<string, string | boolean>;
 };
 
+/**
+ * Flags that never take a value. Without this list `--no-agent ~/repo` parsed as
+ * `no-agent = "~/repo"`: the opt-out was silently ignored (callers test `=== true`) and
+ * the path was lost. Every `--no-*` flag is boolean too.
+ */
+const BOOLEAN_FLAGS = new Set([
+  "all",
+  "fix",
+  "force-gate",
+  "h",
+  "help",
+  "json",
+  "latest",
+  "list",
+  "yes",
+]);
+
 export function parseArgs(argv: string[]): Args {
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      if (eq > 2) {
+        flags[a.slice(2, eq)] = a.slice(eq + 1); // --key=value
+        continue;
+      }
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith("--")) {
+      if (key.startsWith("no-") || BOOLEAN_FLAGS.has(key)) {
+        flags[key] = true;
+      } else if (next !== undefined && !next.startsWith("--")) {
         flags[key] = next;
         i++;
       } else {

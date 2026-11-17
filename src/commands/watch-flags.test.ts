@@ -36,3 +36,43 @@ describe("chong watch --no-auto-inject flag", () => {
     expect(both["no-auto-maintain"] !== true).toBe(false);
   });
 });
+
+describe("parseArgs — boolean flags never swallow the next argument", () => {
+  test("an opt-out flag before the repo path keeps both", () => {
+    // Was: flags["no-auto-inject"] === "/some/repo" — opt-out ignored, path lost.
+    const { positional, flags } = parseArgs(["--no-auto-inject", "/some/repo"]);
+    expect(flags["no-auto-inject"]).toBe(true);
+    expect(positional).toEqual(["/some/repo"]);
+  });
+
+  test("every --no-* flag and the known switches are boolean", () => {
+    const { positional, flags } = parseArgs([
+      "--no-agent",
+      "a",
+      "--no-auto-rebase",
+      "b",
+      "--fix",
+      "c",
+      "--yes",
+      "d",
+    ]);
+    expect(flags).toEqual({ "no-agent": true, "no-auto-rebase": true, fix: true, yes: true });
+    expect(positional).toEqual(["a", "b", "c", "d"]);
+  });
+
+  test("value flags still take the next argument, or --key=value", () => {
+    const { positional, flags } = parseArgs([
+      "--interval",
+      "30",
+      "--branches=main,prod",
+      "--stage-deploy-cmd=make deploy ENV=ci",
+      "repo",
+    ]);
+    expect(flags).toEqual({
+      interval: "30",
+      branches: "main,prod",
+      "stage-deploy-cmd": "make deploy ENV=ci",
+    });
+    expect(positional).toEqual(["repo"]);
+  });
+});

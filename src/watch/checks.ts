@@ -24,7 +24,7 @@ import {
   isScannable,
 } from "./i18n-scan";
 import { type LintError, formatLintSummary, lintableChangedFiles, runLint } from "./lint";
-import { repo } from "./repo";
+import { GIT_TIMEOUT_MS, repo } from "./repo";
 import { splitArgv } from "./repo-config";
 import { type RepoSupports, detectRepoProfile } from "./repo-profile";
 import {
@@ -35,18 +35,35 @@ import {
 
 type Run = { ok: boolean; out: string; err: string };
 
-async function spawnCapture(cmd: string[], cwd: string): Promise<Run> {
-  const proc = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "pipe" });
+/**
+ * Ceiling for a tool run (formatter, tests, pnpm). Everything here runs on the watch's
+ * single serialized queue, so one hung child used to stall inject, checks and deploys
+ * for good. Generous on purpose: this is for hangs, not for slow test suites.
+ */
+const TOOL_TIMEOUT_MS = 45 * 60 * 1000;
+
+async function spawnCapture(cmd: string[], cwd: string, timeoutMs = TOOL_TIMEOUT_MS): Promise<Run> {
+  const proc = Bun.spawn(cmd, {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: timeoutMs,
+    // Raw-mode TUI: a git credential prompt can never be answered, only hang.
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+  });
   const [out, err, code] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
+  if (proc.signalCode !== null && proc.killed) {
+    return { ok: false, out, err: `${cmd[0]} timed out after ${Math.round(timeoutMs / 60000)}m` };
+  }
   return { ok: code === 0, out, err };
 }
 
 async function git(args: string[], cwd: string): Promise<Run> {
-  const r = await spawnCapture(["git", ...args], cwd);
+  const r = await spawnCapture(["git", ...args], cwd, GIT_TIMEOUT_MS);
   return { ok: r.ok, out: r.out.trim(), err: r.err.trim() };
 }
 
@@ -56,7 +73,7 @@ async function git(args: string[], cwd: string): Promise<Run> {
  * off the first/last NUL-separated field.
  */
 async function gitZ(args: string[], cwd: string): Promise<Run> {
-  const r = await spawnCapture(["git", ...args], cwd);
+  const r = await spawnCapture(["git", ...args], cwd, GIT_TIMEOUT_MS);
   return { ok: r.ok, out: r.out, err: r.err.trim() };
 }
 
@@ -1134,6 +1151,27 @@ export type FixResult = {
   blocked?: boolean;
 };
 
+/**
+ * Stage `paths` and commit them in the shadow. Returns null on success, else the reason —
+ * and on failure discards the changes, so the next step does not inherit them.
+ *
+ * Callers used to ignore both results. After a failed commit HEAD is still the origin
+ * tip, so the push that followed was a successful no-op and the step reported
+ * "committed & pushed" for a change that never left the shadow.
+ */
+async function commitInShadow(
+  shadowPath: string,
+  paths: string[],
+  subject: string,
+): Promise<string | null> {
+  const add = await git(["add", "--", ...paths], shadowPath);
+  const made = add.ok ? await git(["commit", "-m", subject, "--no-verify"], shadowPath) : add;
+  if (made.ok) return null;
+  await git(["reset", "-q"], shadowPath);
+  await resetShadowDirty(shadowPath);
+  return (made.err || made.out).split("\n").find(Boolean) ?? "git commit failed";
+}
+
 /** Discard uncommitted shadow changes so later auto-fixes start clean. */
 async function resetShadowDirty(shadowPath: string): Promise<void> {
   await git(["checkout", "--", "."], shadowPath);
@@ -1528,13 +1566,16 @@ async function runGenericMaintenance(
     } else if ((await unexpectedUntracked(shadowPath, touched)).length > 0) {
       step("⚠ code style: unexpected untracked file(s) present — not committing");
     } else {
-      await git(["add", "--", ...touched], shadowPath);
-      await git(["commit", "-m", CODE_STYLE_SUBJECT, "--no-verify"], shadowPath);
-      const pr = await git(["push", remote, `HEAD:refs/heads/${branch}`], shadowPath);
+      const commitErr = await commitInShadow(shadowPath, touched, CODE_STYLE_SUBJECT);
+      const pr = commitErr
+        ? null
+        : await git(["push", remote, `HEAD:refs/heads/${branch}`], shadowPath);
       step(
-        pr.ok
-          ? `✓ code style: committed & pushed to ${branch}`
-          : `⚠ code style: committed but push failed (${pr.err})`,
+        !pr
+          ? `⚠ code style: commit failed (${commitErr})`
+          : pr.ok
+            ? `✓ code style: committed & pushed to ${branch}`
+            : `⚠ code style: committed but push failed (${pr.err})`,
       );
     }
   }
@@ -1673,13 +1714,14 @@ export async function runMaintenance(
             .join(", ")}${unexpectedNew.length > 3 ? ", …" : ""})`,
         );
       } else {
-        await git(["add", "--", ...dirty], shadowPath);
-        await git(["commit", "-m", "CLEAN: bump minor deps", "--no-verify"], shadowPath);
-        const pr = await push();
+        const commitErr = await commitInShadow(shadowPath, dirty, "CLEAN: bump minor deps");
+        const pr = commitErr ? null : await push();
         step(
-          pr.ok
-            ? `✓ deps: updated ${updated.length} package(s) → committed & pushed to ${branch}`
-            : `⚠ deps: committed but push failed (${pr.err})`,
+          !pr
+            ? `⚠ deps: commit failed (${commitErr})`
+            : pr.ok
+              ? `✓ deps: updated ${updated.length} package(s) → committed & pushed to ${branch}`
+              : `⚠ deps: committed but push failed (${pr.err})`,
         );
       }
     } else if (updated.length === 0 && skipped.length === 0) {
@@ -1701,13 +1743,14 @@ export async function runMaintenance(
     if (lockDirty.length === 0) {
       step("✓ lockfile: in sync with package.json");
     } else {
-      await git(["add", "--", ...lockDirty], shadowPath);
-      await git(["commit", "-m", "FIX: pnpm lockfile", "--no-verify"], shadowPath);
-      const pr = await push();
+      const commitErr = await commitInShadow(shadowPath, lockDirty, "FIX: pnpm lockfile");
+      const pr = commitErr ? null : await push();
       step(
-        pr.ok
-          ? `✓ lockfile: regenerated → committed & pushed to ${branch}`
-          : `⚠ lockfile: committed but push failed (${pr.err})`,
+        !pr
+          ? `⚠ lockfile: commit failed (${commitErr})`
+          : pr.ok
+            ? `✓ lockfile: regenerated → committed & pushed to ${branch}`
+            : `⚠ lockfile: committed but push failed (${pr.err})`,
       );
     }
   }
@@ -1749,13 +1792,14 @@ export async function runMaintenance(
     } else if ((await unexpectedUntracked(shadowPath, fmtTouched)).length > 0) {
       step("⚠ code style: unexpected untracked file(s) present — not committing");
     } else {
-      await git(["add", "--", ...fmtTouched], shadowPath);
-      await git(["commit", "-m", CODE_STYLE_SUBJECT, "--no-verify"], shadowPath);
-      const pr = await push();
+      const commitErr = await commitInShadow(shadowPath, fmtTouched, CODE_STYLE_SUBJECT);
+      const pr = commitErr ? null : await push();
       step(
-        pr.ok
-          ? `✓ code style: committed & pushed to ${branch}`
-          : `⚠ code style: committed but push failed (${pr.err})`,
+        !pr
+          ? `⚠ code style: commit failed (${commitErr})`
+          : pr.ok
+            ? `✓ code style: committed & pushed to ${branch}`
+            : `⚠ code style: committed but push failed (${pr.err})`,
       );
     }
   }

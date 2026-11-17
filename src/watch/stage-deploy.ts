@@ -911,15 +911,22 @@ export async function readS3DeployedTree(bucket: string): Promise<string | null>
 
 async function readS3ShaMarker(bucket: string, key: string): Promise<string | null> {
   const uri = `s3://${bucket}/${key}`;
-  const proc = Bun.spawn(["aws", "s3", "cp", uri, "-", "--quiet"], {
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...process.env, AWS_PAGER: "" },
-  });
-  const out = (await new Response(proc.stdout).text()).trim();
-  const code = await proc.exited;
-  if (code !== 0) return null;
-  return /^[0-9a-f]{7,40}$/i.test(out) ? out.toLowerCase() : null;
+  // Runs inside every poll: no `aws` on PATH makes Bun.spawn throw, and a stalled
+  // network call would otherwise freeze refresh. Both read as "marker unknown".
+  try {
+    const proc = Bun.spawn(["aws", "s3", "cp", uri, "-", "--quiet"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: 30_000,
+      env: { ...process.env, AWS_PAGER: "" },
+    });
+    const out = (await new Response(proc.stdout).text()).trim();
+    const code = await proc.exited;
+    if (code !== 0) return null;
+    return /^[0-9a-f]{7,40}$/i.test(out) ? out.toLowerCase() : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1240,6 +1247,18 @@ async function lintGate(
       return {
         action: "fixed",
         message: "lint fix pushed to main — redeploy after tip moves",
+        sha: tip,
+      };
+    }
+    // The fix did not land on origin (push or commit failed), so the shadow now holds
+    // changes `tip` does not. Re-linting it would pass and the deploy would build
+    // tip-plus-fix while every marker recorded `tip`. Never deploy a tree that isn't tip.
+    const head = await git(["rev-parse", "HEAD"], shadowPath);
+    const dirty = await git(["status", "--porcelain", "--untracked-files=no"], shadowPath);
+    if (head.out !== tip || dirty.out !== "") {
+      return {
+        action: "blocked",
+        message: `lint fix did not reach ${mainBranch} (${(fix.error ?? "shadow differs from tip").slice(0, 160)}) — not deploying a tree that differs from ${tip.slice(0, 7)}`,
         sha: tip,
       };
     }

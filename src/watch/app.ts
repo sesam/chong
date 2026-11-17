@@ -31,6 +31,7 @@ import {
 } from "./deploy-targets";
 import { type WatchConfig, computePipeline, enrichCI, gapHotkeys, promote } from "./model";
 import { type UIState, render } from "./render";
+import { repo } from "./repo";
 import { detectRepoProfile } from "./repo-profile";
 import {
   defaultProdDeployCmd,
@@ -412,6 +413,10 @@ export async function runWatch(
     }
 
     const reset = pendingStageDeploySha !== mainTip;
+    // refresh() calls this on every poll. Re-arming an already-running countdown for the
+    // same tip pushed the deadline out by a full cooldown each time — with a 15s poll and
+    // a 60s cooldown it never elapsed, so the auto-deploy never fired.
+    if (!reset && stageDeployAt !== null) return;
     pendingStageDeploySha = mainTip;
     stageDeployAt = Date.now() + cfg.deployCooldownSec * 1000;
     syncStageDeployUi();
@@ -578,7 +583,7 @@ export async function runWatch(
           repoPath,
           remote,
           headBranch,
-          injectOpts(pipeline.localCommits[0]?.sha),
+          injectOpts(await repo.localSha(repoPath, headBranch)),
         );
         if (injected.action !== "noop") {
           noteInjectBlocks(injected);
@@ -847,7 +852,11 @@ export async function runWatch(
     const run = async (): Promise<void> => {
       try {
         if (!pipeline) return;
-        const headTip = pipeline.localCommits[0]?.sha ?? null;
+        // The head lane's own local tip — not `localCommits[0]`, which is whatever branch
+        // is checked out. On a feature branch that never matched the tip the blocklist is
+        // keyed on, so it was wiped before every pass and a conflicting commit re-ran the
+        // cherry-pick + agent every poll.
+        const headTip = await repo.localSha(pipeline.repoPath, headBranch);
         const res = await reconcileLocalMain(
           pipeline.repoPath,
           pipeline.remote,
@@ -867,6 +876,9 @@ export async function runWatch(
           void refresh();
           // cooldown armed from refresh once main tip is visible
         }
+      } catch (e) {
+        addNotice(c.red(`✗ inject crashed: ${e instanceof Error ? e.message : String(e)}`));
+        paint();
       } finally {
         reconciling = false;
       }
@@ -877,6 +889,22 @@ export async function runWatch(
   async function refresh(): Promise<void> {
     if (refreshing) return;
     refreshing = true;
+    // try/finally: a throw mid-refresh used to leave `refreshing` set, so no poll ever
+    // ran again and the screen froze on stale data.
+    try {
+      await refreshOnce();
+    } catch (e) {
+      ui.status = c.red(`✗ refresh failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      ui.busy = false;
+      refreshing = false;
+      paint();
+    }
+    // Queue a local→origin inject if needed (runs after any in-flight shadow work).
+    if (pipeline) maybeReconcileLocalMain();
+  }
+
+  async function refreshOnce(): Promise<void> {
     ui.busy = true;
     paint();
 
@@ -1017,14 +1045,6 @@ export async function runWatch(
     } else {
       ui.status = c.red(`✗ ${error ?? "could not read pipeline"}`);
     }
-    ui.busy = false;
-    refreshing = false;
-    paint();
-
-    // Queue a local→origin inject if needed (runs after any in-flight shadow work).
-    if (pipeline) {
-      maybeReconcileLocalMain();
-    }
   }
 
   /** True when the pending confirmation is a prod gap that can ship locally as well as remotely. */
@@ -1043,8 +1063,28 @@ export async function runWatch(
     idx: number,
     mode: "remote" | "local" | "force" = "remote",
   ): Promise<void> {
+    // Called as `void doPromote(…)` from the key handler: an escaped rejection would hit
+    // the crash net and take the whole watch down mid-promote.
+    try {
+      await promoteGap(idx, mode);
+    } catch (e) {
+      prodDeployLive = null;
+      prodDeploying = false;
+      ui.busy = false;
+      const msg = e instanceof Error ? e.message : String(e);
+      ui.status = c.red(`✗ promote crashed: ${msg}`);
+      addNotice(ui.status);
+      paint();
+    }
+  }
+
+  /** One local prod deploy at a time from this process (the soft claim cannot tell). */
+  let prodDeploying = false;
+
+  async function promoteGap(idx: number, mode: "remote" | "local" | "force"): Promise<void> {
     if (!pipeline) return;
     const gap = pipeline.gaps[idx];
+    if (!gap) return;
     ui.confirm = null;
 
     if ((mode === "local" || mode === "force") && gap.to === "prod" && prodDeployCmd) {
@@ -1063,23 +1103,45 @@ export async function runWatch(
         paint();
         return;
       }
+      // Our own claim id counts as acquirable, so a second keypress used to start a
+      // second build in the same prod-deploy shadow, resetting it under the first.
+      if (prodDeploying) {
+        ui.status = c.yellow("⏳ a prod deploy from this watch is already running");
+        paint();
+        return;
+      }
+      // Diverged: prod carries commits the stage tip lacks (e.g. a hotfix). The remote
+      // route asks for explicit merge consent; uploading stage over it must too.
+      if (!gap.ff && mode !== "force") {
+        ui.status = c.yellow(
+          `⚠ prod has ${gap.behind} commit(s) ${gap.from} lacks — a local deploy would replace them. [p] then [f] to force`,
+        );
+        paint();
+        return;
+      }
+      prodDeploying = true;
       ui.busy = true;
       const prodBase = `deploying ${stageTip.slice(0, 7)} → PRODUCTION (local${mode === "force" ? ", forced" : ""})…`;
       prodDeployLive = { base: prodBase, detail: "starting", stepAt: Date.now() };
       paint();
-      const res = await runLocalProdDeploy(cfg.repoPath, gap.to, stageTip, prodDeployCmd, {
-        force: mode === "force",
-        processId,
-        onProgress: (m) => {
-          const step = shortDeployStep(m);
-          if (prodDeployLive && step && step !== prodDeployLive.detail) {
-            prodDeployLive = { ...prodDeployLive, detail: step, stepAt: Date.now() };
-          }
-          addNotice(c.dim(m));
-          paint();
-        },
-      });
-      prodDeployLive = null;
+      let res: Awaited<ReturnType<typeof runLocalProdDeploy>>;
+      try {
+        res = await runLocalProdDeploy(cfg.repoPath, gap.to, stageTip, prodDeployCmd, {
+          force: mode === "force",
+          processId,
+          onProgress: (m) => {
+            const step = shortDeployStep(m);
+            if (prodDeployLive && step && step !== prodDeployLive.detail) {
+              prodDeployLive = { ...prodDeployLive, detail: step, stepAt: Date.now() };
+            }
+            addNotice(c.dim(m));
+            paint();
+          },
+        });
+      } finally {
+        prodDeploying = false;
+        prodDeployLive = null;
+      }
       if (res.action === "deferred" && res.claim) {
         remoteProdClaim = res.claim;
         ui.status = c.yellow(`⏳ ${res.message} — [f] to force`);
@@ -1151,7 +1213,7 @@ export async function runWatch(
           repoPath,
           remote,
           headBranch,
-          injectOpts(pipeline.localCommits[0]?.sha),
+          injectOpts(await repo.localSha(repoPath, headBranch)),
         );
         if (injected.action !== "noop") {
           noteInjectBlocks(injected);
@@ -1342,8 +1404,12 @@ export async function runWatch(
     if (!t) return;
     autoTargetTried.add(`${t.name}@${tip}`);
     const run = async () => {
-      const st = await targetStatus(cfg.repoPath, t, tip);
-      if (st.stale && !st.claim) await deployTarget(t, "auto");
+      try {
+        const st = await targetStatus(cfg.repoPath, t, tip);
+        if (st.stale && !st.claim) await deployTarget(t, "auto");
+      } catch (e) {
+        addNotice(c.red(`✗ ${t.name} auto-deploy: ${e instanceof Error ? e.message : String(e)}`));
+      }
     };
     checkQueue = checkQueue.then(run, run);
   }
@@ -1355,7 +1421,10 @@ export async function runWatch(
       if (s === "y") {
         const t = deployTargets[tp.sel];
         ui.targetPicker = null;
-        if (t) checkQueue = checkQueue.then(() => deployTarget(t, "manual"));
+        if (t) {
+          const run = () => deployTarget(t, "manual");
+          checkQueue = checkQueue.then(run, run); // run even if the previous item rejected
+        }
       } else if (s === "n" || s === "\x1b") tp.confirm = null;
       paint();
       return;

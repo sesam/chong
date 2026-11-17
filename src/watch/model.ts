@@ -307,12 +307,13 @@ export async function promote(
       return `${gap.from} → ${gap.to} is not a fast-forward (${gap.to} has ${gap.behind} commit(s) ${gap.from} lacks) — reconcile first, or confirm a merge`;
     }
     if (!gap.ff && allowMerge) {
-      // Merge API needs branch names; fall back to pushing main tip if stage tip === main.
-      const mainLane = pipeline.lanes.find((l) => l.name === "main");
-      if (pipeline.ghRepo && mainLane) {
-        return mergeBranches(pipeline.ghRepo, gap.to, "main", pipeline.repoPath);
-      }
-      return "diverged prod promote needs a GitHub remote";
+      // Merge exactly the deployed stage tip (GitHub's merge API takes a commit sha as
+      // `head`). This used to merge the `main` branch, which shipped every commit on
+      // main to prod — including ones never deployed to stage.
+      if (!pipeline.ghRepo) return "diverged prod promote needs a GitHub remote";
+      const mergeErr = await mergeBranches(pipeline.ghRepo, gap.to, sha, pipeline.repoPath);
+      if (!mergeErr) await recordProdPromote(pipeline.repoPath, sha);
+      return mergeErr;
     }
     const pushErr = await repo.pushSha(pipeline.repoPath, pipeline.remote, "prod", sha);
     if (!pushErr) await recordProdPromote(pipeline.repoPath, sha);
