@@ -39,6 +39,7 @@ const BOOLEAN_FLAGS = new Set([
   "fix",
   "force-gate",
   "h",
+  "headless",
   "help",
   "json",
   "latest",

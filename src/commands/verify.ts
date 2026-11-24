@@ -3,6 +3,7 @@ import { repo } from "../watch/repo";
 import type { RepoCheckPhase } from "../watch/repo-config";
 import { detectRepoProfile } from "../watch/repo-profile";
 import { type CheckResult, anyFailed, runChecks } from "../watch/run-checks";
+import { akkChangedFiles, detectVcs } from "../watch/vcs";
 
 async function gitLines(cwd: string, args: string[]): Promise<string[]> {
   const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -37,8 +38,16 @@ export function printResults(results: CheckResult[]): void {
 export async function cmdVerify(argv: string[]): Promise<void> {
   const { positional, flags } = parseArgs(argv);
   const cwd = positional[0] ?? process.cwd();
-  if (!(await repo.isGitRepo(cwd))) throw new Error(`${cwd} is not a git repository`);
-  const repoPath = await repo.topLevel(cwd);
+  const vcs = detectVcs(cwd);
+  let repoPath: string;
+  let isAkk = false;
+  if (vcs?.kind === "akk") {
+    repoPath = vcs.root;
+    isAkk = true;
+  } else {
+    if (!(await repo.isGitRepo(cwd))) throw new Error(`${cwd} is not a git or akk repository`);
+    repoPath = await repo.topLevel(cwd);
+  }
 
   const phaseFlag = typeof flags.phase === "string" ? flags.phase : "commit";
   if (phaseFlag !== "commit" && phaseFlag !== "deploy") {
@@ -47,7 +56,11 @@ export async function cmdVerify(argv: string[]): Promise<void> {
   const phase: RepoCheckPhase = phaseFlag;
   const profile = detectRepoProfile(repoPath);
   const all = flags.all === true || phase === "deploy";
-  const files = all ? undefined : await changedFiles(repoPath);
+  const files = all
+    ? undefined
+    : isAkk
+      ? await akkChangedFiles(repoPath)
+      : await changedFiles(repoPath);
 
   const results = await runChecks(repoPath, profile.checks, {
     files,

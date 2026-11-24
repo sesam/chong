@@ -1,6 +1,9 @@
 import path from "node:path";
 import { type RepoCheck, type RepoCheckPhase, filterByGlobs, splitArgv } from "./repo-config";
 import { checksForPhase } from "./repo-profile";
+import { readStreamCapped } from "./runtime";
+
+const CHECK_TIMEOUT_MS = 10 * 60 * 1_000;
 
 export type CheckResult = {
   name: string;
@@ -33,13 +36,20 @@ async function run(
       cwd,
       stdout: "pipe",
       stderr: "pipe",
-      ...(env ? { env: { ...process.env, ...env } } : {}),
+      timeout: CHECK_TIMEOUT_MS,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...env },
     });
     const [out, err, code] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
+      readStreamCapped(proc.stdout, 256 * 1024),
+      readStreamCapped(proc.stderr, 256 * 1024),
       proc.exited,
     ]);
+    if (proc.signalCode !== null && proc.killed) {
+      return {
+        ok: false,
+        text: `${argv[0]} timed out after ${Math.round(CHECK_TIMEOUT_MS / 60000)}m`,
+      };
+    }
     return { ok: code === 0, text: `${out}${err}`.trim() };
   } catch (e) {
     return { ok: false, text: e instanceof Error ? e.message : String(e) };

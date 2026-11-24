@@ -1,22 +1,55 @@
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import type { LocalSync } from "./model";
-import { repo } from "./repo";
+import { GIT_TIMEOUT_MS, repo } from "./repo";
 
 type Run = { ok: boolean; out: string; err: string };
 
-async function git(args: string[], cwd: string, env?: Record<string, string>): Promise<Run> {
+async function git(
+  args: string[],
+  cwd: string,
+  env?: Record<string, string>,
+  stdin?: Blob,
+): Promise<Run> {
   const proc = Bun.spawn(["git", ...args], {
     cwd,
     stdout: "pipe",
     stderr: "pipe",
-    ...(env ? { env: { ...process.env, ...env } } : {}),
+    ...(stdin ? { stdin } : {}),
+    timeout: GIT_TIMEOUT_MS,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...env },
   });
-  const [out, err] = await Promise.all([
+  const [out, err, code] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
+    proc.exited,
   ]);
-  return { ok: (await proc.exited) === 0, out: out.trim(), err: err.trim() };
+  const timedOut = proc.signalCode !== null && proc.killed;
+  return {
+    ok: code === 0,
+    out: out.trim(),
+    err: timedOut ? `git ${args[0]} timed out` : err.trim(),
+  };
+}
+
+/** Like `git()` but preserves exact stdout bytes (needed for binary diffs / commit messages). */
+async function gitRaw(args: string[], cwd: string, env?: Record<string, string>): Promise<Run> {
+  const proc = Bun.spawn(["git", ...args], {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: GIT_TIMEOUT_MS,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...env },
+  });
+  const [out, err, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { ok: code === 0, out, err: err.trim() };
 }
 
 const firstLine = (s: string, fallback: string): string =>
@@ -39,22 +72,88 @@ const IN_PROGRESS = [
 ];
 
 async function operationInProgress(cwd: string): Promise<boolean> {
+  // Single `git rev-parse --git-dir` instead of 6 sequential `--git-path` spawns.
+  const r = await git(["rev-parse", "--git-dir"], cwd);
+  if (!r.ok || !r.out) return false;
+  const gitDir = path.isAbsolute(r.out) ? r.out : path.join(cwd, r.out);
   for (const name of IN_PROGRESS) {
-    const r = await git(["rev-parse", "--git-path", name], cwd);
-    if (!r.ok || !r.out) continue;
-    if (existsSync(path.isAbsolute(r.out) ? r.out : path.join(cwd, r.out))) return true;
+    if (existsSync(path.join(gitDir, name))) return true;
   }
   return false;
+}
+
+/** Cached capability probe: `git merge-tree --merge-base=...` requires Git >= 2.40. */
+let supportsMergeTreeBase: boolean | null = null;
+
+/**
+ * Off-tree 3-way replay of commit `sha` (relative to `sha^`) onto `tip`.
+ * Uses `git merge-tree --write-tree --merge-base=<sha>^` on Git >= 2.40, and falls back to
+ * a throwaway private `GIT_INDEX_FILE` + `git apply --cached --3way` + `git write-tree` on
+ * older Git (e.g. Debian 12's Git 2.39) without touching the working tree or shared index.
+ */
+async function mergeTreeReplay(
+  cwd: string,
+  tip: string,
+  sha: string,
+): Promise<{ tree: string } | { conflict: true } | { error: string }> {
+  if (supportsMergeTreeBase !== false) {
+    const merged = await git(
+      ["merge-tree", "--write-tree", "--no-messages", `--merge-base=${sha}^`, tip, sha],
+      cwd,
+    );
+    const tree = merged.out.split("\n")[0] ?? "";
+    if (merged.ok && /^[0-9a-f]{40,64}$/.test(tree)) {
+      supportsMergeTreeBase = true;
+      return { tree };
+    }
+    if (/unknown option.*merge-base/i.test(merged.err)) {
+      supportsMergeTreeBase = false;
+    } else if (merged.out) {
+      supportsMergeTreeBase = true;
+      return { conflict: true };
+    } else {
+      return { error: firstLine(merged.err, "merge-tree failed") };
+    }
+  }
+
+  // Fallback for Git < 2.40: apply `sha^..sha` into a throwaway private index seeded from `tip`.
+  const diff = await gitRaw(["diff", "--binary", `${sha}^`, sha], cwd);
+  if (!diff.ok) return { error: firstLine(diff.err, "git diff failed") };
+  if (!diff.out) {
+    const tipTree = await repo.treeOf(cwd, tip);
+    return tipTree ? { tree: tipTree } : { error: "could not read tip tree" };
+  }
+
+  const idx = path.join(tmpdir(), `chong-rebase-idx-${randomUUID()}`);
+  const env = { GIT_INDEX_FILE: idx };
+  try {
+    const seed = await git(["read-tree", tip], cwd, env);
+    if (!seed.ok) return { error: firstLine(seed.err, "read-tree failed") };
+    const ap = await git(
+      ["apply", "--cached", "--3way", "--allow-empty"],
+      cwd,
+      env,
+      new Blob([diff.out]),
+    );
+    if (!ap.ok) return { conflict: true };
+    const wt = await git(["write-tree"], cwd, env);
+    if (!wt.ok || !/^[0-9a-f]{40,64}$/.test(wt.out)) {
+      return { error: firstLine(wt.err, "write-tree failed") };
+    }
+    return { tree: wt.out };
+  } finally {
+    await unlink(idx).catch(() => {});
+  }
 }
 
 type Replay = { tip: string; rewritten: Array<[string, string]> } | { error: string };
 
 /**
  * Rebase `head`'s local-only commits onto `onto` WITHOUT touching any working tree or
- * index: each commit is three-way merged in memory (`git merge-tree --write-tree`) and
- * sealed with `commit-tree`. Any conflict returns an error and leaves nothing behind but
- * unreachable objects. Like `git rebase`, commits whose patch is already on `onto` are
- * dropped (by patch-id via `git cherry`, or because the replay comes out empty).
+ * index: each commit is three-way merged in memory and sealed with `commit-tree`. Any
+ * conflict returns an error and leaves nothing behind but unreachable objects. Like
+ * `git rebase`, commits whose patch is already on `onto` are dropped (by patch-id via
+ * `git cherry`, or because the replay comes out empty).
  *
  * Author *and* committer identity/dates are carried over, so the result is a pure
  * function of (onto, head): two watchers replaying the same commits build the same SHAs,
@@ -80,19 +179,10 @@ export async function replayOnto(cwd: string, onto: string, head: string): Promi
   const rewritten: Array<[string, string]> = [];
   for (const sha of picks) {
     const short = sha.slice(0, 7);
-    const merged = await git(
-      ["merge-tree", "--write-tree", "--no-messages", `--merge-base=${sha}^`, tip, sha],
-      cwd,
-    );
-    const tree = merged.out.split("\n")[0] ?? "";
-    if (!merged.ok || !/^[0-9a-f]{40,64}$/.test(tree)) {
-      // Exit 1 with a tree on stdout is a content conflict; anything else is git itself.
-      return {
-        error: merged.out
-          ? `${short} conflicts with origin`
-          : firstLine(merged.err, "merge-tree failed"),
-      };
-    }
+    const merged = await mergeTreeReplay(cwd, tip, sha);
+    if ("conflict" in merged) return { error: `${short} conflicts with origin` };
+    if ("error" in merged) return { error: merged.error };
+    const tree = merged.tree;
     if (tree === (await repo.treeOf(cwd, tip))) continue; // already on origin in another shape
 
     const meta = await git(

@@ -1,11 +1,18 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
   decideAutoApplyUpdate,
+  filterDepsByReleasePolicy,
   isRegistrySigned,
   isVettedForFreshRelease,
   parseTarget,
+  resetDepsMetaCache,
   trustMetaFromManifest,
 } from "./deps-policy";
+
+afterEach(() => {
+  resetDepsMetaCache();
+  (globalThis.fetch as unknown as { mockRestore?: () => void }).mockRestore?.();
+});
 
 describe("parseTarget", () => {
   test("scoped package", () => {
@@ -92,5 +99,31 @@ describe("decideAutoApplyUpdate", () => {
     expect(isRegistrySigned(trust!)).toBe(false);
     const decision = decideAutoApplyUpdate(trust, 5000, policy);
     expect(decision.allow).toBe(false);
+  });
+});
+
+describe("filterDepsByReleasePolicy fetch deduplication", () => {
+  test("fetches registry metadata only once per package instead of twice", async () => {
+    let fetchCount = 0;
+    const oldTime = new Date(Date.now() - 100 * 60 * 60_000).toISOString();
+    spyOn(globalThis, "fetch").mockImplementation((async () => {
+      fetchCount += 1;
+      return new Response(
+        JSON.stringify({
+          versions: { "1.2.3": { dist: { signatures: [{}] } } },
+          time: { "1.2.3": oldTime },
+        }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch);
+
+    const r1 = await filterDepsByReleasePolicy(["example-pkg@1.2.3"], { minimumReleaseAge: 2880 });
+    expect(r1.allowed).toEqual(["example-pkg@1.2.3"]);
+    expect(fetchCount).toBe(1);
+
+    // Second pass hits the in-memory cache (0 additional fetches).
+    const r2 = await filterDepsByReleasePolicy(["example-pkg@1.2.3"], { minimumReleaseAge: 2880 });
+    expect(r2.allowed).toEqual(["example-pkg@1.2.3"]);
+    expect(fetchCount).toBe(1);
   });
 });

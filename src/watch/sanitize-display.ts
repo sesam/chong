@@ -25,12 +25,11 @@
  * categories are in the allowlist, so they never survive regardless of what new escape
  * family shows up next. Do not "optimize" this back into a denylist of bytes to reject.
  */
+const DISALLOWED_DISPLAY_RE = /[^\p{L}\p{N}\p{P}\p{Zs}]+/gu;
+
 export function sanitizeDisplayText(value: string, maxLen: number): string {
-  const normalized = value.normalize("NFC");
-  let out = "";
-  for (const ch of normalized) {
-    if (/^[\p{L}\p{N}\p{P}\p{Zs}]$/u.test(ch)) out += ch;
-  }
+  // Single-pass allowlist filter after NFC normalization: drop anything outside L/N/P/Zs.
+  const out = value.normalize("NFC").replace(DISALLOWED_DISPLAY_RE, "");
   // Trim first so an all-blank/all-stripped field reads as truly empty for the
   // caller's own "unknown" / reject-the-claim fallback, then cap length.
   return out.trim().slice(0, maxLen);

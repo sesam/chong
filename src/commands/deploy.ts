@@ -9,6 +9,7 @@ import {
   targetStatus,
 } from "../watch/deploy-targets";
 import { repo } from "../watch/repo";
+import { detectVcs, readAkkConfig } from "../watch/vcs";
 
 const USAGE =
   "usage: chong deploy <target> [--sha <sha>] [--yes] [--force-gate]\n       chong deploy --list";
@@ -36,9 +37,11 @@ async function confirm(question: string): Promise<boolean> {
  */
 export async function cmdDeploy(argv: string[]): Promise<void> {
   const { positional, flags } = parseArgs(argv);
-  const repoPath = await repo.topLevel(process.cwd());
+  const vcs = detectVcs(process.cwd());
+  const isAkk = vcs?.kind === "akk";
+  const repoPath = isAkk && vcs ? vcs.root : await repo.topLevel(process.cwd());
   const remote = typeof flags.remote === "string" ? flags.remote : "origin";
-  const mainBranch = typeof flags.branch === "string" ? flags.branch : "main";
+  const mainBranch = typeof flags.branch === "string" ? flags.branch : isAkk ? "trunk" : "main";
 
   const { targets, errors } = await resolveDeployTargets(repoPath);
   for (const e of errors) console.error(c.red(`✗ .chong/config.json ${e}`));
@@ -48,12 +51,16 @@ export async function cmdDeploy(argv: string[]): Promise<void> {
   }
 
   // Best effort: the staleness / on-remote checks are only meaningful against a fresh ref.
-  await Bun.spawn(["git", "fetch", remote, mainBranch], { cwd: repoPath, stderr: "pipe" }).exited;
+  if (!isAkk) await repo.fetch(repoPath, remote, [mainBranch]);
 
   const sha =
     typeof flags.sha === "string"
-      ? await revParse(repoPath, flags.sha)
-      : await revParse(repoPath, `${remote}/${mainBranch}`);
+      ? isAkk
+        ? flags.sha
+        : await revParse(repoPath, flags.sha)
+      : isAkk
+        ? (readAkkConfig(repoPath)?.base ?? null)
+        : await revParse(repoPath, `${remote}/${mainBranch}`);
   if (!sha) {
     console.error(c.red("✗ could not resolve the SHA to deploy"));
     process.exit(1);

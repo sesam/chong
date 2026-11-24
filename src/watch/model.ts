@@ -1,8 +1,12 @@
 import { appendDeployHistory } from "./deploy-history";
-import { checkState, mergeBranches, parseGitHubSlug } from "./gh";
+import { checkStatesBatch, mergeBranches, parseGitHubSlug } from "./gh";
 import { syncHeadBranch } from "./local-rebase";
 import { repo } from "./repo";
 import type { Gap, Lane, Pipeline } from "./types";
+import { computeAkkPipeline, detectVcs } from "./vcs";
+
+/** Cache `ghRepo` slug per (repoPath, remote) — remote URLs rarely change mid-watch. */
+const ghRepoCache = new Map<string, string | null>();
 
 /**
  * Log the prod push. chong does not deploy prod — it pushes a SHA onto `prod` and GitHub
@@ -88,6 +92,10 @@ export type WatchConfig = {
    * reachable. Null ⇒ fall back to `origin/prod` (branch-based comparison).
    */
   prodDeployedSha: string | null;
+  /** Run without a TTY / alt-screen TUI (for systemd / always-on VM daemons). */
+  headless?: boolean;
+  /** Override path for the rotating persistent watch log file (empty = default under ~/.chong/logs). */
+  logFile?: string;
 };
 
 /** Outcome of an auto-fast-forward attempt on one local branch ref. */
@@ -120,21 +128,31 @@ export type LocalSync = {
 export async function syncLocalBranches(cfg: WatchConfig): Promise<LocalSync[]> {
   const { repoPath, remote, branches } = cfg;
   const results: LocalSync[] = [];
+  const downstream = branches
+    .slice(1)
+    .filter((branch) => !(cfg.autoDeployStage && branch === "stage"));
+  if (downstream.length === 0) return results;
 
-  for (const branch of branches.slice(1)) {
-    // Local `stage` tracks what chong deployed to app-ci — do not rewind it to origin/stage.
-    if (cfg.autoDeployStage && branch === "stage") continue;
+  // Resolve all local + remote downstream refs in a single git call.
+  const refs = await repo.resolveRefs(repoPath, [
+    ...downstream.map((b) => `refs/heads/${b}`),
+    ...downstream.map((b) => `refs/remotes/${remote}/${b}`),
+  ]);
 
-    const localSha = await repo.localSha(repoPath, branch);
+  for (const branch of downstream) {
+    const localSha = refs.get(`refs/heads/${branch}`) ?? null;
     if (!localSha) continue; // not tracked locally — nothing to fast-forward
 
-    const originSha = await repo.tip(repoPath, remote, branch);
+    const originSha = refs.get(`refs/remotes/${remote}/${branch}`) ?? "";
     if (!originSha || originSha === localSha) continue; // missing or already in sync
 
     // Only fast-forwardable updates: origin must be a strict descendant of local.
     if (!(await repo.isAncestor(repoPath, localSha, originSha))) continue; // diverged
 
-    const behind = await repo.behindCount(repoPath, localSha, originSha);
+    const [behind, worktree] = await Promise.all([
+      repo.behindCount(repoPath, localSha, originSha),
+      repo.worktreeFor(repoPath, branch),
+    ]);
     const base = {
       branch,
       behind,
@@ -142,7 +160,6 @@ export async function syncLocalBranches(cfg: WatchConfig): Promise<LocalSync[]> 
       originSha,
     };
 
-    const worktree = await repo.worktreeFor(repoPath, branch);
     const err =
       worktree === null
         ? await repo.updateLocalRef(repoPath, branch, originSha, localSha)
@@ -163,6 +180,9 @@ export async function computePipeline(
   cfg: WatchConfig,
 ): Promise<{ pipeline: Pipeline | null; error: string | null; synced: LocalSync[] }> {
   const { repoPath, remote, branches } = cfg;
+  if (detectVcs(repoPath)?.kind === "akk") {
+    return computeAkkPipeline(cfg);
+  }
 
   const fetchErr = await repo.fetch(repoPath, remote, branches);
   // A failed fetch isn't fatal — we can still show the last-known local refs.
@@ -178,7 +198,13 @@ export async function computePipeline(
     if (head) synced.push(head);
   }
 
-  const present = await repo.existingRemoteBranches(repoPath, remote, branches);
+  // Resolve every remote branch + local stage ref in one `for-each-ref` subprocess.
+  const refList = [
+    ...branches.map((b) => `refs/remotes/${remote}/${b}`),
+    ...(cfg.autoDeployStage ? ["refs/heads/stage"] : []),
+  ];
+  const resolvedRefs = await repo.resolveRefs(repoPath, refList);
+  const present = branches.filter((b) => resolvedRefs.has(`refs/remotes/${remote}/${b}`));
   if (present.length === 0) {
     return {
       pipeline: null,
@@ -189,61 +215,75 @@ export async function computePipeline(
     };
   }
 
-  const ghRepo = parseGitHubSlug(await repo.remoteUrl(repoPath, remote));
-
-  const lanes: Lane[] = [];
-  for (const name of present) {
-    let tip = await repo.tip(repoPath, remote, name);
-    // Local stage deploy: lane tip prefers the live marker / local tracker, not origin/stage.
-    if (cfg.autoDeployStage && name === "stage") {
-      const localTip = cfg.stageDeployedSha ?? (await repo.localSha(repoPath, "stage")) ?? null;
-      if (localTip) tip = localTip;
-    }
-    // Live prod marker (S3) beats a stale origin/prod when a local/chong deploy shipped
-    // without pushing the git ref.
-    if (name === "prod" && cfg.prodDeployedSha) {
-      tip = cfg.prodDeployedSha;
-    }
-    if (!tip) continue;
-    const commit = await repo.commitMeta(repoPath, tip);
-    lanes.push({ name, tip, short: tip.slice(0, 7), commit, ci: "unknown" });
+  const ghKey = `${repoPath}\0${remote}`;
+  let ghRepo = ghRepoCache.get(ghKey);
+  if (ghRepo === undefined) {
+    ghRepo = parseGitHubSlug(await repo.remoteUrl(repoPath, remote));
+    ghRepoCache.set(ghKey, ghRepo);
   }
 
-  const gaps = [];
-  for (let i = 0; i < lanes.length - 1; i++) {
-    const fromLane = lanes[i];
-    const toLane = lanes[i + 1];
-    const from = fromLane.name;
-    const to = toLane.name;
+  const laneTips = present
+    .map((name) => {
+      let tip = resolvedRefs.get(`refs/remotes/${remote}/${name}`) ?? "";
+      // Local stage deploy: lane tip prefers the live marker / local tracker, not origin/stage.
+      if (cfg.autoDeployStage && name === "stage") {
+        const localTip = cfg.stageDeployedSha ?? resolvedRefs.get("refs/heads/stage") ?? null;
+        if (localTip) tip = localTip;
+      }
+      // Live prod marker (S3) beats a stale origin/prod when a local/chong deploy shipped
+      // without pushing the git ref.
+      if (name === "prod" && cfg.prodDeployedSha) {
+        tip = cfg.prodDeployedSha;
+      }
+      return tip ? { name, tip } : null;
+    })
+    .filter((x): x is { name: string; tip: string } => x !== null);
 
-    let ahead: number;
-    let behind: number;
-    let ff: boolean;
-    let queued: Awaited<ReturnType<typeof repo.logBetween>>;
+  // Fetch lane commit metadata, incoming log, and local branch in parallel.
+  const [lanes, incoming, localBranch] = await Promise.all([
+    Promise.all(
+      laneTips.map(async ({ name, tip }): Promise<Lane> => {
+        const commit = await repo.commitMeta(repoPath, tip);
+        return { name, tip, short: tip.slice(0, 7), commit, ci: "unknown" };
+      }),
+    ),
+    repo.recentLog(repoPath, remote, laneTips[0]?.name ?? present[0], INCOMING_LIMIT),
+    repo.currentBranch(repoPath),
+  ]);
 
-    if (cfg.autoDeployStage && (from === "stage" || to === "stage")) {
-      // Gaps involving the virtual stage tip use raw SHAs.
-      ({ ahead, behind } = await repo.aheadBehindShas(repoPath, fromLane.tip, toLane.tip));
-      ff = await repo.isAncestor(repoPath, toLane.tip, fromLane.tip);
-      queued =
-        ahead > 0 ? await repo.logBetweenShas(repoPath, fromLane.tip, toLane.tip, QUEUE_LIMIT) : [];
-    } else if (cfg.prodDeployedSha && (from === "prod" || to === "prod")) {
-      // Live prod marker tip is a raw SHA, not necessarily origin/prod.
-      ({ ahead, behind } = await repo.aheadBehindShas(repoPath, fromLane.tip, toLane.tip));
-      ff = await repo.isAncestor(repoPath, toLane.tip, fromLane.tip);
-      queued =
-        ahead > 0 ? await repo.logBetweenShas(repoPath, fromLane.tip, toLane.tip, QUEUE_LIMIT) : [];
-    } else {
-      ({ ahead, behind } = await repo.aheadBehind(repoPath, remote, from, to));
-      ff = await repo.isFastForward(repoPath, remote, from, to);
-      queued = ahead > 0 ? await repo.logBetween(repoPath, remote, from, to, QUEUE_LIMIT) : [];
-    }
-    gaps.push({ from, to, ahead, behind, ff, queued });
-  }
+  // Compute all gaps + local commits concurrently.
+  const [gaps, localCommits] = await Promise.all([
+    Promise.all(
+      lanes.slice(0, -1).map(async (fromLane, i): Promise<Gap> => {
+        const toLane = lanes[i + 1];
+        const from = fromLane.name;
+        const to = toLane.name;
 
-  const incoming = await repo.recentLog(repoPath, remote, lanes[0].name, INCOMING_LIMIT);
-  const localBranch = await repo.currentBranch(repoPath);
-  const localCommits = await repo.localRecentLog(repoPath, localBranch, INCOMING_LIMIT);
+        const useRawShas =
+          (cfg.autoDeployStage && (from === "stage" || to === "stage")) ||
+          (Boolean(cfg.prodDeployedSha) && (from === "prod" || to === "prod"));
+
+        const [{ ahead, behind }, ff] = useRawShas
+          ? await Promise.all([
+              repo.aheadBehindShas(repoPath, fromLane.tip, toLane.tip),
+              repo.isAncestor(repoPath, toLane.tip, fromLane.tip),
+            ])
+          : await Promise.all([
+              repo.aheadBehind(repoPath, remote, from, to),
+              repo.isFastForward(repoPath, remote, from, to),
+            ]);
+
+        const queued =
+          ahead > 0
+            ? useRawShas
+              ? await repo.logBetweenShas(repoPath, fromLane.tip, toLane.tip, QUEUE_LIMIT)
+              : await repo.logBetween(repoPath, remote, from, to, QUEUE_LIMIT)
+            : [];
+        return { from, to, ahead, behind, ff, queued };
+      }),
+    ),
+    repo.localRecentLog(repoPath, localBranch, INCOMING_LIMIT),
+  ]);
 
   return {
     pipeline: {
@@ -262,14 +302,21 @@ export async function computePipeline(
   };
 }
 
-/** Fill in CI status for each lane tip via gh. Best-effort; mutates lanes in place. */
-export async function enrichCI(pipeline: Pipeline): Promise<void> {
+/**
+ * Fill in CI status for each lane tip via GitHub API (batched GraphQL / conditional REST
+ * with terminal verdict caching and rate-limit reserve). Best-effort; mutates lanes in place.
+ */
+export async function enrichCI(pipeline: Pipeline, opts: { force?: boolean } = {}): Promise<void> {
   if (!pipeline.ghRepo) return;
-  await Promise.all(
-    pipeline.lanes.map(async (lane) => {
-      lane.ci = await checkState(pipeline.ghRepo as string, lane.tip, pipeline.repoPath);
-    }),
+  const states = await checkStatesBatch(
+    pipeline.ghRepo,
+    pipeline.lanes.map((l) => l.tip),
+    pipeline.repoPath,
+    opts,
   );
+  for (const lane of pipeline.lanes) {
+    lane.ci = states.get(lane.tip) ?? "unknown";
+  }
 }
 
 /**

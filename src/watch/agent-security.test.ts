@@ -1,10 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-  fenceUntrustedText,
-  isForbiddenAgentBin,
-  scrubAgentPath,
-  scrubbedAgentEnv,
-} from "./agent";
+import { fenceUntrustedText, isForbiddenAgentBin, scrubAgentPath, scrubbedAgentEnv } from "./agent";
 
 describe("scrubbedAgentEnv", () => {
   test("drops secret-shaped vars and keeps the essentials", () => {
@@ -68,6 +63,21 @@ describe("scrubbedAgentEnv", () => {
     expect(scrubbed.PATH).toBe("/usr/bin:/Users/me/.local/bin");
     expect(scrubbed.PATH).not.toContain("antigravity");
   });
+
+  test("disables ambient AWS/GH/SSH credential resolution and honors CHONG_AGENT_HOME", () => {
+    const scrubbed = scrubbedAgentEnv({
+      PATH: "/usr/bin",
+      HOME: "/home/dev",
+      CHONG_AGENT_HOME: "/var/lib/chong-agent",
+      SSH_AUTH_SOCK: "/tmp/ssh-agent.sock",
+    });
+    expect(scrubbed.HOME).toBe("/var/lib/chong-agent");
+    expect(scrubbed.AWS_SHARED_CREDENTIALS_FILE).toBe("/dev/null");
+    expect(scrubbed.AWS_CONFIG_FILE).toBe("/dev/null");
+    expect(scrubbed.AWS_EC2_METADATA_DISABLED).toBe("true");
+    expect(scrubbed.GH_CONFIG_DIR).toBe("/dev/null");
+    expect(scrubbed.SSH_AUTH_SOCK).toBe("");
+  });
 });
 
 describe("scrubAgentPath", () => {
@@ -83,9 +93,9 @@ describe("scrubAgentPath", () => {
 describe("isForbiddenAgentBin", () => {
   test("rejects Antigravity install paths and agy basename", () => {
     expect(isForbiddenAgentBin("/Users/me/.antigravity/antigravity/bin/agent")).toBe(true);
-    expect(isForbiddenAgentBin("/Applications/Antigravity.app/Contents/Resources/app/bin/agy")).toBe(
-      true,
-    );
+    expect(
+      isForbiddenAgentBin("/Applications/Antigravity.app/Contents/Resources/app/bin/agy"),
+    ).toBe(true);
     expect(isForbiddenAgentBin("/usr/local/bin/antigravity")).toBe(true);
   });
 

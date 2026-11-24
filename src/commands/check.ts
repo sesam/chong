@@ -3,6 +3,7 @@ import { c, parseArgs } from "../util";
 import { type FileFindings, scanRepoForUntranslated } from "../watch/checks";
 import type { FindingKind, Untranslated } from "../watch/i18n-scan";
 import { repo } from "../watch/repo";
+import { detectVcs } from "../watch/vcs";
 
 const log = (s: string) => process.stdout.write(`${s}\n`);
 
@@ -57,8 +58,14 @@ export async function cmdCheck(argv: string[]): Promise<void> {
   }
 
   const cwd = process.cwd();
-  if (!(await repo.isGitRepo(cwd))) throw new Error(`${cwd} is not a git repository`);
-  const repoPath = await repo.topLevel(cwd);
+  const vcs = detectVcs(cwd);
+  let repoPath: string;
+  if (vcs?.kind === "akk") {
+    repoPath = vcs.root;
+  } else {
+    if (!(await repo.isGitRepo(cwd))) throw new Error(`${cwd} is not a git or akk repository`);
+    repoPath = await repo.topLevel(cwd);
+  }
 
   // A path argument scopes the scan; resolve it to an absolute path so git ls-files
   // (run from the repo root) accepts it regardless of which subdir we're invoked from.

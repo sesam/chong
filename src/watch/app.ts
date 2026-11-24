@@ -7,6 +7,7 @@ import {
   INJECT_GRACE_MS,
   type ShadowInfo,
   checkI18n,
+  commitDiffU0,
   ensureShadow,
   isAutoFix,
   reconcileLocalMain,
@@ -34,6 +35,13 @@ import { type UIState, render } from "./render";
 import { repo } from "./repo";
 import { detectRepoProfile } from "./repo-profile";
 import {
+  BoundedSet,
+  WatchLogger,
+  defaultWatchLogPath,
+  runAllShutdownHooks,
+  runSyncShutdownHooks,
+} from "./runtime";
+import {
   defaultProdDeployCmd,
   formatDeployStepSuffix,
   prodDeployedShaBucket,
@@ -46,6 +54,7 @@ import {
   stageDeployedShaBucket,
 } from "./stage-deploy";
 import type { Pipeline } from "./types";
+import { detectVcs } from "./vcs";
 import {
   WORKTREE_CLAIM_TOUCH_MS,
   type WorktreeClaim,
@@ -73,36 +82,43 @@ export async function runWatch(
   /** Stable for this watch process — deploy claims + worktree ownership share it. */
   const processId = crypto.randomUUID();
   const shadowPath = shadowPathFor(cfg.repoPath);
+  const headless = cfg.headless === true || !process.stdin.isTTY;
+  const isAkkRepo = detectVcs(cfg.repoPath)?.kind === "akk";
+  const logger = new WatchLogger({
+    filePath: cfg.logFile || defaultWatchLogPath(cfg.repoPath),
+    echoStdout: headless,
+  });
 
-  // Crash net: Bun terminates the process on an unhandled rejection or uncaught
-  // exception, and nothing upstream of this process restores the terminal or releases
-  // the worktree claim for us. Without this, any unguarded rejection anywhere (an agent
-  // call, a stray git failure) leaves the alt screen on — the terminal is unusable until
-  // `reset` — and the claim file live for its full 20-minute stale window, blocking every
-  // other watch on this repo. Installed first, before any async work, and superseding
-  // whatever generic handler `src/index.ts` installed for non-watch commands, so exactly
-  // one handler — this one, which knows how to tear down — runs for the rest of the
-  // process's life.
+  // Crash net: release worktree claims, signal active detached deploy/agent groups, and
+  // restore the terminal on any unhandled rejection or uncaught exception.
   let crashHandled = false;
   function crashRecover(reason: unknown, source: string): void {
     if (crashHandled) return; // never double-release / double-restore
     crashHandled = true;
     try {
+      runSyncShutdownHooks();
+    } catch {
+      /* best effort */
+    }
+    try {
       releaseWorktreeClaim(shadowPath, processId);
     } catch {
       /* best-effort — process is going down regardless */
     }
-    try {
-      if (process.stdin.isTTY) process.stdin.setRawMode(false);
-    } catch {
-      /* ignore */
-    }
-    try {
-      process.stdout.write(ALT_OFF);
-    } catch {
-      /* ignore */
+    if (!headless) {
+      try {
+        if (process.stdin.isTTY) process.stdin.setRawMode(false);
+      } catch {
+        /* ignore */
+      }
+      try {
+        process.stdout.write(ALT_OFF);
+      } catch {
+        /* ignore */
+      }
     }
     const msg = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+    logger.log("error", `chong watch crashed (${source}): ${msg}`);
     console.error(`\nchong watch crashed (${source}): ${msg}`);
     process.exit(1);
   }
@@ -114,18 +130,7 @@ export async function runWatch(
   let worktreeOwned = false;
   let foreignWorktreeClaim: WorktreeClaim | null = null;
   let lastWorktreeTouchAt = 0;
-  /**
-   * Set while `[o]` is waiting on a second keypress to confirm stealing a *live* foreign
-   * worktree claim (names the claim we warned the operator about). Null the rest of the
-   * time — the free/stale path never touches this and stays a single keypress.
-   */
   let pendingWorktreeOverride: WorktreeClaim | null = null;
-  /**
-   * The holder we last told the operator about when skipping inject/reconcile. Unlike
-   * auto-maintain (queued on a handful of triggers), reconcile is attempted on every
-   * poll, so an unconditional notice would refill the notice list with the same line
-   * every second. One notice per holder — repeated only if ownership changes hands.
-   */
   let reconcileSkipNoticeFor: string | null = null;
 
   let pipeline: Pipeline | null = null;
@@ -133,9 +138,13 @@ export async function runWatch(
   let localBaseline: Set<string> | null = null; // local branch shas at the moment watch started
   let refreshing = false;
   let lastFrame: string | null = null;
-  const warnedBlocks = new Set<string>(); // "branch@sha" pairs already warned as blocked
-  const checkedShas = new Set<string>(); // shas that have been through post-commit checks
-  let checkQueue = Promise.resolve(); // serializes shadow work — prevents index.lock races
+  const warnedBlocks = new BoundedSet<string>(1000); // "branch@sha" pairs already warned as blocked
+  const checkedShas = new BoundedSet<string>(2000); // shas that have been through post-commit checks
+  // Separate queues per shadow tree: main-shadow work (checks/inject/maintain) never blocks
+  // stage deploys (`stage-deploy` shadow) or target deploys (`target-*` shadows).
+  let mainQueue = Promise.resolve();
+  let stageQueue = Promise.resolve();
+  let targetQueue = Promise.resolve();
   let reconciling = false; // one inject-local-main pass at a time
   let i18nPausedUntil = 0; // epoch ms — skip post-commit i18n auto-fix while set
   let remoteCommitsSinceMaint = 0;
@@ -151,10 +160,11 @@ export async function runWatch(
   /** When `stageDeployDetail` last changed — elapsed seconds reset per step. */
   let stageDeployStepAt = 0;
   /**
-   * Live prod-deploy status line bits. Kept outside `ui.status` so the 1s clock can
-   * refresh the spinner/seconds without waiting for the next onProgress callback.
+   * Live prod-deploy & target-deploy status lines kept separate so concurrent runs never
+   * clobber each other's spinner/status.
    */
   let prodDeployLive: { base: string; detail: string; stepAt: number } | null = null;
+  let targetDeployLive: { base: string; detail: string; stepAt: number } | null = null;
   /** Soft claim held by another watch (polled from S3); pauses our auto-deploy. */
   let remoteStageClaim: DeployClaim | null = null;
   let remoteProdClaim: DeployClaim | null = null;
@@ -165,7 +175,7 @@ export async function runWatch(
   // picker instead of the stage lane deploy. Loaded async; empty for FRONTEND-shaped repos.
   let deployTargets: DeployTarget[] = [];
   let targetDeploying = false;
-  const autoTargetTried = new Set<string>();
+  const autoTargetTried = new BoundedSet<string>(1000);
   let autoTargetTip: string | null = null;
   let autoTargetTipAt = 0;
   void resolveDeployTargets(cfg.repoPath).then((r) => {
@@ -209,14 +219,16 @@ export async function runWatch(
     return { processId, agentResolve: agentEnabled, skipShas: injectBlockedShas, autoInject };
   }
 
+  const newShas = new BoundedSet<string>(1000);
+  const newLocalShas = new BoundedSet<string>(1000);
   const ui: UIState = {
     selectedGap: 0,
     expanded: false,
     status: "",
     confirm: null,
     busy: false,
-    newShas: new Set(),
-    newLocalShas: new Set(),
+    newShas,
+    newLocalShas,
     notices: [],
     modal: null,
     maintenance: null,
@@ -228,10 +240,12 @@ export async function runWatch(
   const write = (s: string) => process.stdout.write(s);
 
   function paint(force = false): void {
-    // Refresh prod deploy spinner/seconds on every paint (1s clock), not only onProgress.
-    if (prodDeployLive) {
+    if (headless) return;
+    // Refresh active prod/target deploy spinner/seconds on every paint (1s clock).
+    const activeLive = prodDeployLive ?? targetDeployLive;
+    if (activeLive) {
       ui.status = c.yellow(
-        `${prodDeployLive.base}${formatDeployStepSuffix(prodDeployLive.detail, prodDeployLive.stepAt)}`,
+        `${activeLive.base}${formatDeployStepSuffix(activeLive.detail, activeLive.stepAt)}`,
       );
     }
     const frame = pipeline
@@ -249,6 +263,8 @@ export async function runWatch(
 
   function addNotice(msg: string): void {
     ui.notices = [msg, ...ui.notices].slice(0, 5);
+    const level = msg.includes("✗") ? "error" : msg.includes("⚠") ? "warn" : "info";
+    logger.log(level, msg);
   }
 
   /**
@@ -256,6 +272,8 @@ export async function runWatch(
    * (any key dismisses) and ring the terminal bell. Local only — no Discord post.
    */
   function showDeployFailure(target: "stage" | "prod", message: string): void {
+    logger.log("error", `DEPLOY FAILED (${target}): ${message}`);
+    if (headless) return;
     const body: string[] = [];
     for (const line of message.split("\n")) {
       for (let i = 0; i < Math.max(1, line.length); i += 64) body.push(line.slice(i, i + 64));
@@ -312,7 +330,7 @@ export async function runWatch(
   }
 
   /** Shadow warnings already shown — they recur on every call until dealt with by hand. */
-  const shownShadowWarnings = new Set<string>();
+  const shownShadowWarnings = new BoundedSet<string>(200);
 
   /**
    * `ensureShadow` + reconcile our view of ownership with what its (mandatory) claim
@@ -538,7 +556,7 @@ export async function runWatch(
     paint();
   }
 
-  /** Tick the countdown; fire deploy when it hits zero. */
+  /** Tick the countdown; fire deploy on the dedicated `stageQueue` when it hits zero. */
   function tickStageDeployCooldown(): void {
     if (!localStageDeploy || stageDeploying) return;
     syncStageDeployUi();
@@ -546,7 +564,7 @@ export async function runWatch(
       const tip = pendingStageDeploySha;
       stageDeployAt = null; // consume so we don't re-queue every second
       const run = () => executeStageDeploy(`cooldown ${tip.slice(0, 7)}`);
-      checkQueue = checkQueue.then(run, run);
+      stageQueue = stageQueue.then(run, run);
     }
   }
 
@@ -634,7 +652,7 @@ export async function runWatch(
         maintaining = false;
       }
     };
-    checkQueue = checkQueue.then(run, run);
+    mainQueue = mainQueue.then(run, run);
   }
 
   async function runCommitChecks(sha: string, src: "local" | "remote"): Promise<void> {
@@ -656,12 +674,17 @@ export async function runWatch(
     if (!pipeline) return;
     if (await isAutoFix(pipeline.repoPath, sha)) return;
 
+    if (isAkkRepo) return;
     const { repoPath, remote, lanes } = pipeline;
     const headBranch = lanes[0].name;
 
+    // Fetch commit diff once and share between checkI18n and scanCommitForUntranslated.
+    const sharedDiff =
+      profile.supports.i18n || cfg.i18nScan ? await commitDiffU0(repoPath, sha) : null;
+
     // i18n mismatch flag
     const i18n = profile.supports.i18n
-      ? await checkI18n(repoPath, sha)
+      ? await checkI18n(repoPath, sha, sharedDiff)
       : { hasPo: false, hasI18nCode: false, mismatch: false };
     if (i18n.mismatch) {
       addNotice(
@@ -675,7 +698,7 @@ export async function runWatch(
     // Hardcoded strings not wrapped in t() — cheap, diff-scoped, so run on every
     // new commit (local or remote). pnpm i18n can't catch these; this can.
     if (cfg.i18nScan) {
-      const untrans = await scanCommitForUntranslated(repoPath, sha);
+      const untrans = await scanCommitForUntranslated(repoPath, sha, sharedDiff);
       if (untrans.length) {
         const total = untrans.reduce((s, u) => s + u.findings.length, 0);
         const where = untrans
@@ -711,7 +734,13 @@ export async function runWatch(
         ),
       );
     } else {
-      const i18nFix = await runI18nFix(repoPath, shadow.shadowPath, remote, headBranch);
+      const i18nFix = await runI18nFix(
+        repoPath,
+        shadow.shadowPath,
+        remote,
+        headBranch,
+        cfg.i18nCmd,
+      );
       if (i18nFix.error) {
         addNotice(c.red(`✗ ${sha.slice(0, 7)} i18n: ${i18nFix.error.slice(0, 200)}`));
         // Empty msgstr / identical en·sl / other pnpm i18n failures → cursor-agent
@@ -836,13 +865,9 @@ export async function runWatch(
    * Fire-and-forget from refresh — does not block the poll loop.
    */
   function maybeReconcileLocalMain(): void {
-    if (!pipeline || reconciling) return;
+    if (isAkkRepo || !pipeline || reconciling) return;
     const headBranch = pipeline.lanes[0]?.name;
     if (!headBranch) return;
-    // Same gate as queueAutoMaintain, and for the same reason: reconcile's diverged
-    // path resets main-shadow to the origin tip. This runs from refresh() on *every*
-    // poll cycle, so without the gate a watch that does not own the worktree wiped it
-    // the moment its local `main` diverged — mid-deploy or mid-agent-edit included.
     if (!worktreeOwned) {
       noteReconcileSkipped();
       return;
@@ -852,10 +877,6 @@ export async function runWatch(
     const run = async (): Promise<void> => {
       try {
         if (!pipeline) return;
-        // The head lane's own local tip — not `localCommits[0]`, which is whatever branch
-        // is checked out. On a feature branch that never matched the tip the blocklist is
-        // keyed on, so it was wiped before every pass and a conflicting commit re-ran the
-        // cherry-pick + agent every poll.
         const headTip = await repo.localSha(pipeline.repoPath, headBranch);
         const res = await reconcileLocalMain(
           pipeline.repoPath,
@@ -883,49 +904,48 @@ export async function runWatch(
         reconciling = false;
       }
     };
-    checkQueue = checkQueue.then(run, run);
+    mainQueue = mainQueue.then(run, run);
   }
 
   async function refresh(): Promise<void> {
-    if (refreshing) return;
+    if (refreshing || quitting) return;
     refreshing = true;
-    // try/finally: a throw mid-refresh used to leave `refreshing` set, so no poll ever
-    // ran again and the screen froze on stale data.
     try {
       await refreshOnce();
     } catch (e) {
-      ui.status = c.red(`✗ refresh failed: ${e instanceof Error ? e.message : String(e)}`);
+      const msg = c.red(`✗ refresh failed: ${e instanceof Error ? e.message : String(e)}`);
+      ui.status = msg;
+      logger.log("error", msg);
     } finally {
       ui.busy = false;
       refreshing = false;
       paint();
     }
     // Queue a local→origin inject if needed (runs after any in-flight shadow work).
-    if (pipeline) maybeReconcileLocalMain();
+    if (pipeline && !quitting) maybeReconcileLocalMain();
   }
 
   async function refreshOnce(): Promise<void> {
     ui.busy = true;
     paint();
 
-    // Prefer live S3 markers for lane tips when configured. Skip while a local stage
-    // deploy is in flight so we do not rewind the tracker to a still-stale marker.
-    if (localStageDeploy && !stageDeploying) {
-      const live = await resolveLiveStageTip(cfg.repoPath);
-      if (live.commit) cfg.stageDeployedSha = live.commit;
-    }
-    if (!stageDeploying) {
-      const prodLive = await resolveLiveProdTip(cfg.repoPath);
-      cfg.prodDeployedSha = prodLive.commit;
-    }
-
-    // Soft deploy claims — who (if anyone) is mid-upload on each bucket.
+    // Prefer live S3 markers for lane tips when configured. Skip each target while a local
+    // deploy for that target is in flight, and skip reading `deployed-tree-sha.txt` on
+    // routine polls (only `.commit` is used here).
     const stageBucket = stageDeployedShaBucket(cfg.repoPath);
     const prodBucket = prodDeployedShaBucket(cfg.repoPath);
-    const [stageClaim, prodClaim] = await Promise.all([
+    const [stageLive, prodLive, stageClaim, prodClaim] = await Promise.all([
+      localStageDeploy && !stageDeploying
+        ? resolveLiveStageTip(cfg.repoPath, undefined, { includeTree: false })
+        : Promise.resolve(null),
+      !prodDeploying
+        ? resolveLiveProdTip(cfg.repoPath, { includeTree: false })
+        : Promise.resolve(null),
       stageBucket && !stageDeploying ? readDeployClaim(stageBucket) : Promise.resolve(null),
-      prodBucket ? readDeployClaim(prodBucket) : Promise.resolve(null),
+      prodBucket && !prodDeploying ? readDeployClaim(prodBucket) : Promise.resolve(null),
     ]);
+    if (stageLive?.commit) cfg.stageDeployedSha = stageLive.commit;
+    if (prodLive) cfg.prodDeployedSha = prodLive.commit;
     remoteStageClaim =
       stageClaim && !isClaimStale(stageClaim) && stageClaim.sha ? stageClaim : null;
     remoteProdClaim = prodClaim && !isClaimStale(prodClaim) && prodClaim.sha ? prodClaim : null;
@@ -966,7 +986,7 @@ export async function runWatch(
         for (const [from, to] of s.rewritten) {
           if (checkedShas.has(from)) checkedShas.add(to);
           if (localBaseline?.has(from)) localBaseline.add(to);
-          if (ui.newLocalShas.has(from)) ui.newLocalShas.add(to);
+          if (newLocalShas.has(from)) newLocalShas.add(to);
         }
         addNotice(
           c.green(
@@ -997,23 +1017,23 @@ export async function runWatch(
       } else {
         for (const cm of p.incoming) {
           if (!baseline.has(cm.sha)) {
-            ui.newShas.add(cm.sha);
+            newShas.add(cm.sha);
             if (!checkedShas.has(cm.sha)) {
               checkedShas.add(cm.sha);
               const sha = cm.sha;
               const run = () => runCommitChecks(sha, "remote");
-              checkQueue = checkQueue.then(run, run);
+              mainQueue = mainQueue.then(run, run);
             }
           }
         }
         for (const cm of p.localCommits) {
           if (!localBaseline!.has(cm.sha)) {
-            ui.newLocalShas.add(cm.sha);
+            newLocalShas.add(cm.sha);
             if (!checkedShas.has(cm.sha)) {
               checkedShas.add(cm.sha);
               const sha = cm.sha;
               const run = () => runCommitChecks(sha, "local");
-              checkQueue = checkQueue.then(run, run);
+              mainQueue = mainQueue.then(run, run);
             }
           }
         }
@@ -1172,7 +1192,9 @@ export async function runWatch(
       stageDeployBlockedForTip = null;
       ui.busy = true;
       paint();
-      await executeStageDeploy("manual [s]");
+      const run = () => executeStageDeploy("manual [s]");
+      stageQueue = stageQueue.then(run, run);
+      await stageQueue;
       ui.busy = false;
       paint();
       return;
@@ -1273,8 +1295,8 @@ export async function runWatch(
         };
       }
     };
-    checkQueue = checkQueue.then(run, run);
-    await checkQueue;
+    mainQueue = mainQueue.then(run, run);
+    await mainQueue;
 
     ui.busy = false;
     maintaining = false;
@@ -1285,6 +1307,7 @@ export async function runWatch(
   }
 
   // ── teardown plumbing
+  let quitting = false;
   let resolve!: () => void;
   const done = new Promise<void>((r) => {
     resolve = r;
@@ -1295,7 +1318,7 @@ export async function runWatch(
     tickStageDeployCooldown();
     tickAutoTargets();
     maybeTouchWorktreeClaim();
-    if (!ui.maintenance) paint();
+    if (!headless && !ui.maintenance) paint();
   }, 1000); // keep "↻ Ns ago" + stage countdown fresh
   const poll = setInterval(() => void refresh(), intervalMs);
   const autoMaintTimer = cfg.autoMaintain
@@ -1306,16 +1329,24 @@ export async function runWatch(
       }, 60_000)
     : null;
 
-  function quit(): void {
-    // Release worktree ownership first so another watch can take over immediately.
-    releaseWorktreeClaim(shadowPath, processId);
+  function quit(reason = "user"): void {
+    if (quitting) return;
+    quitting = true;
+    logger.log("info", `shutting down (${reason}) — releasing claims and stopping active jobs`);
     clearInterval(clock);
     clearInterval(poll);
     if (autoMaintTimer) clearInterval(autoMaintTimer);
-    if (process.stdin.isTTY) process.stdin.setRawMode(false);
-    process.stdin.pause();
-    write(ALT_OFF);
-    resolve();
+    // Release worktree ownership immediately, then kill active detached process groups
+    // and release any live S3 deploy claims within a 5s graceful shutdown window.
+    releaseWorktreeClaim(shadowPath, processId);
+    if (!headless) {
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+      process.stdin.pause();
+      write(ALT_OFF);
+    }
+    void runAllShutdownHooks(5_000).finally(() => {
+      resolve();
+    });
   }
 
   async function openTargetPicker(): Promise<void> {
@@ -1356,13 +1387,13 @@ export async function runWatch(
     let step = "starting";
     let stepAt = Date.now();
     const base = `deploying ${t.name} ${tip.slice(0, 7)} (${reason})…`;
-    prodDeployLive = { base, detail: step, stepAt };
+    targetDeployLive = { base, detail: step, stepAt };
     paint();
     try {
       const note = (m: string) => {
         step = m.replace(`${t.name}: `, "");
         stepAt = Date.now();
-        if (prodDeployLive) prodDeployLive = { base, detail: step, stepAt };
+        if (targetDeployLive) targetDeployLive = { base, detail: step, stepAt };
         addNotice(c.dim(m));
         paint();
       };
@@ -1382,8 +1413,9 @@ export async function runWatch(
       ui.status = c.red(
         `✗ ${t.name} deploy crashed: ${e instanceof Error ? e.message : String(e)}`,
       );
+      addNotice(ui.status);
     } finally {
-      prodDeployLive = null;
+      targetDeployLive = null;
       targetDeploying = false;
       ui.busy = false;
       paint();
@@ -1411,7 +1443,7 @@ export async function runWatch(
         addNotice(c.red(`✗ ${t.name} auto-deploy: ${e instanceof Error ? e.message : String(e)}`));
       }
     };
-    checkQueue = checkQueue.then(run, run);
+    targetQueue = targetQueue.then(run, run);
   }
 
   function onTargetPickerKey(s: string): void {
@@ -1423,7 +1455,7 @@ export async function runWatch(
         ui.targetPicker = null;
         if (t) {
           const run = () => deployTarget(t, "manual");
-          checkQueue = checkQueue.then(run, run); // run even if the previous item rejected
+          targetQueue = targetQueue.then(run, run); // run even if the previous item rejected
         }
       } else if (s === "n" || s === "\x1b") tp.confirm = null;
       paint();
@@ -1583,7 +1615,7 @@ export async function runWatch(
         // value the argument — wrap it. `.catch` so a failed CI lookup surfaces as a
         // notice instead of an unhandled rejection.
         if (pipeline) {
-          void enrichCI(pipeline)
+          void enrichCI(pipeline, { force: true })
             .then(() => paint())
             .catch((e) => {
               addNotice(
@@ -1640,18 +1672,24 @@ export async function runWatch(
   }
 
   // ── go
-  if (!process.stdin.isTTY) {
-    throw new Error("chong watch needs an interactive terminal (TTY)");
-  }
-  process.stdin.setRawMode(true);
-  process.stdin.resume();
-  process.stdin.setEncoding("utf8");
-  process.stdin.on("data", onKey);
-  process.stdout.on("resize", paint);
-  process.on("SIGINT", quit);
+  process.on("SIGINT", () => quit("SIGINT"));
+  process.on("SIGTERM", () => quit("SIGTERM"));
+  process.on("SIGHUP", () => quit("SIGHUP"));
 
-  write(ALT_ON);
-  paint(true);
+  if (!headless) {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", onKey);
+    process.stdout.on("resize", () => paint(true));
+    write(ALT_ON);
+    paint(true);
+  } else {
+    logger.log(
+      "info",
+      `chong watch started (headless) · ${cfg.repoPath} · log=${logger.filePath ?? "stdout"}`,
+    );
+  }
 
   // Claim the shared main-shadow worktree before any shadow work / auto-maintain.
   if (!tryTakeWorktree(false)) {
@@ -1673,7 +1711,7 @@ export async function runWatch(
   // Seed virtual stage / prod tips from live S3 markers (fallback: local branch / file)
   // before the first pipeline paint.
   if (localStageDeploy) {
-    const live = await resolveLiveStageTip(cfg.repoPath);
+    const live = await resolveLiveStageTip(cfg.repoPath, undefined, { includeTree: false });
     cfg.stageDeployedSha = live.commit;
     if (cfg.stageDeployedSha) {
       const via =
@@ -1698,7 +1736,7 @@ export async function runWatch(
   }
 
   {
-    const prodLive = await resolveLiveProdTip(cfg.repoPath);
+    const prodLive = await resolveLiveProdTip(cfg.repoPath, { includeTree: false });
     cfg.prodDeployedSha = prodLive.commit;
     if (cfg.prodDeployedSha) {
       addNotice(c.dim(`prod live @ ${cfg.prodDeployedSha.slice(0, 7)} (live S3 marker)`));

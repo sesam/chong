@@ -21,7 +21,7 @@
  *     `.chong/deployed/<name>` record is the only state.
  */
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { c } from "../util";
@@ -39,9 +39,18 @@ import {
   writeS3ShaMarkerVerified,
 } from "./deploy-claim";
 import { appendDeployHistory } from "./deploy-history";
-import { repo } from "./repo";
+import { ensureShadowDepsSynced } from "./deps-sync";
+import { GIT_TIMEOUT_MS, repo } from "./repo";
 import { checksForPhase, detectRepoProfile } from "./repo-profile";
 import { anyFailed, runChecks } from "./run-checks";
+import {
+  HEX_SHA_RE,
+  deployAwsEnv,
+  readStreamCapped,
+  registerActiveProcessGroup,
+  registerShutdownHook,
+  writeDeployLogFile,
+} from "./runtime";
 import {
   type DeployTarget,
   FORBIDDEN_CMD_CHARS,
@@ -192,18 +201,58 @@ export function mergeTargets(
   return { targets: [...out.values()].sort((a, b) => a.name.localeCompare(b.name)), errors };
 }
 
+/** Walk depth 1-2 subdirectories looking for `deploy.sh` (used for akk / non-git repos). */
+function walkDeployScripts(repoPath: string): string[] {
+  const found: string[] = [];
+  const visit = (relDir: string, depth: number) => {
+    if (depth > 2) return;
+    let entries: string[];
+    try {
+      entries = readdirSync(relDir ? path.join(repoPath, relDir) : repoPath);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      if (name.startsWith(".") || SKIP_DIRS.has(name)) continue;
+      const rel = relDir ? `${relDir}/${name}` : name;
+      const abs = path.join(repoPath, rel);
+      let st: ReturnType<typeof statSync>;
+      try {
+        st = statSync(abs);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) {
+        const script = path.join(abs, "deploy.sh");
+        if (existsSync(script)) found.push(`${rel}/deploy.sh`);
+        if (depth < 2) visit(rel, depth + 1);
+      }
+    }
+  };
+  visit("", 1);
+  return found;
+}
+
 async function trackedDeployScripts(repoPath: string): Promise<string[]> {
+  if (!existsSync(path.join(repoPath, ".git")) && existsSync(path.join(repoPath, ".akk"))) {
+    return walkDeployScripts(repoPath);
+  }
   try {
     const proc = Bun.spawn(["git", "ls-files", "-z", "--", "*/deploy.sh", "*/*/deploy.sh"], {
       cwd: repoPath,
       stdout: "pipe",
       stderr: "pipe",
+      timeout: GIT_TIMEOUT_MS,
     });
-    const out = await new Response(proc.stdout).text();
-    await proc.exited;
+    const [out, _err, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    if (code !== 0) return walkDeployScripts(repoPath);
     return out.split("\0").filter(Boolean);
   } catch {
-    return [];
+    return walkDeployScripts(repoPath);
   }
 }
 
@@ -256,7 +305,7 @@ export function targetKeyPrefix(prefix: string, name: string): string {
   return `${prefix}${name}/`;
 }
 
-const HEX_SHA = /^[0-9a-f]{7,40}$/i;
+const HEX_SHA = HEX_SHA_RE;
 
 export async function readRemoteDeployedSha(
   m: TargetMarkerConfig,
@@ -320,15 +369,7 @@ export function readTargetEnv(
  * cause is. Best effort: a log that cannot be written must not mask the deploy failure.
  */
 function writeDeployLog(target: string, sha: string, text: string): string | null {
-  try {
-    const dir = path.join(homedir(), ".chong", "logs");
-    mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, `deploy-${target}-${sha.slice(0, 7)}.log`);
-    writeFileSync(file, `${text}\n`, { mode: 0o600 });
-    return file;
-  } catch {
-    return null;
-  }
+  return writeDeployLogFile(target, sha, text);
 }
 
 /** Remove every env-file value from text bound for the terminal. */
@@ -416,10 +457,22 @@ export async function targetStatus(
 
   const args = ["diff", "--name-only", `${deployed}..${tip}`];
   if (target.paths?.length) args.push("--", ...target.paths);
-  const proc = Bun.spawn(["git", ...args], { cwd: repoPath, stdout: "pipe", stderr: "pipe" });
-  const out = await new Response(proc.stdout).text();
-  const code = await proc.exited;
-  return { ...interpretStaleness(deployed, { ok: code === 0, out: out.trim() }), source, claim };
+  try {
+    const proc = Bun.spawn(["git", ...args], {
+      cwd: repoPath,
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: GIT_TIMEOUT_MS,
+    });
+    const [out, _err, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return { ...interpretStaleness(deployed, { ok: code === 0, out: out.trim() }), source, claim };
+  } catch {
+    return { ...interpretStaleness(deployed, { ok: false, out: "" }), source, claim };
+  }
 }
 
 // ── gate ────────────────────────────────────────────────────────────────────
@@ -457,10 +510,14 @@ async function ghRunLines(cwd: string, sha: string): Promise<string[] | null> {
         "--jq",
         '.[] | "\\(.status)/\\(.conclusion)"',
       ],
-      { cwd, stdout: "pipe", stderr: "pipe" },
+      { cwd, stdout: "pipe", stderr: "pipe", timeout: 30_000 },
     );
-    const out = await new Response(proc.stdout).text();
-    return (await proc.exited) === 0 ? out.split("\n") : null;
+    const [out, _err, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return code === 0 ? out.split("\n") : null;
   } catch {
     return null;
   }
@@ -550,20 +607,32 @@ export function defaultGateDeps(repoPath: string, onProgress?: (m: string) => vo
 
 // ── run ─────────────────────────────────────────────────────────────────────
 
+const TARGET_DEPLOY_TIMEOUT_MS = 25 * 60 * 1_000;
+
 async function runShell(
   cwd: string,
   cmd: string,
   env: Record<string, string>,
   shouldAbort?: () => boolean,
+  timeoutMs = TARGET_DEPLOY_TIMEOUT_MS,
 ): Promise<{ ok: boolean; output: string; aborted?: boolean }> {
   const proc = Bun.spawn(["bash", "-c", cmd], {
     cwd,
     stdout: "pipe",
     stderr: "pipe",
     detached: true,
-    env: { ...process.env, HOME: process.env.HOME ?? homedir(), ...env },
+    env: deployAwsEnv(process.env, { HOME: process.env.HOME ?? homedir(), ...env }),
   });
+  const unregisterGroup = registerActiveProcessGroup(proc.pid);
   let aborted = false;
+  let timedOut = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let hardTimer: ReturnType<typeof setTimeout> | undefined;
+  let resolveHard!: (v: "hard-timeout") => void;
+  const hardRace = new Promise<"hard-timeout">((r) => {
+    resolveHard = r;
+  });
+
   const kill = (sig: "SIGTERM" | "SIGKILL") => {
     try {
       process.kill(-proc.pid, sig);
@@ -571,21 +640,58 @@ async function runShell(
       /* group already gone */
     }
   };
-  const poll = setInterval(() => {
-    if (aborted || !shouldAbort?.()) return;
-    aborted = true;
+  const triggerKill = (reason: "abort" | "timeout") => {
+    if (aborted || timedOut) return;
+    if (reason === "abort") aborted = true;
+    else timedOut = true;
     kill("SIGTERM");
-    setTimeout(() => kill("SIGKILL"), 5_000).unref();
+    killTimer = setTimeout(() => {
+      kill("SIGKILL");
+      hardTimer = setTimeout(() => resolveHard("hard-timeout"), 5_000);
+      hardTimer.unref();
+    }, 5_000);
+    killTimer.unref();
+  };
+
+  const poll = setInterval(() => {
+    if (shouldAbort?.()) triggerKill("abort");
   }, 2_000);
-  try {
-    const [out, err] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
+  poll.unref();
+
+  const overallTimer = setTimeout(() => triggerKill("timeout"), timeoutMs);
+  overallTimer.unref();
+
+  const drain = (async () => {
+    const [out, err, code] = await Promise.all([
+      readStreamCapped(proc.stdout, 256 * 1024),
+      readStreamCapped(proc.stderr, 256 * 1024),
+      proc.exited,
     ]);
-    const code = await proc.exited;
-    return { ok: code === 0 && !aborted, output: `${out}\n${err}`.trim(), aborted };
+    return { out, err, code };
+  })();
+
+  try {
+    const settled = await Promise.race([drain, hardRace]);
+    if (settled === "hard-timeout") {
+      return {
+        ok: false,
+        output: timedOut
+          ? `deploy timed out after ${Math.round(timeoutMs / 60_000)}m`
+          : "aborted — deploy claim stolen",
+        aborted,
+      };
+    }
+    return {
+      ok: settled.code === 0 && !aborted && !timedOut,
+      output: `${settled.out}\n${settled.err}`.trim(),
+      aborted,
+    };
   } finally {
+    unregisterGroup();
     clearInterval(poll);
+    clearTimeout(overallTimer);
+    if (killTimer) clearTimeout(killTimer);
+    if (hardTimer) clearTimeout(hardTimer);
   }
 }
 
@@ -620,12 +726,23 @@ export async function runTargetDeploy(
     };
   }
 
-  const anc = Bun.spawn(["git", "merge-base", "--is-ancestor", sha, `${remote}/${mainBranch}`], {
-    cwd: repoPath,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const onRemote = (await anc.exited) === 0;
+  let onRemote = false;
+  try {
+    const anc = Bun.spawn(["git", "merge-base", "--is-ancestor", sha, `${remote}/${mainBranch}`], {
+      cwd: repoPath,
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: GIT_TIMEOUT_MS,
+    });
+    const [_out, _err, code] = await Promise.all([
+      new Response(anc.stdout).text(),
+      new Response(anc.stderr).text(),
+      anc.exited,
+    ]);
+    onRemote = code === 0;
+  } catch {
+    onRemote = false;
+  }
 
   const envRes = readTargetEnv(repoPath, target);
   if (envRes.error) return { action: "blocked", message: envRes.error, sha };
@@ -636,6 +753,9 @@ export async function runTargetDeploy(
   let claim: DeployClaim | null = null;
   let claimLost = false;
   let stopHeartbeat = () => {};
+  let shadowPath: string | null = null;
+  let touch: ReturnType<typeof setInterval> | null = null;
+
   if (marker && keyPrefix) {
     const acq = await acquireDeployClaim(marker.bucket, sha, processId, {
       prefix: keyPrefix,
@@ -674,21 +794,41 @@ export async function runTargetDeploy(
     );
   }
 
-  note(`${target.name}: resetting shadow to ${short}…`);
-  const shadow = await ensureShadow(repoPath, sha, { processId, role: `target-${target.name}` });
-  const shadowPath = shadow.shadowPath;
-  const touch = setInterval(
-    () => touchWorktreeClaim(shadowPath, processId),
-    WORKTREE_CLAIM_TOUCH_MS,
-  );
+  // Wrap ensureShadow INSIDE try/finally + register shutdown hook so an exception in
+  // ensureShadow or a SIGTERM can never leak the live S3 claim or heartbeat interval.
+  const unregisterShutdown = registerShutdownHook({
+    sync: () => {
+      if (shadowPath) releaseWorktreeClaim(shadowPath, processId);
+    },
+    async: async () => {
+      if (marker && keyPrefix && claim) await releaseDeployClaim(marker.bucket, claim, keyPrefix);
+    },
+  });
+
   try {
+    note(`${target.name}: resetting shadow to ${short}…`);
+    const shadow = await ensureShadow(repoPath, sha, { processId, role: `target-${target.name}` });
+    if (shadow.claim.ok) shadowPath = shadow.shadowPath;
     if (shadow.error) {
       return { action: "blocked", message: `shadow: ${shadow.error}`, sha };
     }
-    linkVenv(repoPath, shadowPath);
+    touch = setInterval(
+      () => touchWorktreeClaim(shadow.shadowPath, processId),
+      WORKTREE_CLAIM_TOUCH_MS,
+    );
+    touch.unref();
+    linkVenv(repoPath, shadow.shadowPath);
+
+    const synced = await ensureShadowDepsSynced(repoPath, shadow.shadowPath, {
+      allowShadowInstall: true,
+      onProgress: note,
+    });
+    if (synced.action === "error") {
+      return { action: "blocked", message: `deps sync: ${synced.message}`, sha };
+    }
 
     note(`${target.name}: running checks…`);
-    const checks = await opts.gate.runChecks(shadowPath, target);
+    const checks = await opts.gate.runChecks(shadow.shadowPath, target);
     note(`${target.name}: checking CI for ${short}…`);
     const ci = await opts.gate.ci(sha);
     const plan = planDeploy({ checks, ci, onRemote, forceGate: opts.forceGate === true });
@@ -697,12 +837,12 @@ export async function runTargetDeploy(
       return { action: "blocked", message: `gate refused: ${plan.reasons.join("; ")}`, sha };
     }
 
-    const cwd = target.dir ? path.join(shadowPath, target.dir) : shadowPath;
+    const cwd = target.dir ? path.join(shadow.shadowPath, target.dir) : shadow.shadowPath;
     const env = {
       ...envRes.env,
       CHONG_TARGET: target.name,
       CHONG_SHA: sha,
-      CHONG_REPO_ROOT: shadowPath,
+      CHONG_REPO_ROOT: shadow.shadowPath,
     };
     note(`${target.name}: deploying ${short}…`);
     const run = await runShell(cwd, effectiveTargetCmd(repoPath, target), env, () => claimLost);
@@ -752,8 +892,9 @@ export async function runTargetDeploy(
       sha,
     };
   } finally {
-    clearInterval(touch);
-    releaseWorktreeClaim(shadowPath, processId);
+    unregisterShutdown();
+    if (touch) clearInterval(touch);
+    if (shadowPath) releaseWorktreeClaim(shadowPath, processId);
     stopHeartbeat();
     if (marker && keyPrefix && claim) await releaseDeployClaim(marker.bucket, claim, keyPrefix);
   }

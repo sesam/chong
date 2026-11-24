@@ -46,10 +46,11 @@ const HELP = `chong — ship change-lists to the company git backend
                                         push, to allow a commit --amend), auto fast-forward /
                                         rebase of local main onto origin when clean, and (FRONTEND)
                                         local stage deploy after 60s quiet on origin/main
-                                        (--no-agent, --no-auto-maintain, --no-auto-inject,
-                                         --no-auto-rebase,
-                                         --no-auto-deploy-stage, --deploy-cooldown <s>,
-                                         --no-import-scan)
+                                         (--headless, --log-file <path>, --deploy-aws-profile <p>,
+                                          --no-agent, --no-auto-maintain, --no-auto-inject,
+                                          --no-auto-rebase,
+                                          --no-auto-deploy-stage, --deploy-cooldown <s>,
+                                          --no-import-scan)
   chong shadow-work [<path>] [--remote <r>] [--format-cmd <cmd>]
                                         manually run i18n + format checks on the
                                         latest origin/main commit via main-shadow

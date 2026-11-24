@@ -9,6 +9,7 @@
  */
 
 import { realpathSync } from "node:fs";
+import { readStreamCapped, registerActiveProcessGroup } from "./runtime";
 
 export type AgentRun = {
   ok: boolean;
@@ -83,7 +84,14 @@ export function scrubAgentPath(pathValue: string): string {
     .join(":");
 }
 
-/** Build the env passed to the spawned agent: allowlist only, see {@link ENV_ALLOW_EXACT}. */
+/**
+ * Build the env passed to the spawned agent: allowlist only, see {@link ENV_ALLOW_EXACT}.
+ *
+ * Also actively disables ambient cloud/forge credential lookup even when `HOME` is shared
+ * on a developer laptop (pointing AWS/GH config files at `/dev/null`, disabling EC2 IMDS,
+ * and clearing `SSH_AUTH_SOCK`). On an always-on VM, set `CHONG_AGENT_HOME` to a dedicated
+ * directory containing only agent config so `~/.aws`/`~/.ssh`/`~/.chong` are unreachable.
+ */
 export function scrubbedAgentEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(source)) {
@@ -92,6 +100,14 @@ export function scrubbedAgentEnv(source: NodeJS.ProcessEnv = process.env): Recor
       out[k] = k === "PATH" ? scrubAgentPath(v) : v;
     }
   }
+  const isolatedHome = source.CHONG_AGENT_HOME?.trim();
+  if (isolatedHome) out.HOME = isolatedHome;
+  // Block cloud/forge/SSH credential resolution inside the agent process tree.
+  out.AWS_SHARED_CREDENTIALS_FILE = "/dev/null";
+  out.AWS_CONFIG_FILE = "/dev/null";
+  out.AWS_EC2_METADATA_DISABLED = "true";
+  out.GH_CONFIG_DIR = "/dev/null";
+  out.SSH_AUTH_SOCK = "";
   return out;
 }
 
@@ -257,6 +273,7 @@ export async function runAgent(
     detached: true,
     env: scrubbedAgentEnv(),
   });
+  const unregisterGroup = registerActiveProcessGroup(proc.pid);
 
   // Negative pid signals the whole process group `detached` above created, not just this
   // pid. The group can already be gone (process exited on its own between checks) — ESRCH
@@ -274,12 +291,14 @@ export async function runAgent(
     killGroup("SIGTERM");
     // Escalate if the agent (or a grandchild holding its stdout pipe) ignores SIGTERM.
     killTimer = setTimeout(() => killGroup("SIGKILL"), AGENT_KILL_GRACE_MS);
+    killTimer.unref();
   }, AGENT_TIMEOUT_MS);
+  softTimer.unref();
 
   const drain = (async () => {
     const [out, err, code] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
+      readStreamCapped(proc.stdout, 256 * 1024),
+      readStreamCapped(proc.stderr, 256 * 1024),
       proc.exited,
     ]);
     return { out, err, code };
@@ -289,21 +308,19 @@ export async function runAgent(
   // a daemonized grandchild (calls setsid(), escaping the process group `detached: true`
   // created above) can keep the inherited stdout/stderr pipe open past a SIGKILL of the
   // group, in which case `drain` never settles. Racing against this hard deadline is what
-  // makes a hang bounded end-to-end — everything here is serialized on a single
-  // `checkQueue` (checks.ts), so without this one stuck agent freezes auto-fix,
-  // auto-maintain, and cooldown stage deploys indefinitely. The deadline sits comfortably
-  // past the SIGKILL grace period so a process that dies from SIGKILL still gets to
-  // report its real exit code before the race is decided.
+  // makes a hang bounded end-to-end.
   const HARD_DEADLINE_MS = AGENT_TIMEOUT_MS + AGENT_KILL_GRACE_MS + 5_000;
+  let hardTimer: ReturnType<typeof setTimeout> | undefined;
   const hardDeadline = new Promise<"timed-out">((resolve) => {
-    setTimeout(() => resolve("timed-out"), HARD_DEADLINE_MS);
+    hardTimer = setTimeout(() => resolve("timed-out"), HARD_DEADLINE_MS);
+    hardTimer.unref();
   });
 
   try {
     const result = await Promise.race([drain, hardDeadline]);
     if (result === "timed-out") {
-      // The caller (checkQueue in app.ts) surfaces this as a normal failed run rather
-      // than hanging forever — exitCode 124 mirrors the coreutils `timeout` convention.
+      // The caller surfaces this as a normal failed run rather than hanging forever —
+      // exitCode 124 mirrors the coreutils `timeout` convention.
       return {
         ok: false,
         text: `agent timed out after ${Math.round(AGENT_TIMEOUT_MS / 1000)}s and did not exit even after SIGKILL to its process group (a grandchild likely still holds the output pipe open)`,
@@ -329,8 +346,10 @@ export async function runAgent(
       return { ok: true, text: trimmed, exitCode: code };
     }
   } finally {
+    unregisterGroup();
     clearTimeout(softTimer);
     if (killTimer) clearTimeout(killTimer);
+    if (hardTimer) clearTimeout(hardTimer);
   }
 }
 

@@ -12,8 +12,8 @@ export type UIState = {
   status: string; // transient status / result line
   confirm: number | null; // gap index awaiting y/n confirmation
   busy: boolean; // a promote/fetch is in flight
-  newShas: Set<string>; // remote head-lane commits first seen since watch started
-  newLocalShas: Set<string>; // local branch commits first seen since watch started
+  newShas: ReadonlySet<string>; // remote head-lane commits first seen since watch started
+  newLocalShas: ReadonlySet<string>; // local branch commits first seen since watch started
   notices: string[]; // recent check results, newest first (max 5 shown)
   modal: { title: string; body: string[] } | null; // leftover-files alert
   // manual maintenance pass ([m]); when set, takes over the whole screen
@@ -55,16 +55,20 @@ export type UIState = {
 
 const cols = () => process.stdout.columns || 100;
 
+const PRINTABLE_ASCII_RE = /^[\x20-\x7e]*$/;
+const GRAPHEME_SEGMENTER =
+  typeof (Intl as unknown as { Segmenter?: typeof Intl.Segmenter }).Segmenter === "function"
+    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+    : null;
+
 /**
  * Grapheme clusters of `s` — a base letter plus any combining marks, or a ZWJ/emoji
  * sequence, counts as one visual unit rather than one per code point. Falls back to
- * splitting on code points (still better than raw UTF-16 units for astral characters)
- * when `Intl.Segmenter` isn't available.
+ * splitting on code points when `Intl.Segmenter` isn't available.
  */
 function graphemes(s: string): string[] {
-  const Seg = (Intl as unknown as { Segmenter?: typeof Intl.Segmenter }).Segmenter;
-  if (!Seg) return Array.from(s);
-  return Array.from(new Seg(undefined, { granularity: "grapheme" }).segment(s), (x) => x.segment);
+  if (!GRAPHEME_SEGMENTER) return Array.from(s);
+  return Array.from(GRAPHEME_SEGMENTER.segment(s), (x) => x.segment);
 }
 
 // Code point ranges rendered double-width by (nearly) every terminal: CJK ideographs,
@@ -95,6 +99,7 @@ function clusterWidth(cluster: string): number {
 
 /** Display width of `s`, counting wide (CJK-ish) grapheme clusters as 2 columns. */
 export function stringWidth(s: string): number {
+  if (PRINTABLE_ASCII_RE.test(s)) return s.length;
   let w = 0;
   for (const g of graphemes(s)) w += clusterWidth(g);
   return w;
@@ -103,6 +108,9 @@ export function stringWidth(s: string): number {
 /** Truncate `s` to a display width of `n`, respecting grapheme clusters and wide chars. */
 function trunc(s: string, n: number): string {
   if (n <= 1) return "";
+  if (PRINTABLE_ASCII_RE.test(s)) {
+    return s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+  }
   if (stringWidth(s) <= n) return s;
   let out = "";
   let w = 0;

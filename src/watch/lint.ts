@@ -1,8 +1,11 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { splitNulPaths } from "./checks";
+import { readStreamCapped } from "./runtime";
 
 type Run = { ok: boolean; out: string; err: string };
+
+const LINT_TIMEOUT_MS = 5 * 60 * 1_000;
 
 const LINT_GLOBS = ["*.js", "*.mjs", "*.cjs", "*.ts", "*.vue"];
 
@@ -103,13 +106,26 @@ export function formatLintSummary(errors: LintError[]): string {
 }
 
 async function sh(cmd: string[], cwd: string): Promise<Run> {
-  const proc = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "pipe" });
-  const [out, err, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { ok: code === 0, out: out.trim(), err: err.trim() };
+  try {
+    const proc = Bun.spawn(cmd, {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: LINT_TIMEOUT_MS,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    });
+    const [out, err, code] = await Promise.all([
+      readStreamCapped(proc.stdout, 256 * 1024),
+      readStreamCapped(proc.stderr, 256 * 1024),
+      proc.exited,
+    ]);
+    if (proc.signalCode !== null && proc.killed) {
+      return { ok: false, out: out.trim(), err: `${cmd[0]} timed out` };
+    }
+    return { ok: code === 0, out: out.trim(), err: err.trim() };
+  } catch (e) {
+    return { ok: false, out: "", err: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 /**

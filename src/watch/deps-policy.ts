@@ -150,6 +150,26 @@ function parseNpmUser(raw: unknown): { hasStagedPublish: boolean; hasTrustedPubl
   };
 }
 
+const META_CACHE_TTL_MS = 15 * 60_000;
+const META_CACHE_MAX = 256;
+const META_FETCH_CONCURRENCY = 5;
+
+const metaCache = new Map<string, { meta: RegistryVersionMeta | null; expiresAt: number }>();
+
+/** Clear registry metadata cache (for tests). */
+export function resetDepsMetaCache(): void {
+  metaCache.clear();
+}
+
+function setMetaCache(key: string, meta: RegistryVersionMeta | null, now: number): void {
+  if (metaCache.has(key)) metaCache.delete(key);
+  metaCache.set(key, { meta, expiresAt: now + META_CACHE_TTL_MS });
+  if (metaCache.size > META_CACHE_MAX) {
+    const oldest = metaCache.keys().next().value;
+    if (oldest !== undefined) metaCache.delete(oldest);
+  }
+}
+
 /** Minutes since `name@version` was published to the npm registry, or null on failure. */
 export async function packagePublishAgeMinutes(
   name: string,
@@ -158,7 +178,8 @@ export async function packagePublishAgeMinutes(
   const meta = await fetchPackageRegistryMeta(name, version);
   const published = meta?.publishedAt;
   if (!published) return null;
-  return (Date.now() - new Date(published).getTime()) / 60_000;
+  const ms = Date.parse(published);
+  return Number.isFinite(ms) ? (Date.now() - ms) / 60_000 : null;
 }
 
 export async function packageTrustMeta(name: string, version: string): Promise<TrustMeta | null> {
@@ -166,24 +187,86 @@ export async function packageTrustMeta(name: string, version: string): Promise<T
   return trustMetaFromManifest(meta);
 }
 
+/**
+ * Fetch only the minimal fields needed for `name@version` once (cached 15m), rather than
+ * downloading and retaining the full multi-MB packument twice per package.
+ *
+ * When `policy.minimumReleaseAge <= 0` we only need version trust metadata, which lives at
+ * `/<pkg>/<version>` (a few KB). Otherwise we fetch the packument once, extract only
+ * `dist.attestations.provenance`, `dist.signatures`, `_npmUser`, and `time[version]`, and
+ * let the rest of the JSON be GC'd immediately.
+ */
 async function fetchPackageRegistryMeta(
   name: string,
   version: string,
+  needPublishTime = true,
 ): Promise<RegistryVersionMeta | null> {
-  const packumentUrl = `${REGISTRY}/${encodePackage(name)}`;
+  const key = `${name}@${version}|${needPublishTime ? "full" : "ver"}`;
+  const now = Date.now();
+  const cached = metaCache.get(key);
+  if (cached && now < cached.expiresAt) return cached.meta;
+
   try {
+    if (!needPublishTime) {
+      const verUrl = `${REGISTRY}/${encodePackage(name)}/${encodeURIComponent(version)}`;
+      const res = await fetch(verUrl, {
+        headers: { accept: "application/json" },
+        signal: AbortSignal.timeout(20_000),
+      });
+      if (!res.ok) {
+        setMetaCache(key, null, now);
+        return null;
+      }
+      const v = (await res.json()) as RegistryVersionMeta;
+      const slim: RegistryVersionMeta = {
+        _npmUser: v._npmUser,
+        dist: v.dist
+          ? {
+              attestations: v.dist.attestations
+                ? { provenance: v.dist.attestations.provenance }
+                : undefined,
+              signatures: v.dist.signatures,
+            }
+          : undefined,
+        publishedAt: null,
+      };
+      setMetaCache(key, slim, now);
+      return slim;
+    }
+
+    const packumentUrl = `${REGISTRY}/${encodePackage(name)}`;
     const res = await fetch(packumentUrl, {
       headers: { accept: "application/json" },
       signal: AbortSignal.timeout(20_000),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      setMetaCache(key, null, now);
+      return null;
+    }
     const pack = (await res.json()) as {
       versions?: Record<string, RegistryVersionMeta>;
       time?: Record<string, string>;
     };
     const versionMeta = pack.versions?.[version];
-    if (!versionMeta) return null;
-    return { ...versionMeta, publishedAt: pack.time?.[version] ?? null };
+    if (!versionMeta) {
+      setMetaCache(key, null, now);
+      return null;
+    }
+    // Extract only the tiny fields we care about so the multi-MB packument can be GC'd.
+    const slim: RegistryVersionMeta = {
+      _npmUser: versionMeta._npmUser,
+      dist: versionMeta.dist
+        ? {
+            attestations: versionMeta.dist.attestations
+              ? { provenance: versionMeta.dist.attestations.provenance }
+              : undefined,
+            signatures: versionMeta.dist.signatures,
+          }
+        : undefined,
+      publishedAt: pack.time?.[version] ?? null,
+    };
+    setMetaCache(key, slim, now);
+    return slim;
   } catch {
     return null;
   }
@@ -191,11 +274,7 @@ async function fetchPackageRegistryMeta(
 
 /**
  * Filter maintenance bump targets against release age + vetted-publish rules.
- * `exceptionPackages` (typically this repo's dismissed-Dependabot-alert package names, via
- * `fetchDismissedPackageNames` in ./gh) bypasses the age/vetting gate entirely — e.g. a
- * repo pinning brace-expansion to a pre-rewrite 1.x/2.x line for eslint/minimatch@3 CJS
- * compat shouldn't have same-major bumps blocked by an unrelated freshness check once
- * that package's advisory has been reviewed and dismissed.
+ * Fetches each package's registry metadata once with bounded concurrency.
  */
 export async function filterDepsByReleasePolicy(
   targets: string[],
@@ -204,6 +283,7 @@ export async function filterDepsByReleasePolicy(
 ): Promise<{ allowed: string[]; blocked: FilteredTarget[] }> {
   const allowed: string[] = [];
   const blocked: FilteredTarget[] = [];
+  const toCheck: Array<{ target: string; name: string; version: string }> = [];
 
   for (const target of targets) {
     const parsed = parseTarget(target);
@@ -221,15 +301,24 @@ export async function filterDepsByReleasePolicy(
       allowed.push(target);
       continue;
     }
+    toCheck.push({ target, name, version });
+  }
 
-    const trust = await packageTrustMeta(name, version);
-    const ageMin = await packagePublishAgeMinutes(name, version);
-    const decision = decideAutoApplyUpdate(trust, ageMin, policy);
-
-    if (decision.allow) {
-      allowed.push(target);
-    } else {
-      blocked.push({ target, reason: decision.reason ?? "blocked by release policy" });
+  const needPublishTime = policy.minimumReleaseAge > 0;
+  for (let i = 0; i < toCheck.length; i += META_FETCH_CONCURRENCY) {
+    const batch = toCheck.slice(i, i + META_FETCH_CONCURRENCY);
+    const results = await Promise.all(
+      batch.map(async ({ target, name, version }) => {
+        const meta = await fetchPackageRegistryMeta(name, version, needPublishTime);
+        const trust = trustMetaFromManifest(meta);
+        const pubMs = meta?.publishedAt ? Date.parse(meta.publishedAt) : Number.NaN;
+        const ageMin = Number.isFinite(pubMs) ? (Date.now() - pubMs) / 60_000 : null;
+        return { target, decision: decideAutoApplyUpdate(trust, ageMin, policy) };
+      }),
+    );
+    for (const { target, decision } of results) {
+      if (decision.allow) allowed.push(target);
+      else blocked.push({ target, reason: decision.reason ?? "blocked by release policy" });
     }
   }
 

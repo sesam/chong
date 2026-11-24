@@ -15,8 +15,9 @@
  * past a foreign claim. Stale claims expire after {@link CLAIM_STALE_MS} (~20m — longer
  * than any expected deploy, short enough that a dead process does not wedge the bucket).
  */
-import { hostname } from "node:os";
-import { userInfo } from "node:os";
+import { hostname, userInfo } from "node:os";
+import { HEX_SHA_RE } from "./runtime";
+import { s3DeleteObject, s3ReadText, s3WriteText } from "./s3";
 import { sanitizeDisplayText } from "./sanitize-display";
 
 export const DEPLOY_CLAIM_KEY = "deploy-claim.json";
@@ -97,7 +98,7 @@ export function parseDeployClaim(raw: string): DeployClaim | null {
     if (parsed?.v !== 1) return null;
     if (typeof parsed.id !== "string" || !parsed.id) return null;
     if (typeof parsed.user !== "string" || !parsed.user) return null;
-    if (typeof parsed.sha !== "string" || !/^[0-9a-f]{7,40}$/i.test(parsed.sha)) return null;
+    if (typeof parsed.sha !== "string" || !HEX_SHA_RE.test(parsed.sha)) return null;
     if (typeof parsed.at !== "string" || !parsed.at) return null;
     const user = sanitizeDisplayText(parsed.user, CLAIM_FIELD_MAX_LEN) || "unknown";
     const hostRaw =
@@ -360,56 +361,15 @@ export async function writeS3Text(
   key: string,
   value: string,
 ): Promise<string | null> {
-  const uri = `s3://${bucket}/${key}`;
-  const body = value.endsWith("\n") || value === "" ? value : `${value}\n`;
-  const proc = Bun.spawn(
-    [
-      "aws",
-      "s3",
-      "cp",
-      "-",
-      uri,
-      "--cache-control",
-      "no-store",
-      "--content-type",
-      key.endsWith(".json") ? "application/json" : "text/plain",
-      "--quiet",
-    ],
-    {
-      stdin: new Blob([body]),
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, AWS_PAGER: "" },
-    },
-  );
-  const err = await new Response(proc.stderr).text();
-  const code = await proc.exited;
-  return code === 0 ? null : err.trim() || `aws s3 cp failed (${code})`;
+  return s3WriteText(bucket, key, value);
 }
 
 async function deleteS3Object(bucket: string, key: string): Promise<string | null> {
-  const uri = `s3://${bucket}/${key}`;
-  const proc = Bun.spawn(["aws", "s3", "rm", uri, "--quiet"], {
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...process.env, AWS_PAGER: "" },
-  });
-  const err = await new Response(proc.stderr).text();
-  const code = await proc.exited;
-  return code === 0 ? null : err.trim() || `aws s3 rm failed (${code})`;
+  return s3DeleteObject(bucket, key);
 }
 
 export async function readS3Text(bucket: string, key: string): Promise<string | null> {
-  const uri = `s3://${bucket}/${key}`;
-  const proc = Bun.spawn(["aws", "s3", "cp", uri, "-", "--quiet"], {
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...process.env, AWS_PAGER: "" },
-  });
-  const out = await new Response(proc.stdout).text();
-  const code = await proc.exited;
-  if (code !== 0) return null;
-  return out;
+  return s3ReadText(bucket, key);
 }
 
 function sleep(ms: number): Promise<void> {

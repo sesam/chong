@@ -134,14 +134,30 @@ export const repo = {
     return r.ok ? null : r.err || `git fetch ${remote} failed`;
   },
 
+  /**
+   * Resolve multiple full ref names (`refs/heads/...`, `refs/remotes/...`) in a single
+   * `git for-each-ref` subprocess instead of N sequential `rev-parse` calls.
+   */
+  async resolveRefs(cwd: string, refs: string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    if (refs.length === 0) return out;
+    const r = await git(["for-each-ref", "--format=%(refname) %(objectname)", ...refs], cwd);
+    if (!r.ok || !r.out) return out;
+    for (const line of r.out.split("\n")) {
+      const sp = line.indexOf(" ");
+      if (sp <= 0) continue;
+      const name = line.slice(0, sp);
+      const sha = line.slice(sp + 1).trim();
+      if (name && sha) out.set(name, sha);
+    }
+    return out;
+  },
+
   /** Which of the requested branches exist on the remote. */
   async existingRemoteBranches(cwd: string, remote: string, branches: string[]): Promise<string[]> {
-    const found: string[] = [];
-    for (const b of branches) {
-      const r = await git(["rev-parse", "--verify", "--quiet", `${remote}/${b}`], cwd);
-      if (r.ok) found.push(b);
-    }
-    return found;
+    const refs = branches.map((b) => `refs/remotes/${remote}/${b}`);
+    const resolved = await repo.resolveRefs(cwd, refs);
+    return branches.filter((b) => resolved.has(`refs/remotes/${remote}/${b}`));
   },
 
   /**

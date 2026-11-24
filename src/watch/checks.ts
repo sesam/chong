@@ -14,6 +14,7 @@ import {
   lintResolvePrompt,
 } from "./agent";
 import { filterDepsByReleasePolicy, readDepsPolicy } from "./deps-policy";
+import { ensureShadowDepsSynced } from "./deps-sync";
 import { fetchDismissedPackageNames, parseGitHubSlug } from "./gh";
 import {
   type Untranslated,
@@ -27,6 +28,7 @@ import { type LintError, formatLintSummary, lintableChangedFiles, runLint } from
 import { GIT_TIMEOUT_MS, repo } from "./repo";
 import { splitArgv } from "./repo-config";
 import { type RepoSupports, detectRepoProfile } from "./repo-profile";
+import { readStreamCapped } from "./runtime";
 import {
   type WorktreeAcquireResult,
   acquireWorktreeClaim,
@@ -37,33 +39,45 @@ type Run = { ok: boolean; out: string; err: string };
 
 /**
  * Ceiling for a tool run (formatter, tests, pnpm). Everything here runs on the watch's
- * single serialized queue, so one hung child used to stall inject, checks and deploys
- * for good. Generous on purpose: this is for hangs, not for slow test suites.
+ * main-shadow queue, so one hung child must not stall inject or checks indefinitely.
  */
 const TOOL_TIMEOUT_MS = 45 * 60 * 1000;
 
-async function spawnCapture(cmd: string[], cwd: string, timeoutMs = TOOL_TIMEOUT_MS): Promise<Run> {
-  const proc = Bun.spawn(cmd, {
-    cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-    timeout: timeoutMs,
-    // Raw-mode TUI: a git credential prompt can never be answered, only hang.
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-  });
-  const [out, err, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  if (proc.signalCode !== null && proc.killed) {
-    return { ok: false, out, err: `${cmd[0]} timed out after ${Math.round(timeoutMs / 60000)}m` };
+async function spawnCapture(
+  cmd: string[],
+  cwd: string,
+  timeoutMs = TOOL_TIMEOUT_MS,
+  capBytes: number | null = 512 * 1024,
+): Promise<Run> {
+  try {
+    const proc = Bun.spawn(cmd, {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: timeoutMs,
+      // Raw-mode TUI: a git credential prompt can never be answered, only hang.
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    });
+    const [out, err, code] = await Promise.all([
+      capBytes === null
+        ? new Response(proc.stdout).text()
+        : readStreamCapped(proc.stdout, capBytes),
+      capBytes === null
+        ? new Response(proc.stderr).text()
+        : readStreamCapped(proc.stderr, capBytes),
+      proc.exited,
+    ]);
+    if (proc.signalCode !== null && proc.killed) {
+      return { ok: false, out, err: `${cmd[0]} timed out after ${Math.round(timeoutMs / 60000)}m` };
+    }
+    return { ok: code === 0, out, err };
+  } catch (e) {
+    return { ok: false, out: "", err: e instanceof Error ? e.message : String(e) };
   }
-  return { ok: code === 0, out, err };
 }
 
 async function git(args: string[], cwd: string): Promise<Run> {
-  const r = await spawnCapture(["git", ...args], cwd, GIT_TIMEOUT_MS);
+  const r = await spawnCapture(["git", ...args], cwd, GIT_TIMEOUT_MS, null);
   return { ok: r.ok, out: r.out.trim(), err: r.err.trim() };
 }
 
@@ -73,12 +87,12 @@ async function git(args: string[], cwd: string): Promise<Run> {
  * off the first/last NUL-separated field.
  */
 async function gitZ(args: string[], cwd: string): Promise<Run> {
-  const r = await spawnCapture(["git", ...args], cwd, GIT_TIMEOUT_MS);
+  const r = await spawnCapture(["git", ...args], cwd, GIT_TIMEOUT_MS, null);
   return { ok: r.ok, out: r.out, err: r.err.trim() };
 }
 
 async function sh(cmd: string[], cwd: string): Promise<Run> {
-  const r = await spawnCapture(cmd, cwd);
+  const r = await spawnCapture(cmd, cwd, TOOL_TIMEOUT_MS, 512 * 1024);
   return { ok: r.ok, out: r.out.trim(), err: r.err.trim() };
 }
 
@@ -223,18 +237,28 @@ export function addedLineLooksLikeI18nCode(line: string): boolean {
   return /\bi18n\b|\buseT\b|(?<![A-Za-z0-9_])t\(['"`]/.test(line);
 }
 
-export async function checkI18n(repoPath: string, sha: string): Promise<I18nCheck> {
-  const [files, showR] = await Promise.all([
+/** Fetch a commit's `-U0` unified diff once so `checkI18n` and `scanCommitForUntranslated` can share it. */
+export async function commitDiffU0(repoPath: string, sha: string): Promise<string | null> {
+  const r = await git(["show", "--format=", "-U0", sha], repoPath);
+  return r.ok ? r.out : null;
+}
+
+export async function checkI18n(
+  repoPath: string,
+  sha: string,
+  precomputedDiff?: string | null,
+): Promise<I18nCheck> {
+  const [files, diffOut] = await Promise.all([
     commitFiles(repoPath, sha),
-    git(["show", "--format=", "-U0", sha], repoPath),
+    precomputedDiff !== undefined ? Promise.resolve(precomputedDiff) : commitDiffU0(repoPath, sha),
   ]);
   const hasPo = files.some((f) => f.endsWith(".po") || f.endsWith(".pot"));
-  const hasI18nCode =
-    showR.ok &&
-    showR.out
-      .split("\n")
+  const hasI18nCode = Boolean(
+    diffOut
+      ?.split("\n")
       .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
-      .some((l) => addedLineLooksLikeI18nCode(l));
+      .some((l) => addedLineLooksLikeI18nCode(l)),
+  );
   return { hasPo, hasI18nCode, mismatch: hasPo !== hasI18nCode };
 }
 
@@ -253,48 +277,74 @@ export type FileFindings = {
 export async function scanCommitForUntranslated(
   repoPath: string,
   sha: string,
+  precomputedDiff?: string | null,
 ): Promise<FileFindings[]> {
-  const diffR = await git(["show", sha, "--format=", "-U0"], repoPath);
-  if (!diffR.ok) return [];
-  const added = addedLineNumbers(diffR.out);
+  const diffOut =
+    precomputedDiff !== undefined ? precomputedDiff : await commitDiffU0(repoPath, sha);
+  if (diffOut === null) return [];
+  const added = addedLineNumbers(diffOut);
+  const candidates = [...added.entries()].filter(
+    ([file]) => isScannable(file) && !isExcludedPath(file),
+  );
   const results: FileFindings[] = [];
-  for (const [file, lines] of added) {
-    if (!isScannable(file) || isExcludedPath(file)) continue;
-    const show = await git(["show", `${sha}:${file}`], repoPath);
-    if (!show.ok) continue; // file deleted/renamed-away at this sha
-    const findings = findUntranslated(show.out, file).filter((f) => lines.has(f.line));
-    if (findings.length) results.push({ file, findings, display: isDisplayFile(file, show.out) });
+  for (let i = 0; i < candidates.length; i += 8) {
+    const batch = candidates.slice(i, i + 8);
+    const items = await Promise.all(
+      batch.map(async ([file, lines]): Promise<FileFindings | null> => {
+        const show = await git(["show", `${sha}:${file}`], repoPath);
+        if (!show.ok) return null; // file deleted/renamed-away at this sha
+        const findings = findUntranslated(show.out, file).filter((f) => lines.has(f.line));
+        return findings.length ? { file, findings, display: isDisplayFile(file, show.out) } : null;
+      }),
+    );
+    for (const item of items) if (item) results.push(item);
   }
   return results;
 }
 
 /**
  * Full-tree scan for hardcoded strings not wrapped in `t()`, across all tracked
- * source files. Used by the manual maintenance pass to audit the whole repo.
+ * source files. Batches file reads for speed on large repos.
  */
 export async function scanRepoForUntranslated(
   repoPath: string,
   pathspec?: string,
   includeExcluded = false,
 ): Promise<FileFindings[]> {
-  // `-z` so non-ASCII paths arrive verbatim rather than as `"\304\215.vue"`, which
-  // would then fail to open and be silently skipped from the scan.
-  const lsArgs = pathspec ? ["ls-files", "-z", "--", pathspec] : ["ls-files", "-z"];
-  const ls = await gitZ(lsArgs, repoPath);
-  if (!ls.ok) return [];
-  const files = splitNulPaths(ls.out).filter(
-    (f) => isScannable(f) && (includeExcluded || !isExcludedPath(f)),
-  );
+  let files: string[];
+  if (!existsSync(path.join(repoPath, ".git")) && existsSync(path.join(repoPath, ".akk"))) {
+    const { listTrackedFiles } = await import("./vcs");
+    files = (await listTrackedFiles(repoPath, pathspec)).filter(
+      (f) => isScannable(f) && (includeExcluded || !isExcludedPath(f)),
+    );
+  } else {
+    // `-z` so non-ASCII paths arrive verbatim rather than as `"\304\215.vue"`, which
+    // would then fail to open and be silently skipped from the scan.
+    const lsArgs = pathspec ? ["ls-files", "-z", "--", pathspec] : ["ls-files", "-z"];
+    const ls = await gitZ(lsArgs, repoPath);
+    if (!ls.ok) return [];
+    files = splitNulPaths(ls.out).filter(
+      (f) => isScannable(f) && (includeExcluded || !isExcludedPath(f)),
+    );
+  }
+
   const results: FileFindings[] = [];
-  for (const file of files) {
-    let content: string;
-    try {
-      content = await Bun.file(path.join(repoPath, file)).text();
-    } catch {
-      continue;
-    }
-    const findings = findUntranslated(content, file);
-    if (findings.length) results.push({ file, findings, display: isDisplayFile(file, content) });
+  const BATCH = 16;
+  for (let i = 0; i < files.length; i += BATCH) {
+    const slice = files.slice(i, i + BATCH);
+    const batch = await Promise.all(
+      slice.map(async (file): Promise<FileFindings | null> => {
+        let content: string;
+        try {
+          content = await Bun.file(path.join(repoPath, file)).text();
+        } catch {
+          return null;
+        }
+        const findings = findUntranslated(content, file);
+        return findings.length ? { file, findings, display: isDisplayFile(file, content) } : null;
+      }),
+    );
+    for (const item of batch) if (item) results.push(item);
   }
   return results;
 }
@@ -450,6 +500,9 @@ export type EnsureShadowOpts = ShadowClaimOpts & {
   role?: ShadowRole;
 };
 
+/** Repos already checked for the legacy sibling `../main-shadow` once in this process. */
+const legacyCheckedRepos = new Set<string>();
+
 /**
  * Ensure a shadow worktree exists and is hard-reset to `ref`.
  *
@@ -464,6 +517,10 @@ export async function ensureShadow(
 ): Promise<ShadowInfo> {
   const role = opts.role ?? "main";
   const shadowPath = shadowPathFor(repoPath, role);
+  if (!existsSync(path.join(repoPath, ".git")) && existsSync(path.join(repoPath, ".akk"))) {
+    const { ensureAkkShadow } = await import("./vcs");
+    return ensureAkkShadow(repoPath, shadowPath, ref, opts);
+  }
   mkdirSync(path.dirname(shadowPath), { recursive: true });
   const warnings: string[] = [];
 
@@ -484,71 +541,71 @@ export async function ensureShadow(
     ...(warnings.length ? { warnings } : {}),
   });
 
-  // Prune stale worktree entries first
+  // Prune stale worktree entries first, then read the worktree list once.
   await git(["worktree", "prune"], repoPath);
+  const listR = await git(["worktree", "list", "--porcelain"], repoPath);
+  const listedPaths = new Set(
+    listR.out
+      .split("\n")
+      .filter((l) => l.startsWith("worktree "))
+      .map((l) => l.slice("worktree ".length).trim()),
+  );
 
-  // Migrate away from the old sibling location (../main-shadow), if one is still
-  // registered, so we don't leave an orphaned worktree behind.
-  //
-  // Only when it is safe to: `worktree remove --force` on a path match alone also
-  // discards modified and untracked files, and `<repo parent>/main-shadow` is a name a
-  // user could plausibly have given a worktree of their own. So require both an empty
-  // `git status` (nothing to lose) and a detached HEAD (the shape *we* create — a
-  // worktree on a real branch is somebody's working copy, not our leftover). Otherwise
-  // warn and leave it alone; an orphaned registration is harmless next to lost work.
-  // Deploy roles never used the sibling path — skip migration for them.
-  if (role === "main") {
+  // Migrate away from the old sibling location (../main-shadow) once per process, only
+  // when clean and detached (see comments above).
+  if (role === "main" && !legacyCheckedRepos.has(repoPath)) {
     const legacyPath = path.join(path.dirname(repoPath), "main-shadow");
-    if (legacyPath !== shadowPath) {
-      const reg = await git(["worktree", "list", "--porcelain"], repoPath);
-      const legacyLinked = reg.out
-        .split("\n")
-        .some(
-          (l) => l.startsWith("worktree ") && l.slice("worktree ".length).trim() === legacyPath,
+    if (legacyPath !== shadowPath && listedPaths.has(legacyPath)) {
+      const dirty = await statusPaths(legacyPath);
+      const branchR = await git(["symbolic-ref", "--quiet", "HEAD"], legacyPath);
+      const detached = !branchR.ok;
+      if (dirty.length > 0 || !detached) {
+        warnings.push(
+          `legacy worktree ${legacyPath} left in place — ${
+            dirty.length > 0 ? `${dirty.length} uncommitted change(s)` : `on branch ${branchR.out}`
+          }; remove it by hand once you've saved anything you need`,
         );
-      if (legacyLinked) {
-        const dirty = await statusPaths(legacyPath);
-        const branchR = await git(["symbolic-ref", "--quiet", "HEAD"], legacyPath);
-        const detached = !branchR.ok;
-        if (dirty.length > 0 || !detached) {
-          warnings.push(
-            `legacy worktree ${legacyPath} left in place — ${
-              dirty.length > 0
-                ? `${dirty.length} uncommitted change(s)`
-                : `on branch ${branchR.out}`
-            }; remove it by hand once you've saved anything you need`,
-          );
-        } else {
-          await git(["worktree", "remove", legacyPath], repoPath);
-        }
+      } else {
+        await git(["worktree", "remove", legacyPath], repoPath);
+        legacyCheckedRepos.add(repoPath);
       }
+    } else {
+      legacyCheckedRepos.add(repoPath);
     }
   }
 
-  const listR = await git(["worktree", "list", "--porcelain"], repoPath);
-  const linked = listR.out
-    .split("\n")
-    .some((l) => l.startsWith("worktree ") && l.slice("worktree ".length).trim() === shadowPath);
+  const linked = listedPaths.has(shadowPath);
 
   if (!linked) {
     const addR = await git(["worktree", "add", "--detach", shadowPath, ref], repoPath);
     if (!addR.ok) return done(`worktree add: ${addR.err}`);
   } else {
-    // Remove stale index.lock before touching the worktree
+    // Remove stale index.lock and abort only operations whose marker actually exists
+    // (avoids 3 guaranteed-failing git subprocesses on every clean reset).
     const gitDirR = await git(["rev-parse", "--git-dir"], shadowPath);
-    if (gitDirR.ok) {
-      const lock = path.join(gitDirR.out, "index.lock");
+    if (gitDirR.ok && gitDirR.out) {
+      const gitDir = path.isAbsolute(gitDirR.out)
+        ? gitDirR.out
+        : path.join(shadowPath, gitDirR.out);
       try {
-        unlinkSync(lock);
+        unlinkSync(path.join(gitDir, "index.lock"));
       } catch {
         /* doesn't exist, fine */
       }
+      if (existsSync(path.join(gitDir, "CHERRY_PICK_HEAD"))) {
+        await git(["cherry-pick", "--abort"], shadowPath);
+      }
+      if (
+        existsSync(path.join(gitDir, "rebase-merge")) ||
+        existsSync(path.join(gitDir, "rebase-apply"))
+      ) {
+        await git(["rebase", "--abort"], shadowPath);
+      }
+      if (existsSync(path.join(gitDir, "MERGE_HEAD"))) {
+        await git(["merge", "--abort"], shadowPath);
+      }
     }
 
-    // Clear any leftover cherry-pick/rebase/merge state before hard-reset.
-    await git(["cherry-pick", "--abort"], shadowPath);
-    await git(["rebase", "--abort"], shadowPath);
-    await git(["merge", "--abort"], shadowPath);
     await git(["clean", "-fd"], shadowPath);
     const resetR = await git(["reset", "--hard", ref], shadowPath);
     if (!resetR.ok) return done(`reset to ${ref}: ${resetR.err}`);
@@ -897,8 +954,7 @@ export async function reconcileLocalMain(
         // local tip moves. Without blockShas the next poll retries the same conflict
         // immediately — including a full agent gate+edit — with no backoff.
         const conflictIdx = toInject.indexOf(sha);
-        const blocked =
-          conflictIdx >= 0 ? toInject.slice(conflictIdx) : [sha];
+        const blocked = conflictIdx >= 0 ? toInject.slice(conflictIdx) : [sha];
         return tip({
           action: "conflict",
           count: toInject.length,
@@ -1186,21 +1242,23 @@ export function isAgentableI18nFailure(output: string): boolean {
   return /empty msgstr|identical en\/sl msgstr|i18n-identical-msgstr-allowlist/i.test(output);
 }
 
-/** Run `pnpm i18n` in shadow, commit .po/.pot changes, push. Returns leftover files. */
+/** Run `i18nCmd` (default `pnpm i18n`) in shadow, commit .po/.pot changes, push. Returns leftover files. */
 export async function runI18nFix(
   repoPath: string,
   shadowPath: string,
   remote: string,
   branch: string,
+  i18nCmd = "pnpm i18n",
 ): Promise<FixResult> {
-  const r = await sh(["pnpm", "i18n"], shadowPath);
+  const argv = splitArgv(i18nCmd.trim() || "pnpm i18n");
+  const r = await sh(argv, shadowPath);
   if (!r.ok) {
     const failOutput = stripAnsi(`${r.out}\n${r.err}`).trim();
     return {
       committed: false,
       pushed: false,
       leftovers: [],
-      error: `pnpm i18n: ${r.err || r.out}`,
+      error: `${i18nCmd}: ${r.err || r.out}`,
       failOutput,
     };
   }
@@ -1224,6 +1282,10 @@ export async function runI18nFix(
     return { committed: true, pushed: false, leftovers, error: `push: ${pushR.err}` };
   }
 
+  const head = await git(["rev-parse", "HEAD"], shadowPath);
+  if (head.ok && head.out) {
+    await git(["update-ref", `refs/remotes/${remote}/${branch}`, head.out], repoPath);
+  }
   return { committed: true, pushed: true, leftovers, error: null };
 }
 
@@ -1303,6 +1365,10 @@ export async function runFormatFix(
     return { committed: true, pushed: false, leftovers: [], error: `push: ${pushR.err}` };
   }
 
+  const head = await git(["rev-parse", "HEAD"], shadowPath);
+  if (head.ok && head.out) {
+    await git(["update-ref", `refs/remotes/${remote}/${branch}`, head.out], repoPath);
+  }
   return { committed: true, pushed: true, leftovers: [], error: null };
 }
 
@@ -1359,6 +1425,10 @@ export async function runLockfileFix(
     return { committed: true, pushed: false, leftovers, error: `push: ${pushR.err}` };
   }
 
+  const head = await git(["rev-parse", "HEAD"], shadowPath);
+  if (head.ok && head.out) {
+    await git(["update-ref", `refs/remotes/${remote}/${branch}`, head.out], repoPath);
+  }
   return { committed: true, pushed: true, leftovers, error: null };
 }
 
@@ -1468,8 +1538,7 @@ export async function tryAgentI18nFix(
   }
 
   // Re-run i18n; refuse to commit unless the project check exits 0.
-  const [icmd, ...iargs] = i18nCmd.trim().split(/\s+/);
-  const verify = await sh([icmd, ...iargs], shadowPath);
+  const verify = await sh(splitArgv(i18nCmd), shadowPath);
   if (!verify.ok) {
     const excerpt = stripAnsi(`${verify.out}\n${verify.err}`).trim().slice(-400);
     return pause(`i18n still failing after agent — pausing auto-fix 2h (${excerpt})`);
@@ -1582,6 +1651,10 @@ async function runGenericMaintenance(
 
   if (mode === "commits" || !cmds.test.trim()) return { steps, prompts, error: null };
 
+  await ensureShadowDepsSynced(repoPath, shadowPath, {
+    allowShadowInstall: false,
+    onProgress: onStep,
+  });
   onStep?.("test: running unit tests…");
   const test = await sh(splitArgv(cmds.test), shadowPath);
   if (test.ok) {
@@ -1771,8 +1844,7 @@ export async function runMaintenance(
     // not e.g. leftover dirt the lockfile step above left uncommitted, which `git add -A`
     // used to sweep in here under the "code style" name.
     const beforeFormat = new Set(await statusPaths(shadowPath));
-    const [fcmd, ...fargs] = cmds.format.trim().split(/\s+/);
-    await sh([fcmd, ...fargs], shadowPath); // formatters exit non-zero when they rewrite files
+    await sh(splitArgv(cmds.format), shadowPath); // formatters exit non-zero when they rewrite files
     const afterFormat = await statusPaths(shadowPath);
     const fmtTouched = afterFormat.filter((f) => !beforeFormat.has(f));
     if (fmtTouched.length === 0) {
@@ -1809,9 +1881,12 @@ export async function runMaintenance(
   }
 
   // ── 3. unit tests
+  await ensureShadowDepsSynced(repoPath, shadowPath, {
+    allowShadowInstall: false,
+    onProgress: onStep,
+  });
   onStep?.("test: running unit tests…");
-  const [tcmd, ...targs] = cmds.test.trim().split(/\s+/);
-  const test = await sh([tcmd, ...targs], shadowPath);
+  const test = await sh(splitArgv(cmds.test), shadowPath);
   if (test.ok) {
     step("✓ tests: passing");
   } else {
@@ -1839,8 +1914,7 @@ export async function runMaintenance(
 
   // ── 4. i18n
   onStep?.("i18n: running…");
-  const [icmd, ...iargs] = cmds.i18n.trim().split(/\s+/);
-  const i18n = await sh([icmd, ...iargs], shadowPath);
+  const i18n = await sh(splitArgv(cmds.i18n), shadowPath);
   const changed = await statusPaths(shadowPath);
   // Only count files with genuine entry changes — ignore .po/.pot files left
   // dirty by auto-regenerated comment churn (which needs no translation work).

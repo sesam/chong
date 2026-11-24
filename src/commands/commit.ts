@@ -3,6 +3,7 @@ import { c } from "../util";
 import { repo } from "../watch/repo";
 import { detectRepoProfile } from "../watch/repo-profile";
 import { anyFailed, runChecks } from "../watch/run-checks";
+import { akkChangedFiles, akkCommit, detectVcs } from "../watch/vcs";
 import { printResults } from "./verify";
 
 const USAGE =
@@ -48,9 +49,38 @@ export async function cmdCommit(argv: string[]): Promise<void> {
         .filter(Boolean)
     : [];
 
+  const cwd = process.cwd();
+  const vcs = detectVcs(cwd);
+  if (vcs?.kind === "akk") {
+    if (!noVerify) {
+      const files =
+        add.length > 0
+          ? add.map((p) => path.relative(vcs.root, path.resolve(cwd, p)))
+          : await akkChangedFiles(vcs.root);
+      if (files.length > 0) {
+        const results = await runChecks(vcs.root, detectRepoProfile(vcs.root).checks, {
+          files,
+          phase: "commit",
+        });
+        if (anyFailed(results)) {
+          printResults(results);
+          console.error(c.red("✗ checks failed — nothing committed."));
+          console.error(c.dim("  fix: chong verify --fix   ·   bypass: chong commit --no-verify"));
+          process.exit(1);
+        }
+      }
+    }
+    const res = await akkCommit(vcs.root, message);
+    if (res.error || !res.sha) {
+      console.error(c.red(`✗ ${res.error ?? "akk commit failed"}`));
+      process.exit(1);
+    }
+    console.log(c.green(`✓ ${res.sha.slice(0, 7)}`) + c.dim(`  ${message.split("\n")[0]}`));
+    return;
+  }
+
   if (!noVerify && add.length > 0) {
     // Commit-phase checks on just the paths being committed. No applicable checks = no-op.
-    const cwd = process.cwd();
     const top = (await repo.isGitRepo(cwd)) ? await repo.topLevel(cwd) : cwd;
     const rel = add.map((p) => path.relative(top, path.resolve(cwd, p)));
     const results = await runChecks(top, detectRepoProfile(top).checks, {
@@ -65,7 +95,7 @@ export async function cmdCommit(argv: string[]): Promise<void> {
     }
   }
 
-  const res = await repo.commit(process.cwd(), { message, add, remove, patchFile });
+  const res = await repo.commit(cwd, { message, add, remove, patchFile });
   if (res.error || !res.sha) {
     console.error(c.red(`✗ ${res.error ?? "commit failed"}`));
     process.exit(1);

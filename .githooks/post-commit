@@ -20,7 +20,7 @@ ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT" || exit 0
 
 echo "post-commit: rebuilding chong…"
-if "$BUN" build --compile --target=bun ./src/index.ts --outfile chong >/dev/null 2>&1; then
+if "$BUN" run build >/dev/null 2>&1; then
   echo "post-commit: chong rebuilt → ./chong"
 else
   echo "post-commit: chong rebuild FAILED (run 'bun run build' to see why)" >&2

@@ -466,11 +466,22 @@ function scanJs(src: string, baseLine: number): Cand[] {
   return out;
 }
 
-/** 1-based line number of a character offset within `content`. */
-function lineAt(content: string, offset: number): number {
-  let line = 1;
-  for (let i = 0; i < offset && i < content.length; i++) if (content[i] === "\n") line++;
-  return line;
+/** Precompute 1-based line start offsets so line lookup is O(log lines) instead of O(N). */
+function makeLineLookup(content: string): (offset: number) => number {
+  const starts: number[] = [0];
+  for (let i = 0; i < content.length; i++) {
+    if (content[i] === "\n") starts.push(i + 1);
+  }
+  return (offset: number): number => {
+    let lo = 0;
+    let hi = starts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (starts[mid] <= offset) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo + 1;
+  };
 }
 
 /** Replace each match of `re` with same-length blanks (newlines kept) to preserve offsets. */
@@ -482,7 +493,7 @@ function blank(content: string, re: RegExp): string {
  * Scan a `.vue` template (everything outside <script>/<style>) for hardcoded copy:
  * raw text nodes and string literals inside `{{ … }}` interpolations.
  */
-function scanVueTemplate(content: string): Cand[] {
+function scanVueTemplate(content: string, lineOf: (offset: number) => number): Cand[] {
   const out: Cand[] = [];
   // Neutralise script/style blocks and comments so we only look at template markup.
   const tpl = blank(
@@ -501,7 +512,7 @@ function scanVueTemplate(content: string): Cand[] {
       const at = (m.index ?? 0) + 1; // past the '>'
       out.push({
         value: text.trim().replace(/\s+/g, " "),
-        line: lineAt(content, at),
+        line: lineOf(at),
         wrapped: false,
         kind: "hardcoded",
         escape: false,
@@ -511,7 +522,7 @@ function scanVueTemplate(content: string): Cand[] {
 
   // String literals inside interpolations (e.g. {{ 'Foo' }}); {{ t('Foo') }} is skipped.
   for (const m of tpl.matchAll(/\{\{([\s\S]*?)\}\}/g)) {
-    out.push(...scanJs(m[1], lineAt(content, (m.index ?? 0) + 2)));
+    out.push(...scanJs(m[1], lineOf((m.index ?? 0) + 2)));
   }
   return out;
 }
@@ -579,12 +590,13 @@ export function findUntranslated(content: string, filename: string): Untranslate
   const cands: Cand[] = [];
 
   if (ext === ".vue") {
+    const lineOf = makeLineLookup(content);
     for (const m of content.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)) {
       const inner = m[1];
       const innerStart = (m.index ?? 0) + m[0].length - "</script>".length - inner.length;
-      cands.push(...scanJs(inner, lineAt(content, innerStart)));
+      cands.push(...scanJs(inner, lineOf(innerStart)));
     }
-    cands.push(...scanVueTemplate(content));
+    cands.push(...scanVueTemplate(content, lineOf));
   } else {
     cands.push(...scanJs(content, 1));
   }

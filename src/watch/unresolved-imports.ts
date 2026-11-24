@@ -94,11 +94,25 @@ export type AliasMap = Array<{ prefix: string; targets: string[] }>;
  * safe way round for a gate that blocks deploys.
  */
 export function blankComments(src: string): string {
-  const out = src.split("");
+  // Fast-path: no comment markers at all → zero allocations.
+  if (!src.includes("//") && !src.includes("/*")) return src;
+  const chunks: string[] = [];
+  let segStart = 0;
   let i = 0;
   const n = src.length;
   type State = "code" | "line" | "block" | "single" | "double" | "template";
   let state: State = "code";
+  let blankLen = 0;
+
+  const flushCode = (end: number) => {
+    if (end > segStart) chunks.push(src.slice(segStart, end));
+  };
+  const flushBlank = () => {
+    if (blankLen > 0) {
+      chunks.push(" ".repeat(blankLen));
+      blankLen = 0;
+    }
+  };
 
   while (i < n) {
     const c = src[i];
@@ -106,16 +120,16 @@ export function blankComments(src: string): string {
 
     if (state === "code") {
       if (c === "/" && next === "/") {
+        flushCode(i);
         state = "line";
-        out[i] = " ";
-        out[i + 1] = " ";
+        blankLen = 2;
         i += 2;
         continue;
       }
       if (c === "/" && next === "*") {
+        flushCode(i);
         state = "block";
-        out[i] = " ";
-        out[i + 1] = " ";
+        blankLen = 2;
         i += 2;
         continue;
       }
@@ -127,21 +141,32 @@ export function blankComments(src: string): string {
     }
 
     if (state === "line") {
-      if (c === "\n") state = "code";
-      else out[i] = " ";
+      if (c === "\n") {
+        flushBlank();
+        state = "code";
+        segStart = i;
+      } else {
+        blankLen += 1;
+      }
       i += 1;
       continue;
     }
 
     if (state === "block") {
       if (c === "*" && next === "/") {
-        out[i] = " ";
-        out[i + 1] = " ";
+        blankLen += 2;
+        flushBlank();
         state = "code";
         i += 2;
+        segStart = i;
         continue;
       }
-      if (c !== "\n") out[i] = " ";
+      if (c === "\n") {
+        flushBlank();
+        chunks.push("\n");
+      } else {
+        blankLen += 1;
+      }
       i += 1;
       continue;
     }
@@ -161,7 +186,10 @@ export function blankComments(src: string): string {
     i += 1;
   }
 
-  return out.join("");
+  if (state === "line" || state === "block") flushBlank();
+  else flushCode(n);
+
+  return chunks.join("");
 }
 
 /**
@@ -297,7 +325,12 @@ export function candidatePaths(spec: string, fromFile: string, aliases: AliasMap
   return out;
 }
 
-function listSourceFiles(repoPath: string, dir: string, acc: string[]): void {
+function listSourceFiles(
+  repoPath: string,
+  dir: string,
+  acc: string[],
+  allFiles: Set<string>,
+): void {
   let entries: string[];
   try {
     entries = readdirSync(path.join(repoPath, dir));
@@ -316,15 +349,22 @@ function listSourceFiles(repoPath: string, dir: string, acc: string[]): void {
     }
     if (st.isDirectory()) {
       if (SKIPPED_DIRS.has(name)) continue;
-      listSourceFiles(repoPath, rel, acc);
+      listSourceFiles(repoPath, rel, acc, allFiles);
       continue;
     }
-    if (SCANNED_EXTS.has(path.extname(name))) acc.push(rel);
+    if (st.isFile()) {
+      allFiles.add(rel);
+      if (SCANNED_EXTS.has(path.extname(name))) acc.push(rel);
+    }
   }
 }
 
 /**
  * Scan the repo for import specifiers with no file behind them.
+ *
+ * Pre-indexes every file encountered during traversal into a `Set` and caches fallback
+ * `statSync` checks for paths outside the scanned roots, eliminating tens of thousands of
+ * redundant `stat` syscalls per deploy.
  *
  * @param repoPath worktree root
  * @param roots directories to scan (default: every source dir except the skip list)
@@ -335,12 +375,41 @@ export function scanUnresolvedImports(
 ): { findings: UnresolvedImport[]; filesScanned: number; specifiersChecked: number } {
   const aliases = readAliasMap(repoPath);
   const files: string[] = [];
+  const indexedFiles = new Set<string>();
+  const scannedRootPrefixes: string[] = [];
   for (const root of roots) {
     // The skip list has to be applied to the roots too, not just to recursion — otherwise
     // passing `node_modules` explicitly walks it.
     if (SKIPPED_DIRS.has(root)) continue;
-    if (existsSync(path.join(repoPath, root))) listSourceFiles(repoPath, root, files);
+    if (existsSync(path.join(repoPath, root))) {
+      listSourceFiles(repoPath, root, files, indexedFiles);
+      scannedRootPrefixes.push(root === "." ? "" : `${path.normalize(root)}/`);
+    }
   }
+
+  const statCache = new Map<string, boolean>();
+  const isInsideScannedRoot = (rel: string): boolean =>
+    scannedRootPrefixes.some((p) => p === "" || rel.startsWith(p));
+
+  const fileExists = (rel: string): boolean => {
+    if (indexedFiles.has(rel)) return true;
+    // If inside an already-walked non-dot root (and not a dotfile/skipped dir), absence
+    // from `indexedFiles` is authoritative — zero syscalls!
+    const parts = rel.split("/");
+    const hasDotOrSkipped = parts.some((s) => s.startsWith(".") || SKIPPED_DIRS.has(s));
+    if (!hasDotOrSkipped && isInsideScannedRoot(rel)) return false;
+
+    const cached = statCache.get(rel);
+    if (cached !== undefined) return cached;
+    let ok = false;
+    try {
+      ok = statSync(path.join(repoPath, rel)).isFile();
+    } catch {
+      ok = false;
+    }
+    statCache.set(rel, ok);
+    return ok;
+  };
 
   const findings: UnresolvedImport[] = [];
   let specifiersChecked = 0;
@@ -352,20 +421,13 @@ export function scanUnresolvedImports(
     } catch {
       continue;
     }
-    if (!src.includes("import")) continue;
+    if (!src.includes("import") && !src.includes("export")) continue;
 
     for (const { specifier, line, kind } of collectSpecifiers(src)) {
       if (!isCheckable(specifier, aliases)) continue;
       specifiersChecked += 1;
       const candidates = candidatePaths(specifier, file, aliases);
-      const hit = candidates.some((c) => {
-        const abs = path.join(repoPath, c);
-        try {
-          return statSync(abs).isFile();
-        } catch {
-          return false;
-        }
-      });
+      const hit = candidates.some(fileExists);
       if (!hit) findings.push({ file, line, specifier, kind });
     }
   }

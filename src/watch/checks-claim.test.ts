@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -69,6 +69,7 @@ function plantForeignClaim(repoPath: string): string {
     pid: 4242,
   };
   litter.push(owner, shadowPath);
+  mkdirSync(path.dirname(owner), { recursive: true });
   writeFileSync(owner, `${JSON.stringify(claim)}\n`);
   return shadowPath;
 }

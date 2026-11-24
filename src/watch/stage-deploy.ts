@@ -22,6 +22,7 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -42,10 +43,23 @@ import {
   writeS3ShaMarkerVerified,
 } from "./deploy-claim";
 import { appendDeployHistory, deployHistoryPath } from "./deploy-history";
+import { ensureShadowDepsSynced } from "./deps-sync";
 import { formatLintSummary, isAgentableLintFailure, lintableChangedFiles, runLint } from "./lint";
-import { repo } from "./repo";
+import { GIT_TIMEOUT_MS, repo } from "./repo";
 import type { RepoCheck } from "./repo-config";
+import {
+  HEX_SHA_RE,
+  closeFdSafe,
+  deployAwsEnv,
+  openDeployLogFile,
+  pruneDeployLogs,
+  readStreamCapped,
+  registerActiveProcessGroup,
+  registerShutdownHook,
+} from "./runtime";
+import { s3ReadText } from "./s3";
 import { formatUnresolvedSummary, scanUnresolvedImports } from "./unresolved-imports";
+import { akkTag, detectVcs, readAkkConfig } from "./vcs";
 import {
   WORKTREE_CLAIM_TOUCH_MS,
   releaseWorktreeClaim,
@@ -151,13 +165,24 @@ const DISCORD_CHANNEL = "dev-events";
 type GitRun = { ok: boolean; out: string; err: string };
 
 async function git(args: string[], cwd: string): Promise<GitRun> {
-  const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
-  const [out, err] = await Promise.all([
+  const proc = Bun.spawn(["git", ...args], {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: GIT_TIMEOUT_MS,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+  });
+  const [out, err, code] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
+    proc.exited,
   ]);
-  const code = await proc.exited;
-  return { ok: code === 0, out: out.trim(), err: err.trim() };
+  const timedOut = proc.signalCode !== null && proc.killed;
+  return {
+    ok: code === 0,
+    out: out.trim(),
+    err: timedOut ? `git ${args[0]} timed out` : err.trim(),
+  };
 }
 
 export type StageDeployResult = {
@@ -176,7 +201,7 @@ export function localDeployedShaPath(repoPath: string): string {
 export function readLocalDeployedSha(repoPath: string): string | null {
   try {
     const raw = readFileSync(localDeployedShaPath(repoPath), "utf8").trim();
-    return /^[0-9a-f]{7,40}$/i.test(raw) ? raw.toLowerCase() : null;
+    return HEX_SHA_RE.test(raw) ? raw.toLowerCase() : null;
   } catch {
     return null;
   }
@@ -307,12 +332,30 @@ export function selectLiveDeployTip(opts: {
   return { commit: null, tree: null, source: "none" };
 }
 
+const repoConfigCache = new Map<
+  string,
+  { mtimeMs: number; size: number; config: RepoDeployConfig }
+>();
+
 export function loadRepoDeployConfig(repoPath: string): RepoDeployConfig {
   const cfgPath = path.join(repoPath, ".chong", "config.json");
-  if (!existsSync(cfgPath)) return {};
+  let st: ReturnType<typeof statSync>;
+  try {
+    st = statSync(cfgPath);
+  } catch {
+    repoConfigCache.delete(cfgPath);
+    return {};
+  }
+  const cached = repoConfigCache.get(cfgPath);
+  if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+    return cached.config;
+  }
   try {
     const parsed = JSON.parse(readFileSync(cfgPath, "utf8")) as RepoDeployConfig;
-    return parsed && typeof parsed === "object" ? parsed : {};
+    const config = parsed && typeof parsed === "object" ? parsed : {};
+    if (repoConfigCache.size > 64) repoConfigCache.clear();
+    repoConfigCache.set(cfgPath, { mtimeMs: st.mtimeMs, size: st.size, config });
+    return config;
   } catch {
     // A malformed config must not stop the TUI: fall back to detection.
     return {};
@@ -626,6 +669,7 @@ export async function notifyDiscordStage(message: string): Promise<boolean> {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: payload,
+        signal: AbortSignal.timeout(10_000),
       });
       if (res.ok) return true;
     } catch {
@@ -910,55 +954,41 @@ export async function readS3DeployedTree(bucket: string): Promise<string | null>
 }
 
 async function readS3ShaMarker(bucket: string, key: string): Promise<string | null> {
-  const uri = `s3://${bucket}/${key}`;
-  // Runs inside every poll: no `aws` on PATH makes Bun.spawn throw, and a stalled
-  // network call would otherwise freeze refresh. Both read as "marker unknown".
-  try {
-    const proc = Bun.spawn(["aws", "s3", "cp", uri, "-", "--quiet"], {
-      stdout: "pipe",
-      stderr: "pipe",
-      timeout: 30_000,
-      env: { ...process.env, AWS_PAGER: "" },
-    });
-    const out = (await new Response(proc.stdout).text()).trim();
-    const code = await proc.exited;
-    if (code !== 0) return null;
-    return /^[0-9a-f]{7,40}$/i.test(out) ? out.toLowerCase() : null;
-  } catch {
-    return null;
-  }
+  const raw = await s3ReadText(bucket, key);
+  if (raw === null) return null;
+  const out = raw.trim();
+  return HEX_SHA_RE.test(out) ? out.toLowerCase() : null;
 }
 
 /**
  * Best-known live stage tip.
  *
- * Prefer the S3 markers when a bucket is configured and reachable — that is what is
- * actually on app-ci, including deploys from another machine or from CI. Fall back to
- * the local `stage` branch, then the `.chong/stage-deployed-sha` file (the older
- * single-laptop tracker).
- *
- * When S3 wins with a commit SHA, local `stage` is advanced to match so the lane and
- * the on-disk backup stay consistent across restarts and teammates.
+ * Pass `includeTree: false` during routine 15s polling (which only uses `.commit`) to
+ * avoid fetching `deployed-tree-sha.txt` unnecessarily, and skip rewriting the local
+ * branch/backup file when it already matches `live.commit`.
  */
 export async function resolveLiveStageTip(
   repoPath: string,
   stageBranch = STAGE_TRACK_BRANCH,
+  opts: { includeTree?: boolean } = {},
 ): Promise<LiveDeployTip> {
+  const includeTree = opts.includeTree !== false;
   const markerBucket = stageDeployedShaBucket(repoPath);
   const [s3Commit, s3Tree, branchSha] = await Promise.all([
     markerBucket ? readS3DeployedSha(markerBucket) : Promise.resolve(null),
-    markerBucket ? readS3DeployedTree(markerBucket) : Promise.resolve(null),
+    markerBucket && includeTree ? readS3DeployedTree(markerBucket) : Promise.resolve(null),
     repo.localSha(repoPath, stageBranch),
   ]);
   const fileSha = readLocalDeployedSha(repoPath);
   const live = selectLiveDeployTip({ s3Commit, s3Tree, branchSha, fileSha });
 
   if (live.commit) {
-    // Keep local tracker + backup aligned with whatever won (S3 or recovered file).
-    if (live.source === "s3" || live.source === "local-file" || !branchSha) {
+    const lowerBranch = branchSha?.toLowerCase() ?? null;
+    const lowerFile = fileSha?.toLowerCase() ?? null;
+    if (lowerBranch !== live.commit) {
       const err = await markLocalStageDeployed(repoPath, live.commit, stageBranch);
-      if (err) writeLocalDeployedSha(repoPath, live.commit);
-    } else if (live.source === "local-branch") {
+      if (err && lowerFile !== live.commit) writeLocalDeployedSha(repoPath, live.commit);
+    } else if (lowerFile !== live.commit) {
       writeLocalDeployedSha(repoPath, live.commit);
     }
   }
@@ -972,24 +1002,27 @@ export async function resolveDeployedStageSha(
   repoPath: string,
   stageBranch = STAGE_TRACK_BRANCH,
 ): Promise<string | null> {
-  return (await resolveLiveStageTip(repoPath, stageBranch)).commit;
+  return (await resolveLiveStageTip(repoPath, stageBranch, { includeTree: false })).commit;
 }
 
 /**
  * Best-known live production tip.
  *
- * Prefer S3 markers when `prodDeployedShaBucket` is set — local `origin/prod` can lag
- * a local/chong deploy that wrote the bucket but never pushed the git ref. Fall back
- * to null so the pipeline keeps using `origin/prod` (the older branch-based approach).
+ * Pass `includeTree: false` during routine polling to skip reading `deployed-tree-sha.txt`.
  */
-export async function resolveLiveProdTip(repoPath: string): Promise<LiveDeployTip> {
+export async function resolveLiveProdTip(
+  repoPath: string,
+  opts: { includeTree?: boolean } = {},
+): Promise<LiveDeployTip> {
+  const includeTree = opts.includeTree !== false;
   const markerBucket = prodDeployedShaBucket(repoPath);
   if (!markerBucket) {
     return { commit: null, tree: null, source: "none" };
   }
-  const [s3Commit, s3Tree] = await Promise.all([
+  const [s3Commit, s3Tree, localProdSha] = await Promise.all([
     readS3DeployedSha(markerBucket),
-    readS3DeployedTree(markerBucket),
+    includeTree ? readS3DeployedTree(markerBucket) : Promise.resolve(null),
+    repo.localSha(repoPath, "prod"),
   ]);
   const live = selectLiveDeployTip({
     s3Commit,
@@ -997,12 +1030,9 @@ export async function resolveLiveProdTip(repoPath: string): Promise<LiveDeployTi
     branchSha: null,
     fileSha: null,
   });
-  if (live.commit) {
+  if (live.commit && localProdSha?.toLowerCase() !== live.commit) {
     // Advance local `prod` to the live tip when safe — display + promote prompts agree.
-    const err = await repo.setLocalBranch(repoPath, "prod", live.commit);
-    if (err) {
-      // Lane tip still uses the S3 commit; local ref update is best-effort.
-    }
+    await repo.setLocalBranch(repoPath, "prod", live.commit);
   }
   return live;
 }
@@ -1025,6 +1055,14 @@ export function liveTipCoversSha(
 
 /** Grace period between SIGTERM and SIGKILL when an abort has to reach a process group. */
 const ABORT_KILL_GRACE_MS = 5_000;
+/** Default ceiling for a single deploy command on an always-on watcher (25 min). */
+const DEFAULT_DEPLOY_TIMEOUT_MS = 25 * 60 * 1_000;
+
+function deployTimeoutMs(override?: number): number {
+  if (override !== undefined && Number.isFinite(override) && override > 0) return override;
+  const fromEnv = Number(process.env.CHONG_DEPLOY_TIMEOUT_MS);
+  return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : DEFAULT_DEPLOY_TIMEOUT_MS;
+}
 
 export async function runDeployCommand(
   shadowPath: string,
@@ -1033,24 +1071,21 @@ export async function runDeployCommand(
   opts: {
     /** When this returns true, kill the deploy process (lost soft claim). */
     shouldAbort?: () => boolean;
+    /** Optional overall ceiling in ms (default 25m). */
+    timeoutMs?: number;
+    /** Label + sha for saving full output on failure under ~/.chong/logs/. */
+    logMeta?: { target: string; sha: string };
   } = {},
-): Promise<{ ok: boolean; output: string; aborted?: boolean }> {
-  // Use `bash -c` (not `-lc`): a login shell sources sdkman/zsh helpers that break
-  // under macOS /bin/bash 3.2 (`${var^^}` bad substitution) and can hang on prompts.
-  //
-  // `detached: true` makes this shell its own process group leader (POSIX `setsid`), so
-  // an abort below can signal the whole tree instead of just `bash`. Without it, the real
-  // uploaders — `s5cmd` / `aws s3 sync`, spawned as children of the shell — survive a kill
-  // of the `bash` pid alone and keep writing to the deploy bucket after chong has already
-  // reported the deploy aborted, sometimes interleaving with a deploy another watch starts
-  // after taking over the claim.
+): Promise<{ ok: boolean; output: string; aborted?: boolean; logPath?: string | null }> {
+  const maxMs = deployTimeoutMs(opts.timeoutMs);
+  const logHandle = opts.logMeta ? openDeployLogFile(opts.logMeta.target, opts.logMeta.sha) : null;
+
   const proc = Bun.spawn(["bash", "-c", cmd], {
     cwd: shadowPath,
     stdout: "pipe",
     stderr: "pipe",
     detached: true,
-    env: {
-      ...process.env,
+    env: deployAwsEnv(process.env, {
       CI: "true",
       FORCE: "1",
       DEPLOY_SKIP_INSTALL: process.env.DEPLOY_SKIP_INSTALL ?? "1",
@@ -1059,12 +1094,11 @@ export async function runDeployCommand(
       // The deploy script logs one row per deploy. cwd is a throwaway shadow worktree,
       // so without this the row is written there and discarded with it.
       ...(historyFile ? { DEPLOY_HISTORY_FILE: historyFile } : {}),
-    },
+    }),
   });
+  const unregisterGroup = registerActiveProcessGroup(proc.pid);
 
-  // Negative pid signals the whole process group `detached` created above, not just
-  // `bash`. The group can already be gone by the time this fires (bash and its children
-  // exited on their own between polls) — ESRCH there is expected, not a bug.
+  // Negative pid signals the whole process group `detached` created above, not just `bash`.
   const killGroup = (signal: "SIGTERM" | "SIGKILL") => {
     try {
       process.kill(-proc.pid, signal);
@@ -1074,48 +1108,99 @@ export async function runDeployCommand(
   };
 
   let aborted = false;
+  let timedOut = false;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
-  const poll = setInterval(() => {
-    if (aborted || !opts.shouldAbort?.()) return;
-    aborted = true;
-    killGroup("SIGTERM");
-    // Escalate if the tree ignores SIGTERM (e.g. an uploader mid-syscall).
-    killTimer = setTimeout(() => killGroup("SIGKILL"), ABORT_KILL_GRACE_MS);
-  }, 2_000);
+  let hardTimer: ReturnType<typeof setTimeout> | undefined;
+  let resolveHard!: (v: "hard-timeout") => void;
+  const hardRace = new Promise<"hard-timeout">((r) => {
+    resolveHard = r;
+  });
 
-  // try/finally: if draining the streams ever rejects, the poll interval and a pending
-  // SIGKILL timer must not leak for the life of the process — they are cleared whether the
-  // drain succeeds or throws.
-  //
-  // Deliberately no bound on the drain itself: a daemonizing grandchild (calls setsid(),
-  // escaping the process group `detached: true` created above) that keeps the inherited
-  // stdout/stderr pipe open could in theory hang this await forever, past the `finally`
-  // above and never reaching the caller's claim-release `finally`. A wall-clock cap on
-  // `new Response(...).text()` would fix that but also silently truncate a normal, slow
-  // deploy's real output — there is no way to tell the two apart from out here. Reaching
-  // for one would need per-chunk read progress (a distinct, larger change) rather than a
-  // single overall timeout, so this is left as a known gap rather than guessed at here.
-  let stdout: string;
-  let stderr: string;
-  try {
-    [stdout, stderr] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
+  const triggerKill = (reason: "abort" | "timeout") => {
+    if (aborted || timedOut) return;
+    if (reason === "abort") aborted = true;
+    else timedOut = true;
+    killGroup("SIGTERM");
+    killTimer = setTimeout(() => {
+      killGroup("SIGKILL");
+      // Bound drain even if a daemonized grandchild escaped the process group via setsid().
+      hardTimer = setTimeout(() => resolveHard("hard-timeout"), 5_000);
+      hardTimer.unref();
+    }, ABORT_KILL_GRACE_MS);
+    killTimer.unref();
+  };
+
+  const poll = setInterval(() => {
+    if (opts.shouldAbort?.()) triggerKill("abort");
+  }, 2_000);
+  poll.unref();
+
+  const overallTimer = setTimeout(() => triggerKill("timeout"), maxMs);
+  overallTimer.unref();
+
+  const drain = (async () => {
+    const [stdout, stderr, code] = await Promise.all([
+      readStreamCapped(proc.stdout, 256 * 1024, logHandle?.fd),
+      readStreamCapped(proc.stderr, 256 * 1024, logHandle?.fd),
+      proc.exited,
     ]);
+    return { stdout, stderr, code };
+  })();
+
+  let stdout = "";
+  let stderr = "";
+  let code = -1;
+  try {
+    const settled = await Promise.race([drain, hardRace]);
+    if (settled === "hard-timeout") {
+      stderr = timedOut
+        ? `deploy timed out after ${Math.round(maxMs / 60_000)}m (a grandchild held output pipes open after SIGKILL)`
+        : "aborted: lost deploy claim mid-upload (pipe held open after SIGKILL)";
+    } else {
+      ({ stdout, stderr, code } = settled);
+    }
   } finally {
+    unregisterGroup();
     clearInterval(poll);
+    clearTimeout(overallTimer);
     if (killTimer) clearTimeout(killTimer);
+    if (hardTimer) clearTimeout(hardTimer);
+    closeFdSafe(logHandle?.fd);
   }
-  const code = await proc.exited;
+
+  const ok = code === 0 && !aborted && !timedOut;
+  let logPath: string | null = null;
+  if (logHandle) {
+    if (ok) {
+      // Remove log on success to keep ~/.chong/logs clean; keep only failures.
+      try {
+        unlinkSync(logHandle.path);
+      } catch {
+        /* ignore */
+      }
+    } else {
+      logPath = logHandle.path;
+      pruneDeployLogs();
+    }
+  }
+
   const output = `${stdout}\n${stderr}`.trim();
   if (aborted) {
     return {
       ok: false,
       output: output || "aborted: lost deploy claim mid-upload",
       aborted: true,
+      logPath,
     };
   }
-  return { ok: code === 0, output };
+  if (timedOut) {
+    return {
+      ok: false,
+      output: output || `deploy timed out after ${Math.round(maxMs / 60_000)}m`,
+      logPath,
+    };
+  }
+  return { ok, output, logPath };
 }
 
 /**
@@ -1374,17 +1459,14 @@ export function linkVenv(repoPath: string, shadowPath: string): void {
   }
 }
 
-/** Reset a per-target deploy shadow to `sha` and give the deploy the same .env a manual run sees. */
+/** Reset a per-target deploy shadow to `sha`, sync lockfile deps, and copy `.env`. */
 async function prepareShadow(
   repoPath: string,
   sha: string,
   processId: string,
   role: Extract<ShadowRole, "stage-deploy" | "prod-deploy">,
+  onProgress?: (msg: string) => void,
 ): Promise<{ shadowPath?: string; error?: string; claimed: boolean }> {
-  // `processId` is required: this resets the shared worktree, so it must hold the claim.
-  // It used to be optional and pass `undefined` through, which silently skipped the claim
-  // check entirely — the fourth such bypass, and the one that only surfaced once
-  // `ensureShadow` made the claim mandatory rather than opt-in.
   const shadow = await ensureShadow(repoPath, sha, { processId, role });
   if (shadow.error) {
     // Claim may still be ours after a failed reset — caller releases when claimed.
@@ -1396,6 +1478,16 @@ async function prepareShadow(
   }
 
   linkVenv(repoPath, shadow.shadowPath);
+
+  // Keep symlinked node_modules / .venv in sync with the target commit's lockfile so an
+  // always-on VM never builds with stale or missing packages.
+  const synced = await ensureShadowDepsSynced(repoPath, shadow.shadowPath, {
+    allowShadowInstall: true,
+    onProgress,
+  });
+  if (synced.action === "error") {
+    return { error: synced.message, claimed: true, shadowPath: shadow.shadowPath };
+  }
 
   // Only `.env` — deliberately NOT `.env.local`. Vite loads .env.local after .env and it
   // wins, so copying it would let a developer's localhost values into a real deploy.
@@ -1493,12 +1585,20 @@ export async function runLocalProdDeploy(
 
   let deployShadowPath: string | null = null;
   let stopWorktreeTouch: (() => void) | null = null;
+  const unregisterShutdown = registerShutdownHook({
+    sync: () => {
+      if (deployShadowPath) releaseWorktreeClaim(deployShadowPath, opts.processId);
+    },
+    async: async () => {
+      if (markerBucket && heldClaim) await releaseDeployClaim(markerBucket, heldClaim);
+    },
+  });
 
   try {
     const lost = await confirmClaimBeforeUpload(markerBucket, heldClaim, sha, "prod", force);
     if (lost) return lost;
 
-    const shadow = await prepareShadow(repoPath, sha, opts.processId, "prod-deploy");
+    const shadow = await prepareShadow(repoPath, sha, opts.processId, "prod-deploy", note);
     if (shadow.claimed && shadow.shadowPath) deployShadowPath = shadow.shadowPath;
     if (shadow.error || !shadow.shadowPath) {
       return { action: "blocked", message: `shadow: ${shadow.error}`, sha };
@@ -1510,7 +1610,8 @@ export async function runLocalProdDeploy(
       {
         readClaim: () => (markerBucket ? readDeployClaim(markerBucket) : Promise.resolve(null)),
         fetchRemoteTip: null,
-        readLiveCommit: async () => (await resolveLiveProdTip(repoPath)).commit,
+        readLiveCommit: async () =>
+          (await resolveLiveProdTip(repoPath, { includeTree: false })).commit,
       },
     );
     if (stale && !force) return stale;
@@ -1518,6 +1619,7 @@ export async function runLocalProdDeploy(
     note(`deploy prod: running ${deployCmd}…`);
     const run = await runDeployCommand(shadow.shadowPath, deployCmd, deployHistoryPath(repoPath), {
       shouldAbort: () => claimLost && !force,
+      logMeta: { target: "prod", sha },
     });
     if (run.aborted) {
       return {
@@ -1528,44 +1630,44 @@ export async function runLocalProdDeploy(
     }
     if (!run.ok) {
       const tail = run.output.slice(-1500);
+      const where = run.logPath ? ` (full log: ${run.logPath})` : "";
       return {
         action: "error",
-        message: `prod deploy failed: ${tail.split("\n").slice(-3).join(" | ") || "non-zero exit"}`,
+        message: `prod deploy failed${where}: ${tail.split("\n").slice(-3).join(" | ") || "non-zero exit"}`,
         sha,
       };
     }
 
-    const refErr = await repo.setLocalBranch(repoPath, prodBranch, sha);
+    const isAkk = detectVcs(repoPath)?.kind === "akk";
+    const refErr = isAkk ? null : await repo.setLocalBranch(repoPath, prodBranch, sha);
     if (refErr) {
       note(
         `deploy prod: live, but local ${prodBranch} ref update failed (${refErr.slice(0, 120)})`,
       );
     }
 
-    // Permanent record of this release. Local `prod` tracks what is live but is
-    // never pushed, so origin has no idea; this tag is the part that reaches
-    // everyone. Named for the deploy *completion* time in UTC, which sorts
-    // lexically and is what you actually want when asking "what was live at
-    // 14:00 on the 12th". Failure is noted and dropped — the deploy has already
-    // succeeded and must not be reported as failed over its bookkeeping.
     const releaseTag = prodReleaseTagName(new Date());
-    const who = (await repo.userName(repoPath)) ?? process.env.USER ?? "unknown";
-    const tagErr = await repo.tagAndPush(
-      repoPath,
-      opts.remote ?? "origin",
-      releaseTag,
-      sha,
-      `prod deploy ${sha.slice(0, 7)} by ${who}`,
-    );
+    const who = (isAkk ? null : await repo.userName(repoPath)) ?? process.env.USER ?? "unknown";
+    const tagErr = isAkk
+      ? await akkTag(repoPath, releaseTag, sha, false)
+      : await repo.tagAndPush(
+          repoPath,
+          opts.remote ?? "origin",
+          releaseTag,
+          sha,
+          `prod deploy ${sha.slice(0, 7)} by ${who}`,
+        );
     if (tagErr) note(`deploy prod: live, but release tag failed (${tagErr.slice(0, 120)})`);
 
-    const curErr = await repo.moveTagForce(
-      repoPath,
-      opts.remote ?? "origin",
-      "current-prod",
-      sha,
-      `deployed to production ${new Date().toISOString()}`,
-    );
+    const curErr = isAkk
+      ? await akkTag(repoPath, "current-prod", sha, true)
+      : await repo.moveTagForce(
+          repoPath,
+          opts.remote ?? "origin",
+          "current-prod",
+          sha,
+          `deployed to production ${new Date().toISOString()}`,
+        );
     if (curErr) note(`deploy prod: live, but current-prod tag failed (${curErr.slice(0, 120)})`);
 
     if (markerBucket) {
@@ -1600,6 +1702,7 @@ export async function runLocalProdDeploy(
       sha,
     };
   } finally {
+    unregisterShutdown();
     stopWorktreeTouch?.();
     if (deployShadowPath) {
       releaseWorktreeClaim(deployShadowPath, opts.processId);
@@ -1634,11 +1737,16 @@ export async function runLocalStageDeploy(
     processId: string;
   },
 ): Promise<StageDeployResult> {
-  const tip = await repo.tip(repoPath, remote, mainBranch);
+  const isAkk = detectVcs(repoPath)?.kind === "akk";
+  const tip = isAkk
+    ? (readAkkConfig(repoPath)?.base ?? "")
+    : await repo.tip(repoPath, remote, mainBranch);
   if (!tip) return { action: "error", message: `could not resolve ${remote}/${mainBranch}` };
 
   const live = await resolveLiveStageTip(repoPath, stageBranch);
-  const tipTreeRes = await git(["rev-parse", `${tip}^{tree}`], repoPath);
+  const tipTreeRes = isAkk
+    ? { ok: false, out: "", err: "" }
+    : await git(["rev-parse", `${tip}^{tree}`], repoPath);
   const tipTree = tipTreeRes.ok ? tipTreeRes.out.toLowerCase() : null;
   if (liveTipCoversSha(live, tip, tipTree)) {
     if (live.commit !== tip.toLowerCase()) {
@@ -1660,6 +1768,14 @@ export async function runLocalStageDeploy(
   let stopHeartbeat: () => void = () => {};
   let heldClaim: DeployClaim | null = null;
   let claimLost = false;
+  const unregisterShutdown = registerShutdownHook({
+    sync: () => {
+      if (deploy.shadowPath) releaseWorktreeClaim(deploy.shadowPath, opts.processId);
+    },
+    async: async () => {
+      if (markerBucket && heldClaim) await releaseDeployClaim(markerBucket, heldClaim);
+    },
+  });
 
   // The claim's propagation wait is a fixed sleep, so the shadow reset, lint gate and
   // import scan run inside it instead of after it. They only read the tree (an lint
@@ -1672,7 +1788,7 @@ export async function runLocalStageDeploy(
   const gatesP = (async (): Promise<StageDeployResult | null> => {
     note(`deploy stage: resetting shadow to ${tip.slice(0, 7)}…`);
 
-    const shadow = await prepareShadow(repoPath, tip, opts.processId, "stage-deploy");
+    const shadow = await prepareShadow(repoPath, tip, opts.processId, "stage-deploy", note);
     if (shadow.claimed && shadow.shadowPath) deploy.shadowPath = shadow.shadowPath;
     if (shadow.error || !shadow.shadowPath) {
       return { action: "blocked", message: `shadow: ${shadow.error}`, sha: tip };
@@ -1740,7 +1856,8 @@ export async function runLocalStageDeploy(
           if (err) return { error: err };
           return { sha: await repo.tip(repoPath, remote, mainBranch) };
         },
-        readLiveCommit: async () => (await resolveLiveStageTip(repoPath, stageBranch)).commit,
+        readLiveCommit: async () =>
+          (await resolveLiveStageTip(repoPath, stageBranch, { includeTree: false })).commit,
       },
     );
     if (stale) return stale;
@@ -1748,6 +1865,7 @@ export async function runLocalStageDeploy(
     note(`deploy stage: running ${deployCmd}…`);
     const run = await runDeployCommand(shadow.shadowPath, deployCmd, deployHistoryPath(repoPath), {
       shouldAbort: () => claimLost,
+      logMeta: { target: "stage", sha: tip },
     });
     if (run.aborted) {
       return {
@@ -1758,27 +1876,35 @@ export async function runLocalStageDeploy(
     }
     if (!run.ok) {
       const tail = run.output.slice(-1500);
+      const where = run.logPath ? ` (full log: ${run.logPath})` : "";
       return {
         action: "error",
-        message: `deploy failed: ${tail.split("\n").slice(-3).join(" | ") || "non-zero exit"}`,
+        message: `deploy failed${where}: ${tail.split("\n").slice(-3).join(" | ") || "non-zero exit"}`,
         sha: tip,
       };
     }
 
-    const refErr = await markLocalStageDeployed(repoPath, tip, stageBranch);
+    let refErr: string | null = null;
+    if (isAkk) {
+      writeLocalDeployedSha(repoPath, tip);
+    } else {
+      refErr = await markLocalStageDeployed(repoPath, tip, stageBranch);
+    }
     if (refErr) {
       note(
         `deploy stage: live, but local ${stageBranch} ref update failed (${refErr.slice(0, 120)})`,
       );
     }
 
-    const curErr = await repo.moveTagForce(
-      repoPath,
-      remote,
-      "current-stage",
-      tip,
-      `deployed to stage ${new Date().toISOString()}`,
-    );
+    const curErr = isAkk
+      ? await akkTag(repoPath, "current-stage", tip, true)
+      : await repo.moveTagForce(
+          repoPath,
+          remote,
+          "current-stage",
+          tip,
+          `deployed to stage ${new Date().toISOString()}`,
+        );
     if (curErr) note(`deploy stage: live, but current-stage tag failed (${curErr.slice(0, 120)})`);
 
     if (markerBucket) {
@@ -1810,6 +1936,7 @@ export async function runLocalStageDeploy(
       sha: tip,
     };
   } finally {
+    unregisterShutdown();
     deploy.stopTouch?.();
     if (deploy.shadowPath) {
       releaseWorktreeClaim(deploy.shadowPath, opts.processId);

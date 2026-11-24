@@ -209,6 +209,15 @@ describe("scanUnresolvedImports", () => {
     expect(scanUnresolvedImports(root, ["src", "node_modules", "dist"]).findings).toEqual([]);
   });
 
+  test("catches pure re-export barrel files with no import keyword", () => {
+    const root = repoFixture({
+      "src/index.ts": `export { missing } from "@/gone/module";\n`,
+    });
+    const { findings } = scanUnresolvedImports(root, ["src"]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.specifier).toBe("@/gone/module");
+  });
+
   test("a clean repo yields no findings", () => {
     const root = repoFixture({
       "src/a.js": `import { b } from "@/b.js";`,

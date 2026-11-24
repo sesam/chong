@@ -1,6 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { extname, join } from "node:path";
-import prettier from "prettier";
+import type prettier from "prettier";
 import { git } from "./git";
 
 /**
@@ -77,6 +77,7 @@ export async function formatChangedSinceMain(cwd: string): Promise<FormatResult>
   const files = await git.diffNames(base, cwd);
   const formatted: string[] = [];
   const skipped: string[] = [];
+  let prettierMod: typeof prettier | null = null;
 
   for (const rel of files) {
     const ext = extname(rel).toLowerCase();
@@ -94,8 +95,9 @@ export async function formatChangedSinceMain(cwd: string): Promise<FormatResult>
     }
     let result: string;
     try {
-      result = await prettier.format(source, { ...OPTIONS, parser });
-    } catch (e) {
+      if (!prettierMod) prettierMod = (await import("prettier")).default;
+      result = await prettierMod.format(source, { ...OPTIONS, parser });
+    } catch (_e) {
       // syntax error in source — let it through; the user's typecheck will catch it.
       skipped.push(rel);
       continue;
